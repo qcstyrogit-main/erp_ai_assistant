@@ -79,7 +79,7 @@ def export_to_excel(payload: str, filename: str | None = None):
     fname = _slugify_filename(filename or title)
     frappe.local.response.filename = f"{fname}.xlsx"
     frappe.local.response.filecontent = bytes_content
-    frappe.local.response.type = "binary"
+    frappe.local.response.type = "download"
 
 
 @frappe.whitelist()
@@ -100,7 +100,7 @@ def export_to_pdf(payload: str, filename: str | None = None):
     fname = _slugify_filename(filename or title)
     frappe.local.response.filename = f"{fname}.pdf"
     frappe.local.response.filecontent = bytes_content
-    frappe.local.response.type = "binary"
+    frappe.local.response.type = "download"
 
 
 @frappe.whitelist()
@@ -121,7 +121,7 @@ def export_to_word(payload: str, filename: str | None = None):
     fname = _slugify_filename(filename or title)
     frappe.local.response.filename = f"{fname}.docx"
     frappe.local.response.filecontent = bytes_content
-    frappe.local.response.type = "binary"
+    frappe.local.response.type = "download"
 
 
 def create_message_artifacts(
