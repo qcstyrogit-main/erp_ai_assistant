@@ -314,8 +314,9 @@ def _anthropic_chat(
 
     query_params = {}
     anthropic_beta = _cfg("ANTHROPIC_BETA")
-    if anthropic_beta not in (None, ""):
-        query_params["beta"] = anthropic_beta
+    beta_param = _normalize_beta_param(anthropic_beta)
+    if beta_param is not None:
+        query_params["beta"] = beta_param
 
     endpoint = f"{base_url}{messages_path}"
     if query_params:
@@ -350,20 +351,23 @@ def _anthropic_chat(
     rendered_payload = None
 
     while True:
-        response = requests.post(
-            endpoint,
-            headers=headers,
-            json={
-                "model": model,
-                "max_tokens": 1200,
-                "system": system,
-                "tools": tool_specs,
-                "messages": messages,
-            },
-            timeout=60,
-        )
+        try:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json={
+                    "model": model,
+                    "max_tokens": 1200,
+                    "system": system,
+                    "tools": tool_specs,
+                    "messages": messages,
+                },
+                timeout=60,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Request to AI endpoint failed ({endpoint}): {exc}") from exc
         response.raise_for_status()
-        body = response.json()
+        body = _parse_backend_json(response, endpoint)
         content_blocks = body.get("content", [])
         messages.append({"role": "assistant", "content": content_blocks})
 
@@ -410,6 +414,36 @@ def _anthropic_chat(
                 )
 
         messages.append({"role": "user", "content": tool_results})
+
+
+def _normalize_beta_param(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, bool):
+        return "true" if value else None
+    text = str(value).strip().lower()
+    if text in {"", "0", "false", "none", "null", "off", "no"}:
+        return None
+    return text
+
+
+def _parse_backend_json(response: requests.Response, endpoint: str) -> dict[str, Any]:
+    try:
+        body = response.json()
+    except ValueError as exc:
+        preview = (response.text or "").strip().replace("\n", " ")[:300]
+        content_type = response.headers.get("content-type", "")
+        status = response.status_code
+        detail = (
+            f"AI endpoint returned non-JSON response (status={status}, content_type='{content_type}') "
+            f"from {endpoint}. Body preview: {preview or '<empty>'}"
+        )
+        raise RuntimeError(detail) from exc
+    if not isinstance(body, dict):
+        raise RuntimeError(
+            f"AI endpoint returned unexpected JSON payload type ({type(body).__name__}) from {endpoint}; expected object."
+        )
+    return body
 
 
 def _run_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
