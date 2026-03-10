@@ -408,15 +408,26 @@
           copyBtn.className = "erp-ai-assistant-message__copy";
           copyBtn.innerHTML = "📋";
           copyBtn.title = "Copy message";
-          copyBtn.addEventListener("click", () => {
-            navigator.clipboard?.writeText(content).then(() => {
+          copyBtn.type = "button";
+          copyBtn.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const copied = await this._copyText(content);
+            if (copied) {
               copyBtn.innerHTML = "✓";
               copyBtn.title = "Copied!";
               setTimeout(() => {
                 copyBtn.innerHTML = "📋";
                 copyBtn.title = "Copy message";
-              }, 2000);
-            });
+              }, 1200);
+              return;
+            }
+            copyBtn.innerHTML = "!";
+            copyBtn.title = "Copy failed";
+            setTimeout(() => {
+              copyBtn.innerHTML = "📋";
+              copyBtn.title = "Copy message";
+            }, 1200);
           });
           bubble.appendChild(copyBtn);
         }
@@ -557,6 +568,37 @@
       const indicator = document.getElementById("erp-ai-assistant-typing");
       if (indicator) {
         indicator.remove();
+      }
+    }
+
+    async _copyText(text) {
+      const value = String(text || "");
+      if (!value) return false;
+
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+          await navigator.clipboard.writeText(value);
+          return true;
+        }
+      } catch (error) {
+        // Fall through to legacy copy fallback.
+      }
+
+      try {
+        const textarea = document.createElement("textarea");
+        textarea.value = value;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.top = "-9999px";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(textarea);
+        return !!ok;
+      } catch (error) {
+        return false;
       }
     }
 
