@@ -18,6 +18,19 @@ TOOL_NAME_MAP = {
 }
 
 
+def _cfg(key: str, default: Any = None) -> Any:
+    candidates = [key, key.lower(), key.upper()]
+    for candidate in candidates:
+        value = frappe.conf.get(candidate)
+        if value not in (None, ""):
+            return value
+    for candidate in candidates:
+        value = os.getenv(candidate)
+        if value not in (None, ""):
+            return value
+    return default
+
+
 @frappe.whitelist()
 def send_prompt(
     prompt: str,
@@ -65,8 +78,17 @@ def _generate_response(
     if _llm_chat_configured():
         try:
             return _anthropic_chat(prompt, context, history=history)
-        except Exception:
+        except Exception as exc:
             frappe.log_error(frappe.get_traceback(), "ERP AI Assistant Chat Error")
+            return {
+                "text": (
+                    "I could not complete that request because the assistant backend call failed.\n\n"
+                    f"Error: {str(exc) or 'Unknown error'}\n\n"
+                    "Please retry, and if this persists check the AI provider/API configuration in site config."
+                ),
+                "tool_events": [],
+                "payload": None,
+            }
 
     direct_plan = _plan_prompt(prompt, context)
     if direct_plan:
@@ -84,10 +106,11 @@ def _generate_response(
 
 
 def _llm_chat_configured() -> bool:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    base_url = os.getenv("ANTHROPIC_BASE_URL")
-    messages_path = os.getenv("ANTHROPIC_MESSAGES_PATH")
-    if api_key:
+    api_key = _cfg("ANTHROPIC_API_KEY")
+    auth_token = _cfg("ANTHROPIC_AUTH_TOKEN")
+    base_url = _cfg("ANTHROPIC_BASE_URL")
+    messages_path = _cfg("ANTHROPIC_MESSAGES_PATH")
+    if api_key or auth_token:
         return True
     if base_url and base_url.rstrip("/") != "https://api.anthropic.com":
         return True
@@ -281,16 +304,18 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
 def _anthropic_chat(
     prompt: str, context: dict[str, Any], history: Optional[list[dict[str, Any]]] = None
 ) -> dict[str, Any]:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
-    base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
-    messages_path = os.getenv("ANTHROPIC_MESSAGES_PATH", "/v1/messages")
+    api_key = _cfg("ANTHROPIC_API_KEY")
+    auth_token = _cfg("ANTHROPIC_AUTH_TOKEN")
+    model = _cfg("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+    base_url = str(_cfg("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).rstrip("/")
+    messages_path = str(_cfg("ANTHROPIC_MESSAGES_PATH", "/v1/messages"))
     if not messages_path.startswith("/"):
         messages_path = f"/{messages_path}"
 
     query_params = {}
-    if os.getenv("ANTHROPIC_BETA") not in (None, ""):
-        query_params["beta"] = os.getenv("ANTHROPIC_BETA")
+    anthropic_beta = _cfg("ANTHROPIC_BETA")
+    if anthropic_beta not in (None, ""):
+        query_params["beta"] = anthropic_beta
 
     endpoint = f"{base_url}{messages_path}"
     if query_params:
@@ -299,8 +324,11 @@ def _anthropic_chat(
     headers = {"content-type": "application/json"}
     if api_key:
         headers["x-api-key"] = api_key
-    if os.getenv("ANTHROPIC_VERSION", "2023-06-01"):
-        headers["anthropic-version"] = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
+    elif auth_token:
+        headers["authorization"] = f"Bearer {auth_token}"
+    anthropic_version = _cfg("ANTHROPIC_VERSION", "2023-06-01")
+    if anthropic_version:
+        headers["anthropic-version"] = anthropic_version
     tool_specs = [
         {
             "name": name,
@@ -314,6 +342,7 @@ def _anthropic_chat(
         "You are a helpful Frappe and ERPNext assistant. "
         "Use available tools whenever live data is needed or when creating/updating records. "
         "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
+        "Never invent connectivity/authentication/server issues. If a tool call fails, report the exact returned error text only. "
         f"Current context: doctype={context.get('doctype')}, docname={context.get('docname')}, route={context.get('route')}."
     )
     messages: list[dict[str, Any]] = history[:] if history else [{"role": "user", "content": prompt}]
@@ -352,16 +381,33 @@ def _anthropic_chat(
         for tool_use in tool_uses:
             tool_name = tool_use["name"]
             tool_input = tool_use.get("input", {})
-            tool_result = _run_tool(tool_name, tool_input)
-            tool_events.append(f"{tool_name} {tool_input}")
-            rendered_payload = tool_result
-            tool_results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use["id"],
-                    "content": json.dumps(tool_result, default=str),
+            try:
+                tool_result = _run_tool(tool_name, tool_input)
+                tool_events.append(f"{tool_name} {tool_input}")
+                rendered_payload = tool_result
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use["id"],
+                        "content": json.dumps(tool_result, default=str),
+                    }
+                )
+            except Exception as exc:
+                error_payload = {
+                    "success": False,
+                    "error": str(exc) or "Unknown tool error",
+                    "tool": tool_name,
+                    "input": tool_input,
                 }
-            )
+                tool_events.append(f"{tool_name} {tool_input} (error)")
+                tool_results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use["id"],
+                        "is_error": True,
+                        "content": json.dumps(error_payload, default=str),
+                    }
+                )
 
         messages.append({"role": "user", "content": tool_results})
 
