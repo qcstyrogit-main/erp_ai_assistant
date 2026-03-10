@@ -358,6 +358,7 @@ def _anthropic_chat(
                 json={
                     "model": model,
                     "max_tokens": 1200,
+                    "stream": False,
                     "system": system,
                     "tools": tool_specs,
                     "messages": messages,
@@ -431,6 +432,9 @@ def _parse_backend_json(response: requests.Response, endpoint: str) -> dict[str,
     try:
         body = response.json()
     except ValueError as exc:
+        content_type = (response.headers.get("content-type") or "").lower()
+        if "text/event-stream" in content_type:
+            return _parse_sse_response(response.text, endpoint)
         preview = (response.text or "").strip().replace("\n", " ")[:300]
         content_type = response.headers.get("content-type", "")
         status = response.status_code
@@ -444,6 +448,78 @@ def _parse_backend_json(response: requests.Response, endpoint: str) -> dict[str,
             f"AI endpoint returned unexpected JSON payload type ({type(body).__name__}) from {endpoint}; expected object."
         )
     return body
+
+
+def _parse_sse_response(text: str, endpoint: str) -> dict[str, Any]:
+    blocks_by_index: dict[int, dict[str, Any]] = {}
+    message_payload: dict[str, Any] = {}
+    stop_reason = None
+
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        raw_data = line[len("data:") :].strip()
+        if not raw_data or raw_data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(raw_data)
+        except Exception:
+            continue
+
+        event_type = payload.get("type")
+        if event_type == "message_start":
+            message_payload = payload.get("message") or {}
+            continue
+        if event_type == "message_delta":
+            if payload.get("delta", {}).get("stop_reason"):
+                stop_reason = payload["delta"]["stop_reason"]
+            continue
+        if event_type == "content_block_start":
+            index = int(payload.get("index", 0))
+            block = payload.get("content_block") or {}
+            blocks_by_index[index] = block
+            continue
+        if event_type == "content_block_delta":
+            index = int(payload.get("index", 0))
+            block = blocks_by_index.setdefault(index, {})
+            delta = payload.get("delta") or {}
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                block["type"] = block.get("type") or "text"
+                block["text"] = (block.get("text") or "") + (delta.get("text") or "")
+            elif delta_type == "input_json_delta":
+                block["_input_json"] = (block.get("_input_json") or "") + (delta.get("partial_json") or "")
+            continue
+        if event_type == "content_block_stop":
+            index = int(payload.get("index", 0))
+            block = blocks_by_index.get(index) or {}
+            if block.get("type") == "tool_use" and block.get("_input_json"):
+                try:
+                    block["input"] = json.loads(block["_input_json"])
+                except Exception:
+                    block["input"] = {}
+            block.pop("_input_json", None)
+            blocks_by_index[index] = block
+
+    content = [blocks_by_index[i] for i in sorted(blocks_by_index.keys()) if blocks_by_index[i]]
+    if not content and message_payload.get("content"):
+        content = message_payload.get("content") or []
+
+    if not content:
+        preview = (text or "").strip().replace("\n", " ")[:300]
+        raise RuntimeError(
+            f"AI endpoint returned SSE but no parsable content from {endpoint}. Body preview: {preview or '<empty>'}"
+        )
+
+    return {
+        "id": message_payload.get("id"),
+        "type": "message",
+        "role": "assistant",
+        "content": content,
+        "model": message_payload.get("model"),
+        "stop_reason": stop_reason or message_payload.get("stop_reason"),
+    }
 
 
 def _run_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
