@@ -31,6 +31,11 @@
       "fieldname": "tool_events",
       "fieldtype": "Long Text",
       "label": "Tool Events"
+    },
+    {
+      "fieldname": "attachments_json",
+      "fieldtype": "Long Text",
+      "label": "Attachments JSON"
     }
   ],
   "permissions": [

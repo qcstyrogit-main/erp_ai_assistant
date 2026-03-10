@@ -9,6 +9,7 @@ import requests
 from frappe import _
 
 from .chat import add_message, create_conversation
+from .export import create_message_artifacts
 from .fac_proxy import TOOL_DEFINITIONS, _dispatch_tool
 
 
@@ -56,11 +57,17 @@ def send_prompt(
 
     history = _conversation_history_for_llm(conversation_name)
     response = _generate_response(prompt.strip(), context, history=history)
+    attachments = _build_message_attachments(
+        response.get("payload"),
+        title=f"{_summarize_title(prompt)} export",
+        conversation=conversation_name,
+    )
     add_message(
         conversation_name,
         "assistant",
         response["text"],
         tool_events=json.dumps(response.get("tool_events", [])),
+        attachments_json=json.dumps(attachments),
     )
 
     return {
@@ -68,8 +75,24 @@ def send_prompt(
         "reply": response["text"],
         "tool_events": response.get("tool_events", []),
         "payload": response.get("payload"),
+        "attachments": attachments,
         "context": context,
     }
+
+
+def _build_message_attachments(payload: Any, title: str, conversation: str) -> list[dict[str, Any]]:
+    if payload in (None, "", [], {}):
+        return []
+    try:
+        return create_message_artifacts(
+            payload=payload,
+            title=title,
+            attached_to_doctype="AI Conversation",
+            attached_to_name=conversation,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "ERP AI Assistant Artifact Generation Error")
+        return []
 
 
 def _generate_response(

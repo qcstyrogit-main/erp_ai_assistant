@@ -1,10 +1,11 @@
 """Export functionality for ERP AI Assistant - Excel, PDF, and Word export."""
 
 import json
-from pathlib import Path
+from io import BytesIO
 from typing import Any, Dict, List
 
 import frappe
+from frappe.utils.file_manager import save_file
 
 
 def _stringify_cell(value: Any) -> str:
@@ -20,25 +21,35 @@ def _stringify_cell(value: Any) -> str:
     return str(value)
 
 
-def _rows_to_table(title: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Convert a list of dict rows into a table structure for export."""
-    if not rows:
-        return {"headers": ["Result"], "rows": [{"Result": "No data"}]}
+def _payload_to_rows(payload: Any) -> list[dict[str, Any]]:
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        rows = []
+        for row in payload:
+            if isinstance(row, dict):
+                rows.append(row)
+            else:
+                rows.append({"value": _stringify_cell(row)})
+        return rows
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), list):
+            return _payload_to_rows(payload.get("data"))
+        if isinstance(payload.get("result"), list):
+            return _payload_to_rows(payload.get("result"))
+        compact = {k: v for k, v in payload.items() if k not in {"message", "success"}}
+        if compact:
+            return [compact]
+    return [{"value": _stringify_cell(payload)}]
 
-    # Extract all unique keys as headers
-    headers = []
-    for row in rows:
-        for key in row.keys():
-            if key not in headers:
-                headers.append(key)
 
-    # Build table rows
-    table_rows = []
-    for row in rows:
-        table_row = {header: _stringify_cell(row.get(header, "")) for header in headers}
-        table_rows.append(table_row)
-
-    return {"headers": headers, "rows": table_rows}
+def _normalize_export_payload(payload: str) -> tuple[str, list[dict[str, Any]]]:
+    data = json.loads(payload)
+    title = data.get("title", "export")
+    rows = data.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    return title, rows
 
 
 def _slugify_filename(text: str) -> str:
@@ -54,45 +65,20 @@ def _slugify_filename(text: str) -> str:
 def export_to_excel(payload: str, filename: str | None = None):
     """Export payload data to Excel format."""
     try:
-        from openpyxl import Workbook
+        import openpyxl  # noqa: F401
     except ImportError as exc:
         frappe.throw("Excel export requires openpyxl. Install with: pip install openpyxl")
 
-    data = json.loads(payload)
-    title = data.get("title", "export")
-    rows = data.get("rows", [])
+    title, rows = _normalize_export_payload(payload)
 
     if not rows:
         frappe.throw("No data to export")
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = title[:30]
-
-    # Add headers
-    headers = list(rows[0].keys())
-    ws.append(headers)
-
-    # Add data rows
-    for row in rows:
-        ws.append([row.get(header, "") for header in headers])
-
-    # Auto-size columns
-    for column in ws.columns:
-        max_length = 0
-        column = list(column)
-        for cell in column:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(cell.value)
-            except:
-                pass
-        adjusted_width = min(max_length + 2, 50)
-        ws.column_dimensions[column[0].column_letter].width = adjusted_width
+    bytes_content = _build_excel_bytes(title, rows)
 
     fname = _slugify_filename(filename or title)
     frappe.local.response.filename = f"{fname}.xlsx"
-    frappe.local.response.filecontent = wb.save_to_bytes()
+    frappe.local.response.filecontent = bytes_content
     frappe.local.response.type = "binary"
 
 
@@ -100,41 +86,132 @@ def export_to_excel(payload: str, filename: str | None = None):
 def export_to_pdf(payload: str, filename: str | None = None):
     """Export payload data to PDF format."""
     try:
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import letter
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.lib.units import inch
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+        import reportlab  # noqa: F401
     except ImportError as exc:
         frappe.throw("PDF export requires reportlab. Install with: pip install reportlab")
 
-    data = json.loads(payload)
-    title = data.get("title", "export")
-    rows = data.get("rows", [])
+    title, rows = _normalize_export_payload(payload)
 
     if not rows:
         frappe.throw("No data to export")
 
-    # Build table data
+    bytes_content = _build_pdf_bytes(title, rows)
+
+    fname = _slugify_filename(filename or title)
+    frappe.local.response.filename = f"{fname}.pdf"
+    frappe.local.response.filecontent = bytes_content
+    frappe.local.response.type = "binary"
+
+
+@frappe.whitelist()
+def export_to_word(payload: str, filename: str | None = None):
+    """Export payload data to Word format."""
+    try:
+        import docx  # noqa: F401
+    except ImportError as exc:
+        frappe.throw("Word export requires python-docx. Install with: pip install python-docx")
+
+    title, rows = _normalize_export_payload(payload)
+
+    if not rows:
+        frappe.throw("No data to export")
+
+    bytes_content = _build_word_bytes(title, rows)
+
+    fname = _slugify_filename(filename or title)
+    frappe.local.response.filename = f"{fname}.docx"
+    frappe.local.response.filecontent = bytes_content
+    frappe.local.response.type = "binary"
+
+
+def create_message_artifacts(
+    payload: Any,
+    title: str,
+    attached_to_doctype: str,
+    attached_to_name: str,
+) -> list[dict[str, str]]:
+    rows = _payload_to_rows(payload)
+    if not rows:
+        return []
+
+    attachments: list[dict[str, str]] = []
+    base_name = _slugify_filename(title or "assistant-export")
+    normalized_title = title or "Assistant Export"
+
+    builders = [
+        ("xlsx", "Excel", _build_excel_bytes),
+        ("pdf", "PDF", _build_pdf_bytes),
+        ("docx", "Word", _build_word_bytes),
+    ]
+
+    for ext, label, builder in builders:
+        try:
+            content = builder(normalized_title, rows)
+            filename = f"{base_name}.{ext}"
+            file_doc = save_file(
+                fname=filename,
+                content=content,
+                dt=attached_to_doctype,
+                dn=attached_to_name,
+                is_private=1,
+            )
+            attachments.append(
+                {
+                    "label": label,
+                    "filename": filename,
+                    "file_url": file_doc.file_url,
+                    "file_type": ext,
+                }
+            )
+        except Exception:
+            # Skip formats that fail due to missing libs or generation errors.
+            continue
+
+    return attachments
+
+
+def _build_excel_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = (title or "Export")[:30]
+
+    headers = list(rows[0].keys())
+    ws.append(headers)
+    for row in rows:
+        ws.append([_stringify_cell(row.get(header, "")) for header in headers])
+
+    for column in ws.columns:
+        max_length = 0
+        col_cells = list(column)
+        for cell in col_cells:
+            val = _stringify_cell(cell.value)
+            if len(val) > max_length:
+                max_length = len(val)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max_length + 2, 50)
+
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+
+
+def _build_pdf_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+
     headers = list(rows[0].keys())
     table_data = [headers]
     for row in rows:
         table_data.append([_stringify_cell(row.get(header, "")) for header in headers])
 
-    # Create PDF
-    from io import BytesIO
-
     buffer = BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter, title=title)
-
     styles = getSampleStyleSheet()
-    elements = []
+    elements = [Paragraph(title, styles["Title"]), Paragraph("<br/>", styles["Normal"])]
 
-    # Title
-    elements.append(Paragraph(title, styles["Title"]))
-    elements.append(Paragraph("<br/>", styles["Normal"]))
-
-    # Table
     table = Table(table_data)
     table.setStyle(
         TableStyle(
@@ -151,54 +228,26 @@ def export_to_pdf(payload: str, filename: str | None = None):
         )
     )
     elements.append(table)
-
     doc.build(elements)
-
-    fname = _slugify_filename(filename or title)
-    frappe.local.response.filename = f"{fname}.pdf"
-    frappe.local.response.filecontent = buffer.getvalue()
-    frappe.local.response.type = "binary"
+    return buffer.getvalue()
 
 
-@frappe.whitelist()
-def export_to_word(payload: str, filename: str | None = None):
-    """Export payload data to Word format."""
-    try:
-        from docx import Document
-        from docx.shared import Inches
-    except ImportError as exc:
-        frappe.throw("Word export requires python-docx. Install with: pip install python-docx")
-
-    data = json.loads(payload)
-    title = data.get("title", "export")
-    rows = data.get("rows", [])
-
-    if not rows:
-        frappe.throw("No data to export")
+def _build_word_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
+    from docx import Document
 
     doc = Document()
     doc.add_heading(title, 0)
 
-    # Add table
     headers = list(rows[0].keys())
     table = doc.add_table(rows=len(rows) + 1, cols=len(headers))
     table.style = "Light Grid"
 
-    # Add headers
     for i, header in enumerate(headers):
         table.rows[0].cells[i].text = header
-
-    # Add data rows
     for row_idx, row in enumerate(rows):
         for col_idx, header in enumerate(headers):
             table.rows[row_idx + 1].cells[col_idx].text = _stringify_cell(row.get(header, ""))
 
-    from io import BytesIO
-
     buffer = BytesIO()
     doc.save(buffer)
-
-    fname = _slugify_filename(filename or title)
-    frappe.local.response.filename = f"{fname}.docx"
-    frappe.local.response.filecontent = buffer.getvalue()
-    frappe.local.response.type = "binary"
+    return buffer.getvalue()

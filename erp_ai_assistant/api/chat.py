@@ -59,10 +59,13 @@ def list_conversations(search: str | None = None):
 @frappe.whitelist()
 def get_conversation(name: str):
     doc = _get_conversation(name)
+    fields = ["name", "role", "content", "tool_events", "creation"]
+    if frappe.db.has_column("AI Message", "attachments_json"):
+        fields.append("attachments_json")
     messages = frappe.get_all(
         "AI Message",
         filters={"conversation": name},
-        fields=["name", "role", "content", "tool_events", "creation"],
+        fields=fields,
         order_by="creation asc",
     )
     return {
@@ -112,17 +115,24 @@ def delete_conversation(name: str):
 
 
 @frappe.whitelist()
-def add_message(conversation: str, role: str, content: str, tool_events: str | None = None):
+def add_message(
+    conversation: str,
+    role: str,
+    content: str,
+    tool_events: str | None = None,
+    attachments_json: str | None = None,
+):
     _chat_storage_ready(raise_exception=True)
     _get_conversation(conversation)
-    message = frappe.get_doc(
-        {
-            "doctype": "AI Message",
-            "conversation": conversation,
-            "role": role,
-            "content": content,
-            "tool_events": tool_events,
-        }
-    )
+    values = {
+        "doctype": "AI Message",
+        "conversation": conversation,
+        "role": role,
+        "content": content,
+        "tool_events": tool_events,
+    }
+    if attachments_json and frappe.db.has_column("AI Message", "attachments_json"):
+        values["attachments_json"] = attachments_json
+    message = frappe.get_doc(values)
     message.insert(ignore_permissions=True)
     return message.as_dict()

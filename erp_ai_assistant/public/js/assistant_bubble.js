@@ -402,6 +402,11 @@
         // Preserve line breaks and basic formatting
         bodyElement.innerHTML = this._formatMessageContent(content);
 
+        const attachments = this._parseAttachments(message.attachments_json);
+        if (attachments.length) {
+          bubble.appendChild(this._renderAttachmentRow(attachments));
+        }
+
         // Add copy button for assistant messages
         if (message.role !== "user" && content) {
           const copyBtn = document.createElement("button");
@@ -452,6 +457,34 @@
         .replace(/`([^`]+)`/g, '<code class="erp-ai-assistant-message__inline-code">$1</code>')
         .replace(/\n\n/g, '</p><p>')
         .replace(/\n/g, '<br>');
+    }
+
+    _parseAttachments(raw) {
+      if (!raw) return [];
+      try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter((item) => item && item.file_url);
+      } catch (error) {
+        return [];
+      }
+    }
+
+    _renderAttachmentRow(attachments) {
+      const wrap = document.createElement("div");
+      wrap.className = "erp-ai-assistant-message__attachments";
+      attachments.forEach((item) => {
+        const link = document.createElement("a");
+        link.className = "erp-ai-assistant-message__attachment";
+        link.href = item.file_url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        const label = item.label || item.file_type || "File";
+        const name = item.filename || "download";
+        link.textContent = `${label}: ${name}`;
+        wrap.appendChild(link);
+      });
+      return wrap;
     }
 
     ensureConversation(callback) {
