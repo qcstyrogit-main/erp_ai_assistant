@@ -613,6 +613,12 @@
   flex-wrap: wrap;
 }
 
+.erp-ai-assistant-composer__buttons {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .erp-ai-assistant-composer__hint {
   font-size: 12px;
   color: var(--ai-text-secondary);
@@ -677,6 +683,38 @@
 .erp-ai-assistant-btn--primary:hover {
   background: linear-gradient(135deg, var(--ai-primary-dark), #b8563a);
   box-shadow: 0 4px 12px rgba(192, 86, 33, 0.25);
+}
+
+.erp-ai-assistant-btn--stop {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid #d9cdbf;
+  background: #f7efe5;
+  color: #2a231d;
+}
+
+.erp-ai-assistant-btn--stop[hidden] {
+  display: none !important;
+}
+
+.erp-ai-assistant-stop-icon {
+  width: 20px;
+  height: 20px;
+  border: 2px solid currentColor;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.erp-ai-assistant-stop-icon::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  background: currentColor;
+  border-radius: 1px;
 }
 
 .erp-ai-assistant-btn:disabled {

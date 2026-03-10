@@ -22,6 +22,15 @@
 
       /** @type {Object} */
       this.elements = {};
+
+      /** @type {boolean} */
+      this.isGenerating = false;
+
+      /** @type {JQuery.jqXHR|null} */
+      this.pendingPromptRequest = null;
+
+      /** @type {boolean} */
+      this.abortRequested = false;
     }
 
     boot() {
@@ -79,7 +88,12 @@
             <textarea rows="3" placeholder="Ask about this record, generate a report, or update data..." aria-label="Message input"></textarea>
             <div class="erp-ai-assistant-composer__actions">
               <span class="erp-ai-assistant-composer__hint"><kbd>Enter</kbd> to send <kbd>Shift+Enter</kbd> for newline</span>
-              <button class="erp-ai-assistant-btn erp-ai-assistant-btn--primary" data-action="send" title="Send message">Send</button>
+              <div class="erp-ai-assistant-composer__buttons">
+                <button class="erp-ai-assistant-btn erp-ai-assistant-btn--stop" data-action="stop" title="Stop response" aria-label="Stop response" hidden>
+                  <span class="erp-ai-assistant-stop-icon" aria-hidden="true"></span>
+                </button>
+                <button class="erp-ai-assistant-btn erp-ai-assistant-btn--primary" data-action="send" title="Send message">Send</button>
+              </div>
             </div>
           </div>
         </div>
@@ -96,6 +110,8 @@
         context: drawer.querySelector(".erp-ai-assistant-context"),
         messages: drawer.querySelector(".erp-ai-assistant-messages"),
         textarea: drawer.querySelector("textarea"),
+        sendButton: drawer.querySelector('[data-action="send"]'),
+        stopButton: drawer.querySelector('[data-action="stop"]'),
         exportHistory: drawer.querySelector('[data-action="export-history"]'),
         importHistory: drawer.querySelector('[data-action="import-history"]'),
         importInput: drawer.querySelector(".erp-ai-assistant-import-input"),
@@ -104,6 +120,7 @@
       bubble.addEventListener("click", () => this.toggleDrawer());
       drawer.querySelector('[data-action="close"]')?.addEventListener("click", () => this.toggleDrawer(false));
       drawer.querySelector('[data-action="send"]')?.addEventListener("click", () => this.sendPrompt());
+      drawer.querySelector('[data-action="stop"]')?.addEventListener("click", () => this.stopPrompt());
       drawer.querySelector('[data-action="new-chat"]')?.addEventListener("click", () => this.startDraftConversation());
       this.elements.exportHistory?.addEventListener("click", () => this.exportHistory());
       this.elements.importHistory?.addEventListener("click", () => this.elements.importInput?.click());
@@ -156,6 +173,8 @@
           this.toggleDrawer(false);
         }
       });
+
+      this._setGeneratingState(false);
     }
 
     bindGlobalEvents() {
@@ -492,6 +511,8 @@
     }
 
     sendPrompt() {
+      if (this.isGenerating) return;
+
       const prompt = (this.elements.textarea?.value || "").trim();
       if (!prompt) return;
 
@@ -506,12 +527,12 @@
         }
 
         // Show typing indicator
+        this.abortRequested = false;
+        this._setGeneratingState(true);
         this._showTypingIndicator();
 
-        frappe.call({
+        const request = frappe.call({
           method: "erp_ai_assistant.api.ai.send_prompt",
-          freeze: true,
-          freeze_message: "Assistant is thinking...",
           args: {
             conversation: conversationName,
             prompt,
@@ -520,16 +541,35 @@
             route: context.route,
           },
           callback: (response) => {
-            this._hideTypingIndicator();
             this.refreshHistory();
             this.loadConversation(conversationName);
           },
           error: (error) => {
-            this._hideTypingIndicator();
+            if (this.abortRequested) return;
             frappe.show_alert({ message: error.message || "Assistant request failed", indicator: "red" });
           },
+          always: () => {
+            this.pendingPromptRequest = null;
+            this._setGeneratingState(false);
+            this._hideTypingIndicator();
+            this.abortRequested = false;
+          },
         });
+
+        this.pendingPromptRequest = request;
       });
+    }
+
+    stopPrompt() {
+      if (!this.isGenerating || !this.pendingPromptRequest) {
+        return;
+      }
+
+      this.abortRequested = true;
+      this.pendingPromptRequest.abort("abort");
+      this.pendingPromptRequest = null;
+      this._setGeneratingState(false);
+      this._hideTypingIndicator();
     }
 
     _addUserMessageToUI(prompt) {
@@ -580,6 +620,20 @@
       const indicator = document.getElementById("erp-ai-assistant-typing");
       if (indicator) {
         indicator.remove();
+      }
+    }
+
+    _setGeneratingState(isGenerating) {
+      this.isGenerating = !!isGenerating;
+
+      if (this.elements.sendButton) {
+        this.elements.sendButton.hidden = this.isGenerating;
+        this.elements.sendButton.disabled = this.isGenerating;
+      }
+
+      if (this.elements.stopButton) {
+        this.elements.stopButton.hidden = !this.isGenerating;
+        this.elements.stopButton.disabled = !this.isGenerating;
       }
     }
 
