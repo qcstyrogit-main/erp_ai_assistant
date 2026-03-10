@@ -1,0 +1,39 @@
+{% extends "templates/web.html" %}
+
+{% block page_content %}
+<div class="erp-web-assistant" id="erp-web-assistant">
+  <aside class="erp-web-assistant__sidebar">
+    <div class="erp-web-assistant__sidebar-head">
+      <div>
+        <p class="erp-web-assistant__eyebrow">ERP AI Assistant</p>
+        <h3>Conversations</h3>
+      </div>
+      <button class="erp-web-assistant__btn erp-web-assistant__btn--primary" data-action="new-chat" type="button">New</button>
+    </div>
+    <input class="erp-web-assistant__search" data-role="search" type="search" placeholder="Search conversations" />
+    <div class="erp-web-assistant__history" data-role="history"></div>
+  </aside>
+
+  <section class="erp-web-assistant__main">
+    <header class="erp-web-assistant__header">
+      <div>
+        <p class="erp-web-assistant__eyebrow">Context</p>
+        <p class="erp-web-assistant__context" data-role="context">General ERP workspace</p>
+      </div>
+    </header>
+
+    <div class="erp-web-assistant__messages" data-role="messages"></div>
+
+    <footer class="erp-web-assistant__composer">
+      <textarea data-role="prompt" rows="4" placeholder="Ask anything about your ERP data..."></textarea>
+      <div class="erp-web-assistant__composer-actions">
+        <small>Enter to send, Shift+Enter for newline</small>
+        <button class="erp-web-assistant__btn erp-web-assistant__btn--primary" data-action="send" type="button">Send</button>
+      </div>
+    </footer>
+  </section>
+</div>
+
+<link rel="stylesheet" href="/assets/erp_ai_assistant/css/web_assistant.css">
+<script src="/assets/erp_ai_assistant/js/web_assistant.js"></script>
+{% endblock %}

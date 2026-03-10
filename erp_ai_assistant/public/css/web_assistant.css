@@ -1,0 +1,169 @@
+:root {
+  --ai-primary: #d97757;
+  --ai-primary-dark: #c86446;
+  --ai-bg: #f6efe5;
+  --ai-surface: #fffaf3;
+  --ai-sidebar: #1f2937;
+  --ai-sidebar-item: #2f3a4d;
+  --ai-border: #e2d4c4;
+  --ai-text: #2a231d;
+  --ai-muted: #85776a;
+}
+
+.erp-web-assistant {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  min-height: calc(100vh - 180px);
+  border: 1px solid var(--ai-border);
+  border-radius: 20px;
+  overflow: hidden;
+  background: var(--ai-bg);
+}
+
+.erp-web-assistant__sidebar {
+  background: var(--ai-sidebar);
+  color: #f9f6f1;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.erp-web-assistant__sidebar-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.erp-web-assistant__eyebrow {
+  margin: 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.8;
+}
+
+.erp-web-assistant__search,
+.erp-web-assistant__composer textarea {
+  width: 100%;
+  border: 1px solid #d9cdbf;
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: var(--ai-surface);
+  color: var(--ai-text);
+}
+
+.erp-web-assistant__history {
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+}
+
+.erp-web-assistant__history-item {
+  border: 0;
+  border-radius: 10px;
+  background: var(--ai-sidebar-item);
+  color: #f4efe6;
+  text-align: left;
+  padding: 10px;
+  cursor: pointer;
+}
+
+.erp-web-assistant__history-item.is-active,
+.erp-web-assistant__history-item:hover {
+  background: #42506a;
+}
+
+.erp-web-assistant__main {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-height: 0;
+}
+
+.erp-web-assistant__header,
+.erp-web-assistant__composer {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--ai-border);
+}
+
+.erp-web-assistant__composer {
+  border-bottom: 0;
+  border-top: 1px solid var(--ai-border);
+}
+
+.erp-web-assistant__context {
+  margin: 4px 0 0;
+  color: var(--ai-text);
+  font-weight: 600;
+}
+
+.erp-web-assistant__messages {
+  overflow: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.erp-web-assistant__msg {
+  max-width: 80%;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--ai-border);
+  background: var(--ai-surface);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.erp-web-assistant__msg.is-user {
+  margin-left: auto;
+  color: #fffaf5;
+  border-color: var(--ai-primary);
+  background: linear-gradient(135deg, var(--ai-primary), var(--ai-primary-dark));
+}
+
+.erp-web-assistant__msg-meta {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--ai-muted);
+}
+
+.erp-web-assistant__msg.is-user .erp-web-assistant__msg-meta {
+  color: rgba(255, 250, 245, 0.9);
+}
+
+.erp-web-assistant__composer-actions {
+  margin-top: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.erp-web-assistant__btn {
+  border: 0;
+  border-radius: 10px;
+  background: #e9dfd1;
+  color: var(--ai-text);
+  padding: 8px 12px;
+  font-weight: 600;
+}
+
+.erp-web-assistant__btn--primary {
+  color: #fffaf5;
+  background: linear-gradient(135deg, var(--ai-primary), var(--ai-primary-dark));
+}
+
+@media (max-width: 980px) {
+  .erp-web-assistant {
+    grid-template-columns: 1fr;
+  }
+
+  .erp-web-assistant__sidebar {
+    min-height: 240px;
+  }
+}

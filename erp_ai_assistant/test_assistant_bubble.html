@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Assistant Bubble Local Test</title>
+    <link rel="stylesheet" href="./public/css/assistant_bubble.css" />
+    <style>
+      body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #f2f3f5;
+      }
+
+      .mock-page {
+        min-height: 100vh;
+        padding: 24px;
+      }
+
+      .mock-card {
+        max-width: 760px;
+        background: #fff;
+        border: 1px solid #ddd;
+        border-radius: 12px;
+        padding: 20px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="mock-page">
+      <div class="mock-card">
+        <h2>ERP Desk Mock Page</h2>
+        <p>Use this page to test assistant bubble layout without ERP installation.</p>
+      </div>
+    </div>
+
+    <script>
+      window.$ = function () {
+        return {
+          on: function () {},
+        };
+      };
+
+      window.erp_ai_assistant = window.erp_ai_assistant || {};
+
+      window.frappe = {
+        session: { user: "Administrator" },
+        get_route: function () {
+          return ["Form", "Sales Invoice", "ACC-SINV-2026-00001"];
+        },
+        provide: function (path) {
+          var parts = path.split(".");
+          var ref = window;
+          for (var i = 0; i < parts.length; i++) {
+            ref[parts[i]] = ref[parts[i]] || {};
+            ref = ref[parts[i]];
+          }
+        },
+        after_ajax: function (fn) {
+          setTimeout(fn, 0);
+        },
+        utils: {
+          escape_html: function (text) {
+            var value = String(text || "");
+            return value
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .replace(/"/g, "&quot;")
+              .replace(/'/g, "&#039;");
+          },
+        },
+        datetime: {
+          str_to_user: function (value) {
+            return value || "";
+          },
+        },
+        show_alert: function (opts) {
+          console.log("Alert:", opts);
+        },
+        confirm: function (msg, yes) {
+          if (window.confirm(msg)) yes();
+        },
+        call: function (opts) {
+          var method = opts.method || "";
+          var ok = function (message) {
+            if (opts.callback) {
+              setTimeout(function () {
+                opts.callback({ message: message });
+              }, 120);
+            }
+          };
+
+          if (method === "erp_ai_assistant.api.chat.list_conversations") {
+            ok([
+              {
+                name: "CHAT-0001",
+                title: "Sales Invoice Follow-up",
+                modified: "2026-03-09 16:15:00",
+                is_pinned: 1,
+              },
+              {
+                name: "CHAT-0002",
+                title: "Supplier Summary",
+                modified: "2026-03-09 15:10:00",
+                is_pinned: 0,
+              },
+            ]);
+            return;
+          }
+
+          if (method === "erp_ai_assistant.api.chat.get_conversation") {
+            ok({
+              conversation: {
+                name: opts.args.name,
+                title: opts.args.name === "CHAT-0001" ? "Sales Invoice Follow-up" : "Supplier Summary",
+              },
+              messages: [
+                {
+                  role: "assistant",
+                  creation: "2026-03-09 16:15:28",
+                  content: "Try prompts like 'Show me list of customers'.",
+                },
+                {
+                  role: "user",
+                  creation: "2026-03-09 16:20:24",
+                  content: "Show overdue invoices for this customer.",
+                },
+              ],
+            });
+            return;
+          }
+
+          if (method === "erp_ai_assistant.api.chat.create_conversation") {
+            ok({ name: "CHAT-NEW", title: opts.args && opts.args.title ? opts.args.title : "New chat" });
+            return;
+          }
+
+          if (
+            method === "erp_ai_assistant.api.chat.toggle_pin" ||
+            method === "erp_ai_assistant.api.chat.delete_conversation" ||
+            method === "erp_ai_assistant.api.import_export.export_history" ||
+            method === "erp_ai_assistant.api.import_export.import_history" ||
+            method === "erp_ai_assistant.api.export.export_to_excel" ||
+            method === "erp_ai_assistant.api.export.export_to_pdf" ||
+            method === "erp_ai_assistant.api.export.export_to_word"
+          ) {
+            ok({ count: 1 });
+            return;
+          }
+
+          if (method === "erp_ai_assistant.api.ai.send_prompt") {
+            ok({
+              payload: {
+                rows: [{ label: "Sample", value: "Mock export row" }],
+              },
+            });
+            return;
+          }
+
+          if (opts.error) {
+            opts.error({ message: "Unknown method in local mock: " + method });
+          }
+        },
+      };
+    </script>
+    <script src="./public/js/assistant_bubble.js"></script>
+  </body>
+</html>
