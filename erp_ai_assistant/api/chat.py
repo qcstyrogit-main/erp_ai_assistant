@@ -22,7 +22,8 @@ def _chat_storage_ready(raise_exception: bool = False) -> bool:
             return False
 
         # Ensure the underlying database table is present after migration.
-        if not frappe.db.table_exists(f"tab{doctype}"):
+        # `table_exists` expects the DocType name, not a pre-prefixed tablename.
+        if not frappe.db.table_exists(doctype):
             if raise_exception:
                 raise _chat_storage_missing_error() from None
             return False
