@@ -7,6 +7,12 @@ import frappe
 from frappe import _
 
 
+def _json_default(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
 @frappe.whitelist()
 def export_history(start_date=None, end_date=None):
     """Export user's conversations and messages as JSON.
@@ -20,9 +26,11 @@ def export_history(start_date=None, end_date=None):
 
     # Get conversations for current user
     filters = {"owner": frappe.session.user}
-    if start_date:
+    if start_date and end_date:
+        filters["creation"] = ["between", [start_date, end_date]]
+    elif start_date:
         filters["creation"] = [">=", start_date]
-    if end_date:
+    elif end_date:
         filters["creation"] = ["<=", end_date]
 
     conversations = frappe.get_all(
@@ -34,10 +42,13 @@ def export_history(start_date=None, end_date=None):
 
     export_data = []
     for conv in conversations:
+        message_fields = ["role", "content", "tool_events", "creation"]
+        if frappe.db.has_column("AI Message", "attachments_json"):
+            message_fields.append("attachments_json")
         messages = frappe.get_all(
             "AI Message",
             filters={"conversation": conv.name},
-            fields=["role", "content", "tool_events", "creation"],
+            fields=message_fields,
             order_by="creation asc"
         )
 
@@ -52,8 +63,8 @@ def export_history(start_date=None, end_date=None):
     filename = f"erp_ai_assistant_export_{frappe.session.user}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
     frappe.local.response.filename = filename
-    frappe.local.response.filecontent = json.dumps(export_data, indent=2)
-    frappe.local.response.type = "json"
+    frappe.local.response.filecontent = json.dumps(export_data, indent=2, default=_json_default)
+    frappe.local.response.type = "download"
 
 
 @frappe.whitelist()
@@ -97,13 +108,16 @@ def import_history(file_data):
             # Add messages
             messages = conv_data.get("messages", [])
             for msg_data in messages:
-                msg = frappe.get_doc({
+                msg_values = {
                     "doctype": "AI Message",
                     "conversation": conv.name,
                     "role": msg_data.get("role"),
                     "content": msg_data.get("content"),
                     "tool_events": msg_data.get("tool_events")
-                })
+                }
+                if frappe.db.has_column("AI Message", "attachments_json") and msg_data.get("attachments_json"):
+                    msg_values["attachments_json"] = msg_data.get("attachments_json")
+                msg = frappe.get_doc(msg_values)
                 msg.insert(ignore_permissions=True)
 
             imported.append(conv.title)

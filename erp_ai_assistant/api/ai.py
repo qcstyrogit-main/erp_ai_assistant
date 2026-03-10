@@ -61,6 +61,7 @@ def send_prompt(
         response.get("payload"),
         title=f"{_summarize_title(prompt)} export",
         conversation=conversation_name,
+        prompt=prompt,
     )
     add_message(
         conversation_name,
@@ -80,19 +81,35 @@ def send_prompt(
     }
 
 
-def _build_message_attachments(payload: Any, title: str, conversation: str) -> list[dict[str, Any]]:
+def _build_message_attachments(payload: Any, title: str, conversation: str, prompt: str) -> list[dict[str, Any]]:
     if payload in (None, "", [], {}):
         return []
     try:
+        formats = _requested_export_formats(prompt)
         return create_message_artifacts(
             payload=payload,
             title=title,
             attached_to_doctype="AI Conversation",
             attached_to_name=conversation,
+            formats=formats,
         )
     except Exception:
         frappe.log_error(frappe.get_traceback(), "ERP AI Assistant Artifact Generation Error")
         return []
+
+
+def _requested_export_formats(prompt: str) -> list[str]:
+    text = (prompt or "").lower()
+    formats: list[str] = []
+    if any(term in text for term in ["excel", ".xlsx", "xlsx", "spreadsheet"]):
+        formats.append("xlsx")
+    if any(term in text for term in ["pdf", ".pdf"]):
+        formats.append("pdf")
+    if any(term in text for term in ["word", "docx", ".docx", "document file"]):
+        formats.append("docx")
+    if formats:
+        return formats
+    return ["xlsx", "pdf", "docx"]
 
 
 def _generate_response(

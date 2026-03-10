@@ -711,23 +711,6 @@
   color: #fffaf5;
 }
 
-.erp-ai-assistant-export-panel {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-}
-
-.erp-ai-assistant-export-panel .erp-ai-assistant-btn {
-  padding: 8px 12px;
-  font-size: 12px;
-}
-
-.erp-ai-assistant-export-panel .erp-ai-assistant-btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
 @media (max-width: 900px) {
   #erp-ai-assistant-drawer {
     width: calc(100vw - 16px);

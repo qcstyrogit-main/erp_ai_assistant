@@ -129,6 +129,7 @@ def create_message_artifacts(
     title: str,
     attached_to_doctype: str,
     attached_to_name: str,
+    formats: list[str] | None = None,
 ) -> list[dict[str, str]]:
     rows = _payload_to_rows(payload)
     if not rows:
@@ -143,6 +144,9 @@ def create_message_artifacts(
         ("pdf", "PDF", _build_pdf_bytes),
         ("docx", "Word", _build_word_bytes),
     ]
+    allowed_formats = {str(fmt).lower().strip() for fmt in (formats or []) if str(fmt).strip()}
+    if allowed_formats:
+        builders = [row for row in builders if row[0] in allowed_formats]
 
     for ext, label, builder in builders:
         try:

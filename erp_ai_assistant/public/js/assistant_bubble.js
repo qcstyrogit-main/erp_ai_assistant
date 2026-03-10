@@ -22,9 +22,6 @@
 
       /** @type {Object} */
       this.elements = {};
-
-      /** @type {Object|null} */
-      this.latestExportBundle = null;
     }
 
     boot() {
@@ -75,11 +72,6 @@
               <div class="erp-ai-assistant-drawer__eyebrow">Current Context</div>
               <div class="erp-ai-assistant-context" title="The current page context being used for responses"></div>
             </div>
-            <div class="erp-ai-assistant-export-panel">
-              <button class="erp-ai-assistant-btn" data-action="export-excel" title="Export last response to Excel" disabled>Excel</button>
-              <button class="erp-ai-assistant-btn" data-action="export-pdf" title="Export last response to PDF" disabled>PDF</button>
-              <button class="erp-ai-assistant-btn" data-action="export-word" title="Export last response to Word" disabled>Word</button>
-            </div>
             <button class="erp-ai-assistant-btn" data-action="close" title="Close assistant (Esc)">Close</button>
           </div>
           <div class="erp-ai-assistant-messages"></div>
@@ -104,9 +96,6 @@
         context: drawer.querySelector(".erp-ai-assistant-context"),
         messages: drawer.querySelector(".erp-ai-assistant-messages"),
         textarea: drawer.querySelector("textarea"),
-        exportExcel: drawer.querySelector('[data-action="export-excel"]'),
-        exportPdf: drawer.querySelector('[data-action="export-pdf"]'),
-        exportWord: drawer.querySelector('[data-action="export-word"]'),
         exportHistory: drawer.querySelector('[data-action="export-history"]'),
         importHistory: drawer.querySelector('[data-action="import-history"]'),
         importInput: drawer.querySelector(".erp-ai-assistant-import-input"),
@@ -116,9 +105,6 @@
       drawer.querySelector('[data-action="close"]')?.addEventListener("click", () => this.toggleDrawer(false));
       drawer.querySelector('[data-action="send"]')?.addEventListener("click", () => this.sendPrompt());
       drawer.querySelector('[data-action="new-chat"]')?.addEventListener("click", () => this.startDraftConversation());
-      this.elements.exportExcel?.addEventListener("click", () => this.exportData("excel"));
-      this.elements.exportPdf?.addEventListener("click", () => this.exportData("pdf"));
-      this.elements.exportWord?.addEventListener("click", () => this.exportData("word"));
       this.elements.exportHistory?.addEventListener("click", () => this.exportHistory());
       this.elements.importHistory?.addEventListener("click", () => this.elements.importInput?.click());
       this.elements.importInput?.addEventListener("change", (e) => this.importHistory(e));
@@ -161,12 +147,6 @@
               if (event.shiftKey) {
                 event.preventDefault();
                 this.elements.search?.focus();
-              }
-              break;
-            case "e":
-              if (event.shiftKey && this.latestExportBundle) {
-                event.preventDefault();
-                this.exportData("excel");
               }
               break;
           }
@@ -543,7 +523,6 @@
             this._hideTypingIndicator();
             this.refreshHistory();
             this.loadConversation(conversationName);
-            this._setExportBundle(response.message?.payload || null);
           },
           error: (error) => {
             this._hideTypingIndicator();
@@ -633,42 +612,6 @@
       } catch (error) {
         return false;
       }
-    }
-
-    _setExportBundle(payload) {
-      this.latestExportBundle = payload;
-      const enabled = !!payload;
-      if (this.elements.exportExcel) this.elements.exportExcel.disabled = !enabled;
-      if (this.elements.exportPdf) this.elements.exportPdf.disabled = !enabled;
-      if (this.elements.exportWord) this.elements.exportWord.disabled = !enabled;
-    }
-
-    exportData(format) {
-      if (!this.latestExportBundle) {
-        frappe.show_alert({ message: "No data to export", indicator: "yellow" });
-        return;
-      }
-
-      const payload = {
-        title: this.activeConversation?.title || "Export",
-        rows: this.latestExportBundle.rows || [this.latestExportBundle],
-      };
-
-      frappe.call({
-        method:
-          format === "excel"
-            ? "erp_ai_assistant.api.export.export_to_excel"
-            : format === "pdf"
-            ? "erp_ai_assistant.api.export.export_to_pdf"
-            : "erp_ai_assistant.api.export.export_to_word",
-        args: { payload: JSON.stringify(payload), filename: this.activeConversation?.title },
-        callback: () => {
-          // Frappe handles download automatically
-        },
-        error: (error) => {
-          frappe.show_alert({ message: error.message || "Export failed", indicator: "red" });
-        },
-      });
     }
 
     exportHistory() {
