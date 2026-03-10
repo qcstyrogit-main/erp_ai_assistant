@@ -1,7 +1,7 @@
 {
   "doctype": "DocType",
   "name": "AI Conversation",
-  "module": "Assistant Core",
+  "module": "ERP AI Assistant",
   "custom": 0,
   "istable": 0,
   "track_changes": 1,

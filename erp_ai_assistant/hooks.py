@@ -17,7 +17,7 @@ app_include_css = [
 
 add_to_apps_screen = [
     {
-        "name": "erp-ai-assistant",
+        "name": "erp_ai_assistant",
         "logo": "/assets/erp_ai_assistant/logo.svg",
         "title": "ERP AI Assistant",
         "route": "/app/assistant-workspace",
