@@ -41,7 +41,8 @@ def send_prompt(
         "user": frappe.session.user,
     }
 
-    response = _generate_response(prompt.strip(), context)
+    history = _conversation_history_for_llm(conversation_name)
+    response = _generate_response(prompt.strip(), context, history=history)
     add_message(
         conversation_name,
         "assistant",
@@ -58,10 +59,12 @@ def send_prompt(
     }
 
 
-def _generate_response(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
-    if os.getenv("ANTHROPIC_API_KEY"):
+def _generate_response(
+    prompt: str, context: dict[str, Any], history: Optional[list[dict[str, Any]]] = None
+) -> dict[str, Any]:
+    if _llm_chat_configured():
         try:
-            return _anthropic_chat(prompt, context)
+            return _anthropic_chat(prompt, context, history=history)
         except Exception:
             frappe.log_error(frappe.get_traceback(), "ERP AI Assistant Chat Error")
 
@@ -80,6 +83,17 @@ def _generate_response(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
     return {"text": guidance, "tool_events": [], "payload": None}
 
 
+def _llm_chat_configured() -> bool:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    base_url = os.getenv("ANTHROPIC_BASE_URL")
+    messages_path = os.getenv("ANTHROPIC_MESSAGES_PATH")
+    if api_key:
+        return True
+    if base_url and base_url.rstrip("/") != "https://api.anthropic.com":
+        return True
+    return bool(messages_path)
+
+
 def _set_conversation_title_from_prompt(conversation_name: str, prompt: str) -> None:
     title = _summarize_title(prompt)
     if not title:
@@ -94,12 +108,33 @@ def _set_conversation_title_from_prompt(conversation_name: str, prompt: str) -> 
     doc.save(ignore_permissions=True)
 
 
+def _conversation_history_for_llm(conversation_name: str, limit: int = 24) -> list[dict[str, Any]]:
+    messages = frappe.get_all(
+        "AI Message",
+        filters={"conversation": conversation_name},
+        fields=["role", "content"],
+        order_by="creation desc",
+        limit_page_length=max(1, limit),
+    )
+    history: list[dict[str, Any]] = []
+    for row in reversed(messages):
+        role = (row.get("role") or "").strip().lower()
+        content = (row.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            history.append({"role": "user", "content": content})
+        elif role == "assistant":
+            history.append({"role": "assistant", "content": content})
+    return history
+
+
 def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any]]:
     raw_text = _normalize_name(prompt)
     text = raw_text.lower()
 
     sales_report_match = re.match(
-        r"^(create|show|get|run)( me)?( a)? sales order report( for)? (?P<year>\d{4})$",
+        r"^(create|show|get|run|generate)( me)?( a)? sales order report( for)? (?P<year>\d{4})$",
         text,
         re.IGNORECASE,
     ) or re.match(r"^sales( orders?)?( report)? (?P<year>\d{4})$", text, re.IGNORECASE)
@@ -216,7 +251,7 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
                 "heading": f"{doctype} list",
             }
 
-    report_match = re.match(r"^(run|show|get)( me)?( the)? report (.+)$", raw_text, re.IGNORECASE)
+    report_match = re.match(r"^(run|show|get|generate)( me)?( the)? report (.+)$", raw_text, re.IGNORECASE)
     if report_match:
         report_name = _normalize_name(report_match.group(4))
         return {
@@ -243,7 +278,9 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
     return None
 
 
-def _anthropic_chat(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
+def _anthropic_chat(
+    prompt: str, context: dict[str, Any], history: Optional[list[dict[str, Any]]] = None
+) -> dict[str, Any]:
     api_key = os.getenv("ANTHROPIC_API_KEY")
     model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
     base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
@@ -274,11 +311,12 @@ def _anthropic_chat(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
     ]
 
     system = (
-        "You are an ERP assistant inside Frappe. "
-        "Use tools whenever data is needed. "
+        "You are a helpful Frappe and ERPNext assistant. "
+        "Use available tools whenever live data is needed or when creating/updating records. "
+        "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
         f"Current context: doctype={context.get('doctype')}, docname={context.get('docname')}, route={context.get('route')}."
     )
-    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    messages: list[dict[str, Any]] = history[:] if history else [{"role": "user", "content": prompt}]
     tool_events: list[str] = []
     rendered_payload = None
 

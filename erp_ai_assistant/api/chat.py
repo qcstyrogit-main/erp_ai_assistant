@@ -103,6 +103,9 @@ def toggle_pin(name: str):
 @frappe.whitelist()
 def delete_conversation(name: str):
     doc = _get_conversation(name)
+    messages = frappe.get_all("AI Message", filters={"conversation": doc.name}, pluck="name")
+    for message_name in messages:
+        frappe.delete_doc("AI Message", message_name, ignore_permissions=True)
     frappe.delete_doc("AI Conversation", doc.name, ignore_permissions=True)
     return {"ok": True}
 
