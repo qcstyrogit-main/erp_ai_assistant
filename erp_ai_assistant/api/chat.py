@@ -5,28 +5,27 @@ from frappe import _
 CHAT_DOCTYPES = ("AI Conversation", "AI Message")
 
 
-def _is_missing_doctype(exc: Exception, doctype: str) -> bool:
-    if isinstance(exc, getattr(frappe.db, "TableMissingError", tuple())):
-        return True
-    args = getattr(exc, "args", ())
-    return len(args) >= 2 and args[0] == "DocType" and args[1] == doctype
+def _chat_storage_missing_error() -> frappe.ValidationError:
+    return frappe.ValidationError(
+        _(
+            "ERP AI Assistant is installed but its DocTypes are not available on this site yet. "
+            "Run bench migrate for the affected site, then reload Desk."
+        )
+    )
 
 
 def _chat_storage_ready(raise_exception: bool = False) -> bool:
     for doctype in CHAT_DOCTYPES:
-        try:
-            frappe.db.get_table_columns(doctype)
-        except Exception as exc:
-            if _is_missing_doctype(exc, doctype):
-                if raise_exception:
-                    raise frappe.ValidationError(
-                        _(
-                            "ERP AI Assistant is installed but its DocTypes are not available on this site yet. "
-                            "Run bench migrate for the affected site, then reload Desk."
-                        )
-                    )
-                return False
-            raise
+        if not frappe.db.exists("DocType", doctype):
+            if raise_exception:
+                raise _chat_storage_missing_error() from None
+            return False
+
+        # Ensure the underlying database table is present after migration.
+        if not frappe.db.table_exists(f"tab{doctype}"):
+            if raise_exception:
+                raise _chat_storage_missing_error() from None
+            return False
     return True
 
 
