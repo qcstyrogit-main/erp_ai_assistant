@@ -26,9 +26,19 @@
 
     <footer class="erp-web-assistant__composer">
       <textarea data-role="prompt" rows="4" placeholder="Ask anything about your ERP data..."></textarea>
+      <div class="erp-web-assistant__image-preview" data-role="image-preview"></div>
+      <input type="file" data-role="image-input" accept="image/*" multiple hidden />
       <div class="erp-web-assistant__composer-actions">
-        <small>Enter to send, Shift+Enter for newline</small>
-        <button class="erp-web-assistant__btn erp-web-assistant__btn--primary" data-action="send" type="button">Send</button>
+        <div class="erp-web-assistant__composer-left">
+          <select class="erp-web-assistant__model-select" data-role="model-select" aria-label="Select AI model">
+            <option value="">Default model</option>
+          </select>
+          <small>Enter to send, Shift+Enter for newline</small>
+        </div>
+        <div class="erp-web-assistant__composer-right">
+          <button class="erp-web-assistant__btn" data-action="attach-image" type="button">Image</button>
+          <button class="erp-web-assistant__btn erp-web-assistant__btn--primary" data-action="send" type="button">Send</button>
+        </div>
       </div>
     </footer>
   </section>

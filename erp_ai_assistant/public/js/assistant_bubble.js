@@ -31,6 +31,18 @@
 
       /** @type {boolean} */
       this.abortRequested = false;
+
+      /** @type {string} */
+      this.modelStorageKey = "erp_ai_assistant_selected_model";
+
+      /** @type {number|null} */
+      this.progressPollTimer = null;
+
+      /** @type {boolean} */
+      this.progressPollPending = false;
+
+      /** @type {Array<Object>} */
+      this.pendingImages = [];
     }
 
     boot() {
@@ -66,9 +78,6 @@
               <h3>Conversations</h3>
             </div>
             <div class="erp-ai-assistant-drawer__sidebar-actions">
-              <button class="erp-ai-assistant-btn" data-action="export-history" title="Export all conversations (JSON)">Export</button>
-              <button class="erp-ai-assistant-btn" data-action="import-history" title="Import conversations (JSON)">Import</button>
-              <input type="file" class="erp-ai-assistant-import-input" accept=".json" aria-label="Import file" style="display: none;" />
               <button class="erp-ai-assistant-btn erp-ai-assistant-btn--primary" data-action="new-chat" title="Start new conversation (Ctrl+Shift+N)">New Chat</button>
             </div>
           </div>
@@ -86,9 +95,17 @@
           <div class="erp-ai-assistant-messages"></div>
           <div class="erp-ai-assistant-composer">
             <textarea rows="3" placeholder="Ask about this record, generate a report, or update data..." aria-label="Message input"></textarea>
+            <div class="erp-ai-assistant-image-preview"></div>
+            <input type="file" class="erp-ai-assistant-image-input" accept="image/*" multiple hidden />
             <div class="erp-ai-assistant-composer__actions">
-              <span class="erp-ai-assistant-composer__hint"><kbd>Enter</kbd> to send <kbd>Shift+Enter</kbd> for newline</span>
+              <div class="erp-ai-assistant-composer__left">
+                <select class="erp-ai-assistant-model-select" aria-label="Select AI model">
+                  <option value="">Default model</option>
+                </select>
+                <span class="erp-ai-assistant-composer__hint"><kbd>Enter</kbd> to send <kbd>Shift+Enter</kbd> for newline</span>
+              </div>
               <div class="erp-ai-assistant-composer__buttons">
+                <button class="erp-ai-assistant-btn" data-action="attach-image" title="Attach image or paste screenshot" type="button">Image</button>
                 <button class="erp-ai-assistant-btn erp-ai-assistant-btn--stop" data-action="stop" title="Stop response" aria-label="Stop response" hidden>
                   <span class="erp-ai-assistant-stop-icon" aria-hidden="true"></span>
                 </button>
@@ -110,11 +127,12 @@
         context: drawer.querySelector(".erp-ai-assistant-context"),
         messages: drawer.querySelector(".erp-ai-assistant-messages"),
         textarea: drawer.querySelector("textarea"),
+        imagePreview: drawer.querySelector(".erp-ai-assistant-image-preview"),
+        imageInput: drawer.querySelector(".erp-ai-assistant-image-input"),
+        attachImageButton: drawer.querySelector('[data-action="attach-image"]'),
+        modelSelect: drawer.querySelector(".erp-ai-assistant-model-select"),
         sendButton: drawer.querySelector('[data-action="send"]'),
         stopButton: drawer.querySelector('[data-action="stop"]'),
-        exportHistory: drawer.querySelector('[data-action="export-history"]'),
-        importHistory: drawer.querySelector('[data-action="import-history"]'),
-        importInput: drawer.querySelector(".erp-ai-assistant-import-input"),
       };
 
       bubble.addEventListener("click", () => this.toggleDrawer());
@@ -122,15 +140,27 @@
       drawer.querySelector('[data-action="send"]')?.addEventListener("click", () => this.sendPrompt());
       drawer.querySelector('[data-action="stop"]')?.addEventListener("click", () => this.stopPrompt());
       drawer.querySelector('[data-action="new-chat"]')?.addEventListener("click", () => this.startDraftConversation());
-      this.elements.exportHistory?.addEventListener("click", () => this.exportHistory());
-      this.elements.importHistory?.addEventListener("click", () => this.elements.importInput?.click());
-      this.elements.importInput?.addEventListener("change", (e) => this.importHistory(e));
+      this.elements.attachImageButton?.addEventListener("click", () => this.elements.imageInput?.click());
+      this.elements.imageInput?.addEventListener("change", async (event) => {
+        await this._ingestImageFiles(event?.target?.files);
+        if (this.elements.imageInput) {
+          this.elements.imageInput.value = "";
+        }
+      });
+      this.elements.modelSelect?.addEventListener("change", () => this._persistSelectedModel());
       this.elements.search?.addEventListener("input", () => this.renderHistory());
       this.elements.textarea?.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
           this.sendPrompt();
         }
+      });
+      this.elements.textarea?.addEventListener("paste", async (event) => {
+        const items = Array.from(event.clipboardData?.items || []).filter((item) => String(item.type || "").startsWith("image/"));
+        if (!items.length) return;
+        event.preventDefault();
+        const files = items.map((item) => item.getAsFile()).filter(Boolean);
+        await this._ingestImageFiles(files);
       });
 
       // Keyboard shortcuts
@@ -175,6 +205,7 @@
       });
 
       this._setGeneratingState(false);
+      this.loadModelOptions();
     }
 
     bindGlobalEvents() {
@@ -324,6 +355,7 @@
     startDraftConversation() {
       this.activeConversation = null;
       this.isDraftConversation = true;
+      this._clearPendingImages();
       this.renderMessages([]);
       this.renderHistory();
       if (this.elements.textarea) {
@@ -357,6 +389,7 @@
           const payload = response.message || {};
           this.activeConversation = payload.conversation || null;
           this.isDraftConversation = false;
+          this._clearPendingImages();
           this.renderMessages(payload.messages || []);
           this.renderHistory();
         },
@@ -398,8 +431,12 @@
         const bodyElement = bubble.querySelector(".erp-ai-assistant-message__body");
         const content = message.content || "";
 
-        // Preserve line breaks and basic formatting
         bodyElement.innerHTML = this._formatMessageContent(content);
+
+        const toolEvents = this._parseToolEvents(message.tool_events);
+        if (toolEvents.length) {
+          bubble.appendChild(this._renderToolEventRow(toolEvents));
+        }
 
         const attachments = this._parseAttachments(message.attachments_json);
         if (attachments.length) {
@@ -443,30 +480,221 @@
     }
 
     _formatMessageContent(content) {
+      return this._renderRichText(content || "");
+    }
+
+    _renderRichText(content) {
       if (!content) return "";
 
-      // Escape HTML
-      const escaped = content.replace(/&/g, "&amp;")
-                           .replace(/</g, "&lt;")
-                           .replace(/>/g, "&gt;");
+      const tokens = [];
+      const withCodeTokens = String(content).replace(/```([\s\S]*?)```/g, (_, block) => {
+        const token = `__ERP_AI_BLOCK_${tokens.length}__`;
+        tokens.push(`<pre class="erp-ai-assistant-message__code-block"><code>${this._escapeHtml(block || "")}</code></pre>`);
+        return token;
+      });
 
-      // Convert markdown-like code blocks
-      return escaped
-        .replace(/```([\s\S]*?)```/g, '<pre class="erp-ai-assistant-message__code-block"><code>$1</code></pre>')
-        .replace(/`([^`]+)`/g, '<code class="erp-ai-assistant-message__inline-code">$1</code>')
-        .replace(/\n\n/g, '</p><p>')
-        .replace(/\n/g, '<br>');
+      const rendered = withCodeTokens
+        .split(/\n{2,}/)
+        .map((chunk) => this._renderBlock(chunk))
+        .filter(Boolean)
+        .join("");
+
+      return this._restoreTokens(rendered, tokens);
+    }
+
+    _renderBlock(chunk) {
+      const trimmed = String(chunk || "").trim();
+      if (!trimmed) return "";
+
+      if (/^#{1,3}\s/.test(trimmed)) {
+        const level = Math.min(6, Math.max(3, (trimmed.match(/^#+/) || ["###"])[0].length + 2));
+        return `<h${level} class="erp-ai-assistant-message__heading">${this._renderInline(trimmed.replace(/^#{1,3}\s*/, ""))}</h${level}>`;
+      }
+
+      const lines = trimmed.split("\n").map((line) => line.trimEnd());
+      if (this._looksLikeMarkdownTable(lines)) {
+        return this._renderTable(lines);
+      }
+
+      if (lines.every((line) => /^\s*([-*])\s+/.test(line))) {
+        const items = lines
+          .map((line) => line.replace(/^\s*[-*]\s+/, ""))
+          .map((line) => `<li>${this._renderInline(line)}</li>`)
+          .join("");
+        return `<ul class="erp-ai-assistant-message__list">${items}</ul>`;
+      }
+
+      if (lines.every((line) => /^\s*\d+\.\s+/.test(line))) {
+        const items = lines
+          .map((line) => line.replace(/^\s*\d+\.\s+/, ""))
+          .map((line) => `<li>${this._renderInline(line)}</li>`)
+          .join("");
+        return `<ol class="erp-ai-assistant-message__list">${items}</ol>`;
+      }
+
+      if (trimmed.startsWith(">")) {
+        const body = lines.map((line) => line.replace(/^\s*>\s?/, "")).join("\n");
+        return `<blockquote class="erp-ai-assistant-message__quote">${this._renderInline(body)}</blockquote>`;
+      }
+
+      return `<p class="erp-ai-assistant-message__paragraph">${this._renderInline(lines.join("\n"))}</p>`;
+    }
+
+    _looksLikeMarkdownTable(lines) {
+      if (!Array.isArray(lines) || lines.length < 2) return false;
+      const hasPipes = lines[0].includes("|") && lines[1].includes("|");
+      const separator = /^\s*\|?[\s:-]+(?:\|[\s:-]+)+\|?\s*$/;
+      return hasPipes && separator.test(lines[1]);
+    }
+
+    _renderTable(lines) {
+      const rows = lines
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => line.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim()));
+
+      if (rows.length < 2) {
+        return `<p class="erp-ai-assistant-message__paragraph">${this._renderInline(lines.join("\n"))}</p>`;
+      }
+
+      const headers = rows[0];
+      const bodyRows = rows.slice(2);
+      const thead = `<thead><tr>${headers.map((cell) => `<th>${this._renderInline(cell)}</th>`).join("")}</tr></thead>`;
+      const tbody = `<tbody>${bodyRows.map((row) => `<tr>${headers.map((_, index) => `<td>${this._renderInline(row[index] || "")}</td>`).join("")}</tr>`).join("")}</tbody>`;
+      return `<div class="erp-ai-assistant-message__table-wrap"><table class="erp-ai-assistant-message__table">${thead}${tbody}</table></div>`;
+    }
+
+    _renderInline(text) {
+      const tokens = [];
+      let value = String(text || "");
+
+      value = value.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/[^\s)]+)\)/g, (_, alt, url) => {
+        const token = `__ERP_AI_INLINE_${tokens.length}__`;
+        tokens.push(this._renderInlineImage(url, alt));
+        return token;
+      });
+
+      value = value.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
+        const token = `__ERP_AI_INLINE_${tokens.length}__`;
+        tokens.push(this._renderAnchor(url, label));
+        return token;
+      });
+
+      value = value.replace(/`([^`]+)`/g, (_, code) => {
+        const token = `__ERP_AI_INLINE_${tokens.length}__`;
+        tokens.push(`<code class="erp-ai-assistant-message__inline-code">${this._escapeHtml(code)}</code>`);
+        return token;
+      });
+
+      value = this._escapeHtml(value);
+      value = value.replace(/\n/g, "<br>");
+      value = value.replace(
+        /(https?:\/\/[^\s<]+)/g,
+        (url) => {
+          const cleanUrl = this._decodeHtml(url);
+          if (this._isImageUrl(cleanUrl)) {
+            const token = `__ERP_AI_INLINE_${tokens.length}__`;
+            tokens.push(this._renderInlineImage(cleanUrl, this._filenameFromUrl(cleanUrl)));
+            return token;
+          }
+          const token = `__ERP_AI_INLINE_${tokens.length}__`;
+          tokens.push(this._renderAnchor(cleanUrl, cleanUrl));
+          return token;
+        }
+      );
+
+      return this._restoreTokens(value, tokens);
+    }
+
+    _renderAnchor(url, label) {
+      const safeUrl = this._escapeHtml(url);
+      const safeLabel = this._escapeHtml(label || url);
+      return `<a class="erp-ai-assistant-message__link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`;
+    }
+
+    _renderInlineImage(url, alt) {
+      const safeUrl = this._escapeHtml(url);
+      const safeAlt = this._escapeHtml(alt || "Image");
+      return `
+        <figure class="erp-ai-assistant-message__media">
+          <a href="${safeUrl}" target="_blank" rel="noopener noreferrer">
+            <img class="erp-ai-assistant-message__image" src="${safeUrl}" alt="${safeAlt}" loading="lazy" />
+          </a>
+          <figcaption class="erp-ai-assistant-message__caption">${safeAlt}</figcaption>
+        </figure>
+      `;
+    }
+
+    _restoreTokens(text, tokens) {
+      return tokens.reduce(
+        (output, tokenHtml, index) => output.replaceAll(`__ERP_AI_INLINE_${index}__`, tokenHtml).replaceAll(`__ERP_AI_BLOCK_${index}__`, tokenHtml),
+        text
+      );
+    }
+
+    _escapeHtml(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    _decodeHtml(value) {
+      const textarea = document.createElement("textarea");
+      textarea.innerHTML = String(value || "");
+      return textarea.value;
+    }
+
+    _isImageUrl(url) {
+      const value = String(url || "").toLowerCase();
+      return value.startsWith("data:image/") || /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/.test(value);
+    }
+
+    _filenameFromUrl(url) {
+      try {
+        const parsed = new URL(url, window.location.origin);
+        const name = parsed.pathname.split("/").filter(Boolean).pop();
+        return name || "Image";
+      } catch (error) {
+        return "Image";
+      }
     }
 
     _parseAttachments(raw) {
       if (!raw) return [];
       try {
         const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-        if (!Array.isArray(parsed)) return [];
-        return parsed.filter((item) => item && item.file_url);
+        if (Array.isArray(parsed)) return parsed.filter((item) => item && item.file_url);
+        if (parsed && Array.isArray(parsed.attachments)) {
+          return parsed.attachments.filter((item) => item && item.file_url);
+        }
+        return [];
       } catch (error) {
         return [];
       }
+    }
+
+    _parseToolEvents(raw) {
+      if (!raw) return [];
+      try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        return Array.isArray(parsed) ? parsed.map((item) => String(item || "").trim()).filter(Boolean) : [];
+      } catch (error) {
+        return [];
+      }
+    }
+
+    _renderToolEventRow(events) {
+      const wrap = document.createElement("details");
+      wrap.className = "erp-ai-assistant-message__tools";
+      wrap.open = false;
+      const items = events.slice(-8).map((item) => `<li>${this._escapeHtml(item)}</li>`).join("");
+      wrap.innerHTML = `
+        <summary class="erp-ai-assistant-message__tools-summary">Tool activity</summary>
+        <ul class="erp-ai-assistant-message__tools-list">${items}</ul>
+      `;
+      return wrap;
     }
 
     _renderAttachmentRow(attachments) {
@@ -480,7 +708,23 @@
         link.rel = "noopener noreferrer";
         const label = item.label || item.file_type || "File";
         const name = item.filename || "download";
-        link.textContent = `${label}: ${name}`;
+        if (this._isImageUrl(item.file_url)) {
+          link.classList.add("is-image");
+          link.innerHTML = `
+            <img class="erp-ai-assistant-message__attachment-image" src="${this._escapeHtml(item.file_url)}" alt="${this._escapeHtml(name)}" loading="lazy" />
+            <span class="erp-ai-assistant-message__attachment-meta">
+              <strong>${this._escapeHtml(name)}</strong>
+              <small>${this._escapeHtml(label)}</small>
+            </span>
+          `;
+        } else {
+          link.innerHTML = `
+            <span class="erp-ai-assistant-message__attachment-meta">
+              <strong>${this._escapeHtml(name)}</strong>
+              <small>${this._escapeHtml(label)}</small>
+            </span>
+          `;
+        }
         wrap.appendChild(link);
       });
       return wrap;
@@ -514,22 +758,27 @@
       if (this.isGenerating) return;
 
       const prompt = (this.elements.textarea?.value || "").trim();
-      if (!prompt) return;
+      const images = this.pendingImages.slice();
+      if (!prompt && !images.length) return;
 
       // Add user message to UI immediately
-      this._addUserMessageToUI(prompt);
+      this._addUserMessageToUI(prompt, images);
 
       this.ensureConversation((conversationName) => {
         const context = this.getCurrentContext();
+        const imagePayload = images.map((item) => ({
+          name: item.name,
+          type: item.type,
+          data_url: item.dataUrl,
+        }));
 
         if (this.elements.textarea) {
           this.elements.textarea.value = "";
         }
+        this._clearPendingImages();
 
-        // Show typing indicator
         this.abortRequested = false;
         this._setGeneratingState(true);
-        this._showTypingIndicator();
 
         const request = frappe.call({
           method: "erp_ai_assistant.api.ai.send_prompt",
@@ -539,6 +788,8 @@
             doctype: context.doctype,
             docname: context.docname,
             route: context.route,
+            model: this.elements.modelSelect?.value || undefined,
+            images: imagePayload.length ? JSON.stringify(imagePayload) : undefined,
           },
           callback: (response) => {
             this.refreshHistory();
@@ -550,6 +801,7 @@
           },
           always: () => {
             this.pendingPromptRequest = null;
+            this._stopProgressPolling();
             this._setGeneratingState(false);
             this._hideTypingIndicator();
             this.abortRequested = false;
@@ -557,6 +809,7 @@
         });
 
         this.pendingPromptRequest = request;
+        this._startProgressPolling(conversationName);
       });
     }
 
@@ -568,11 +821,12 @@
       this.abortRequested = true;
       this.pendingPromptRequest.abort("abort");
       this.pendingPromptRequest = null;
+      this._stopProgressPolling();
       this._setGeneratingState(false);
       this._hideTypingIndicator();
     }
 
-    _addUserMessageToUI(prompt) {
+    _addUserMessageToUI(prompt, images) {
       if (!this.elements.messages) return;
 
       const emptyState = this.elements.messages.querySelector(".erp-ai-assistant-messages__empty");
@@ -585,17 +839,33 @@
 
       const now = new Date();
       const timeStr = frappe.datetime ? frappe.datetime.str_to_user(now) : now.toLocaleTimeString();
+      const text = String(prompt || "").trim();
+      const imageCount = Array.isArray(images) ? images.length : 0;
+      const imageNote = imageCount ? `\n\n[Attached ${imageCount} image${imageCount === 1 ? "" : "s"}]` : "";
+      const body = text ? `${text}${imageNote}` : imageNote.trim();
 
       userBubble.innerHTML = `
         <div class="erp-ai-assistant-message__meta">👤 You <span class="erp-ai-assistant-message__time">• ${timeStr}</span></div>
-        <div class="erp-ai-assistant-message__body">${this._formatMessageContent(prompt)}</div>
+        <div class="erp-ai-assistant-message__body">${this._formatMessageContent(body)}</div>
       `;
+      if (imageCount) {
+        userBubble.appendChild(
+          this._renderAttachmentRow(
+            images.map((item, index) => ({
+              label: "Image",
+              filename: item.name || `image-${index + 1}`,
+              file_type: String(item.type || "image").split("/").pop(),
+              file_url: item.dataUrl,
+            }))
+          )
+        );
+      }
 
       this.elements.messages.appendChild(userBubble);
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
     }
 
-    _showTypingIndicator() {
+    _showTypingIndicator(steps) {
       if (!this.elements.messages) return;
 
       this._hideTypingIndicator(); // Remove any existing indicator
@@ -604,16 +874,77 @@
       indicator.className = "erp-ai-assistant-message is-assistant erp-ai-assistant-message--typing";
       indicator.id = "erp-ai-assistant-typing";
       indicator.innerHTML = `
-        <div class="erp-ai-assistant-message__meta">🤖 Assistant <span class="erp-ai-assistant-message__time">• typing</span></div>
-        <div class="erp-ai-assistant-message__typing-indicator">
-          <span></span>
-          <span></span>
-          <span></span>
+        <div class="erp-ai-assistant-message__meta">🤖 Assistant <span class="erp-ai-assistant-message__time">• working</span></div>
+        <div class="erp-ai-assistant-progress">
+          <div class="erp-ai-assistant-progress__head">
+            <span class="erp-ai-assistant-progress__spinner" aria-hidden="true"></span>
+            <span>Working</span>
+          </div>
+          <div class="erp-ai-assistant-progress__steps"></div>
         </div>
       `;
 
       this.elements.messages.appendChild(indicator);
+      this._updateTypingSteps(Array.isArray(steps) ? steps : ["Preparing request"]);
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
+    }
+
+    _updateTypingSteps(steps) {
+      const indicator = document.getElementById("erp-ai-assistant-typing");
+      if (!indicator) return;
+      const wrap = indicator.querySelector(".erp-ai-assistant-progress__steps");
+      if (!wrap) return;
+
+      const normalized = Array.isArray(steps)
+        ? steps.map((item) => String(item || "").trim()).filter(Boolean)
+        : [];
+      const finalSteps = normalized.length ? normalized : ["Preparing request"];
+
+      wrap.innerHTML = "";
+      finalSteps.slice(-4).forEach((step) => {
+        const row = document.createElement("div");
+        row.className = "erp-ai-assistant-progress__step";
+        row.textContent = step;
+        wrap.appendChild(row);
+      });
+    }
+
+    _startProgressPolling(conversationName) {
+      this._stopProgressPolling();
+      this._showTypingIndicator(["Preparing request"]);
+
+      if (!conversationName) return;
+
+      const pollProgress = () => {
+        if (this.progressPollPending) return;
+        this.progressPollPending = true;
+
+        frappe.call({
+          method: "erp_ai_assistant.api.ai.get_prompt_progress",
+          args: { conversation: conversationName },
+          callback: (response) => {
+            const progress = response?.message || {};
+            const steps = Array.isArray(progress.steps) ? progress.steps : [];
+            this._updateTypingSteps(steps);
+          },
+          always: () => {
+            this.progressPollPending = false;
+          },
+        });
+      };
+
+      pollProgress();
+      this.progressPollTimer = window.setInterval(() => {
+        pollProgress();
+      }, 1200);
+    }
+
+    _stopProgressPolling() {
+      if (this.progressPollTimer) {
+        clearInterval(this.progressPollTimer);
+        this.progressPollTimer = null;
+      }
+      this.progressPollPending = false;
     }
 
     _hideTypingIndicator() {
@@ -621,6 +952,119 @@
       if (indicator) {
         indicator.remove();
       }
+    }
+
+    loadModelOptions() {
+      frappe.call({
+        method: "erp_ai_assistant.api.ai.get_available_models",
+        callback: (response) => {
+          this._setModelOptions(response?.message || {});
+        },
+        error: () => {
+          this._setModelOptions({});
+        },
+      });
+    }
+
+    _setModelOptions(payload) {
+      const select = this.elements.modelSelect;
+      if (!select) return;
+
+      const models = Array.isArray(payload.models) ? payload.models.filter(Boolean) : [];
+      const defaultModel = payload.default_model || models[0] || "";
+      const persisted = localStorage.getItem(this.modelStorageKey);
+      const selected = persisted && models.includes(persisted) ? persisted : defaultModel;
+
+      select.innerHTML = "";
+      models.forEach((model) => {
+        const option = document.createElement("option");
+        option.value = model;
+        option.textContent = model;
+        if (model === selected) {
+          option.selected = true;
+        }
+        select.appendChild(option);
+      });
+
+      if (!models.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = "Default model";
+        option.selected = true;
+        select.appendChild(option);
+      }
+      this._persistSelectedModel();
+    }
+
+    _persistSelectedModel() {
+      const selected = this.elements.modelSelect?.value;
+      if (!selected) return;
+      localStorage.setItem(this.modelStorageKey, selected);
+    }
+
+    async _ingestImageFiles(fileList) {
+      const files = Array.from(fileList || []);
+      for (const file of files) {
+        if (!file || !String(file.type || "").startsWith("image/")) continue;
+        if (this.pendingImages.length >= 4) {
+          frappe.show_alert({ message: "Maximum 4 images per prompt", indicator: "orange" });
+          break;
+        }
+        if (file.size > 4 * 1024 * 1024) {
+          frappe.show_alert({ message: `${file.name || "Image"} exceeds 4MB`, indicator: "orange" });
+          continue;
+        }
+        try {
+          const dataUrl = await this._readFileAsDataUrl(file);
+          this.pendingImages.push({
+            name: file.name || "image",
+            type: file.type || "image/png",
+            size: file.size || 0,
+            dataUrl,
+          });
+        } catch (error) {
+          frappe.show_alert({ message: "Unable to read image", indicator: "red" });
+        }
+      }
+      this._renderImagePreview();
+    }
+
+    _readFileAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("read_failed"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    _renderImagePreview() {
+      const wrap = this.elements.imagePreview;
+      if (!wrap) return;
+      wrap.innerHTML = "";
+      if (!this.pendingImages.length) return;
+
+      this.pendingImages.forEach((item, index) => {
+        const chip = document.createElement("button");
+        chip.type = "button";
+        chip.className = "erp-ai-assistant-image-chip";
+        chip.title = item.name;
+        chip.innerHTML = `
+          <img src="${item.dataUrl}" alt="${item.name}" />
+          <span>${item.name}</span>
+          <strong>x</strong>
+        `;
+        chip.addEventListener("click", () => {
+          this.pendingImages.splice(index, 1);
+          this._renderImagePreview();
+        });
+        wrap.appendChild(chip);
+      });
+    }
+
+    _clearPendingImages() {
+      this.pendingImages = [];
+      this._renderImagePreview();
     }
 
     _setGeneratingState(isGenerating) {
@@ -666,44 +1110,6 @@
       } catch (error) {
         return false;
       }
-    }
-
-    exportHistory() {
-      frappe.call({
-        method: "erp_ai_assistant.api.import_export.export_history",
-        callback: () => {
-          frappe.show_alert({ message: "Export started", indicator: "green" });
-        },
-        error: (error) => {
-          frappe.show_alert({ message: error.message || "Export failed", indicator: "red" });
-        },
-      });
-    }
-
-    importHistory(event) {
-      const file = event?.target?.files?.[0];
-      if (!file) return;
-
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        frappe.call({
-          method: "erp_ai_assistant.api.import_export.import_history",
-          args: { file_data: e.target.result },
-          callback: (response) => {
-            frappe.show_alert({
-              message: `Imported ${response.message.count} conversations`,
-              indicator: "green",
-            });
-            this.refreshHistory();
-            event.target.value = "";
-          },
-          error: (error) => {
-            frappe.show_alert({ message: error.message || "Import failed", indicator: "red" });
-          },
-        });
-      };
-
-      reader.readAsText(file);
     }
 
     togglePin(name) {
