@@ -754,6 +754,92 @@ def _is_erp_intent(prompt: str, context: dict[str, Any]) -> bool:
     return any(marker in text for marker in erp_markers)
 
 
+def _fallback_model_candidates(selected_model: str | None = None) -> list[str]:
+    candidates: list[str] = []
+    if selected_model:
+        normalized = str(selected_model).strip()
+        if normalized:
+            candidates.append(normalized)
+
+    provider = _provider_name()
+    if provider in {"openai", "openai_compatible"}:
+        raw = _cfg("OPENAI_MODELS", "")
+    elif provider == "anthropic":
+        raw = _cfg("ANTHROPIC_MODELS", "")
+    else:
+        raw = ""
+
+    if isinstance(raw, str) and raw.strip():
+        parsed = [row.strip() for row in raw.split(",") if row.strip()]
+        candidates.extend(parsed)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _is_transient_provider_error(message: str) -> bool:
+    text = str(message or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "timeout",
+        "timed out",
+        "connection reset",
+        "temporary",
+        "rate limit",
+        "too many requests",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _provider_chat_with_resilience(
+    prompt: str,
+    context: dict[str, Any],
+    *,
+    history: Optional[list[dict[str, Any]]] = None,
+    model: str | None = None,
+    progress: Optional[dict[str, Any]] = None,
+    images: Optional[list[dict[str, str]]] = None,
+) -> dict[str, Any]:
+    errors: list[str] = []
+    model_candidates = _fallback_model_candidates(model)
+    if not model_candidates:
+        model_candidates = [model] if model else [None]
+
+    max_attempts = max(1, min(3, len(model_candidates)))
+    for index in range(max_attempts):
+        attempt_model = model_candidates[index]
+        try:
+            return _provider_chat(
+                prompt,
+                context,
+                history=history,
+                model=attempt_model,
+                progress=progress,
+                images=images,
+            )
+        except Exception as exc:
+            message = str(exc) or "Unknown provider error"
+            errors.append(message)
+            if index + 1 < max_attempts and _is_transient_provider_error(message):
+                continue
+            if index + 1 < max_attempts and "model" in message.lower():
+                continue
+            break
+
+    raise RuntimeError(" | ".join(errors[-2:]) if errors else "Unknown provider error")
+
+
 def _generate_response(
     prompt: str,
     context: dict[str, Any],
@@ -793,14 +879,21 @@ def _generate_response(
 
     if _llm_chat_configured():
         try:
-            response = _provider_chat(prompt, context, history=history, model=model, progress=progress, images=images)
+            response = _provider_chat_with_resilience(
+                prompt,
+                context,
+                history=history,
+                model=model,
+                progress=progress,
+                images=images,
+            )
             if images and _response_rejects_images(response.get("text")):
                 retry_prompt = (
                     f"{prompt}\n\n"
                     "An image is already attached in this same user message as multimodal input. "
                     "Analyze the visual content directly and answer only from what is visible in the image."
                 ).strip()
-                response = _provider_chat(
+                response = _provider_chat_with_resilience(
                     retry_prompt,
                     context,
                     history=history,
@@ -820,6 +913,12 @@ def _generate_response(
                     }
             return response
         except Exception as exc:
+            fallback = _deterministic_router_response(prompt, context)
+            if fallback is not None:
+                fallback_events = list(fallback.get("tool_events") or [])
+                fallback_events.append("provider fallback deterministic")
+                fallback["tool_events"] = fallback_events
+                return fallback
             _progress_update(progress, stage="failed", done=True, error=str(exc) or "Unknown error")
             frappe.log_error(frappe.get_traceback(), "ERP AI Assistant Chat Error")
             return {
