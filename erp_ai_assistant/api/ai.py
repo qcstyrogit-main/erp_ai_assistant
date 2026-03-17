@@ -1412,6 +1412,10 @@ def _plan_named_update(raw_text: str, named_doc_patterns: dict[str, str]) -> lis
     label = str(match.group("label") or "").strip().lower()
     field_label = _normalize_name(match.group("field"))
     target = _normalize_name(match.group("target"))
+    if not label:
+        split = _split_named_update_target_and_field(_normalize_name(f"{target} {field_label}"))
+        if split:
+            target, field_label = split
     value = _coerce_value(match.group("value"))
     doctype_key = label or _infer_update_doctype(field_label)
     doctype = named_doc_patterns.get(doctype_key or "")
@@ -1627,10 +1631,51 @@ def _report_prompt_filters(prompt: str) -> dict[str, Any]:
 
 
 def _infer_update_doctype(field_label: str) -> str:
-    normalized = str(field_label or "").strip().lower()
-    if normalized in {"salary", "basic salary", "designation", "department"}:
+    normalized = _normalize_field_key(field_label)
+    if normalized in {
+        "salary",
+        "basic_salary",
+        "designation",
+        "department",
+        "date_of_birth",
+        "birthday",
+        "birth_date",
+        "dob",
+        "company_email",
+        "email_id",
+        "mobile_no",
+    }:
         return "employee"
     return ""
+
+
+def _split_named_update_target_and_field(text: str) -> tuple[str, str] | None:
+    phrase = _normalize_name(text)
+    lowered = phrase.lower()
+    alias_map = {
+        "date of birth": "date_of_birth",
+        "birth date": "date_of_birth",
+        "birthday": "date_of_birth",
+        "dob": "date_of_birth",
+        "designation": "designation",
+        "department": "department",
+        "salary": "salary",
+        "basic salary": "basic_salary",
+        "company email": "company_email",
+        "email": "email_id",
+        "mobile": "mobile_no",
+        "phone": "phone",
+        "status": "status",
+        "territory": "territory",
+    }
+    for alias in sorted(alias_map.keys(), key=len, reverse=True):
+        if lowered == alias:
+            return "", alias_map[alias]
+        if lowered.endswith(f" {alias}"):
+            target = phrase[: len(phrase) - len(alias)].strip(" ,-")
+            if target:
+                return target, alias_map[alias]
+    return None
 
 
 def _doctype_display_field(doctype: str | None) -> str:
