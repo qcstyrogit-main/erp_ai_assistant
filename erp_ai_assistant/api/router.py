@@ -287,6 +287,63 @@ def _parse_related_list_request(prompt: str, context: dict[str, Any]) -> tuple[s
     return None
 
 
+def _parse_amount_filtered_list_request(prompt: str, context: dict[str, Any]) -> tuple[str, dict[str, Any], str] | None:
+    text = _normalize_prompt(prompt)
+    lowered = text.lower()
+    if not any(term in lowered for term in ("show", "list", "get", "find", "display", "retrieve", "pull")):
+        return None
+    target = _resolve_safe_target(text)
+    if not target:
+        return None
+    _key, config = target
+    doctype = str(config.get("doctype") or "").strip()
+    filter_fields = set(config.get("filter_fields") or set())
+    if not doctype or not filter_fields:
+        return None
+
+    comparator = None
+    numeric_value = None
+    amount_match = re.search(
+        r"\b(?:above|over|greater than|more than|below|under|less than)\s+(?P<amount>\d+(?:[.,]\d+)?)(?P<suffix>k|m)?\b",
+        lowered,
+        re.IGNORECASE,
+    )
+    if amount_match:
+        raw_amount = str(amount_match.group("amount") or "").replace(",", "")
+        try:
+            numeric_value = float(raw_amount)
+        except Exception:
+            numeric_value = None
+        suffix = str(amount_match.group("suffix") or "").strip().lower()
+        if numeric_value is not None:
+            if suffix == "k":
+                numeric_value *= 1000
+            elif suffix == "m":
+                numeric_value *= 1000000
+        leading = str(amount_match.group(0) or "").lower()
+        comparator = "<" if any(term in leading for term in ("below", "under", "less than")) else ">"
+    if numeric_value is None:
+        return None
+
+    if "outstanding" in lowered or "balance" in lowered or "unpaid" in lowered:
+        amount_field = "outstanding_amount"
+    elif "base grand total" in lowered or "base amount" in lowered:
+        amount_field = "base_grand_total"
+    else:
+        amount_field = "grand_total"
+
+    if amount_field not in filter_fields:
+        fallback_fields = [field for field in ("grand_total", "base_grand_total", "outstanding_amount") if field in filter_fields]
+        if not fallback_fields:
+            return None
+        amount_field = fallback_fields[0]
+
+    filters = _extract_natural_filters(text, config, context) or {}
+    filters[amount_field] = [comparator, numeric_value]
+    heading = f"{doctype} {('above' if comparator == '>' else 'below')} {int(numeric_value) if float(numeric_value).is_integer() else numeric_value:g}"
+    return doctype, filters, heading
+
+
 def _parse_update_request(prompt: str, context: dict[str, Any]) -> dict[str, Any] | None:
     text = _normalize_prompt(prompt)
     lowered = text.lower()
@@ -755,6 +812,13 @@ def _planner_priority_route(
             result["matched"] = True
             result["action"] = "list_erp_documents"
             return result
+        amount_list_request = _parse_amount_filtered_list_request(text, context)
+        if amount_list_request:
+            doctype, filters, heading = amount_list_request
+            result = _render_list_result(list_erp_documents_internal(doctype, filters=filters), heading)
+            result["matched"] = True
+            result["action"] = "list_erp_documents"
+            return result
         list_request = _parse_list_request(text)
         if list_request:
             result = _render_list_result(list_erp_documents_internal(list_request), f"{list_request} list")
@@ -994,6 +1058,14 @@ def route_prompt_internal(
         result["action"] = "list_erp_documents"
         return result
 
+    amount_list_request = _parse_amount_filtered_list_request(text, current_context)
+    if amount_list_request:
+        doctype, filters, heading = amount_list_request
+        result = _render_list_result(list_erp_documents_internal(doctype, filters=filters), heading)
+        result["matched"] = True
+        result["action"] = "list_erp_documents"
+        return result
+
     list_request = _parse_list_request(text)
     if list_request:
         result = _render_list_result(list_erp_documents_internal(list_request), f"{list_request} list")
@@ -1136,6 +1208,24 @@ def route_prompt(
             except Exception:
                 planner_result = None
         parsed = parse_prompt(prompt, parsed_context)
+        if parsed.get("needs_clarification"):
+            pending_action = None
+            intent = str(parsed.get("intent") or "").strip()
+            if intent == "create" and parsed.get("doctype"):
+                pending_action = {
+                    "action": "create_erp_document",
+                    "doctype": str(parsed.get("doctype") or "").strip(),
+                    "values": parsed.get("values") or {},
+                    "missing_fields": get_required_doctype_fields_internal(str(parsed.get("doctype") or "").strip()) or [],
+                }
+            return {
+                "ok": False,
+                "type": "clarification",
+                "action": intent or "unknown",
+                "message": str(parsed.get("clarification_question") or "Please clarify your request."),
+                "parsed": parsed,
+                "pending_action": pending_action,
+            }
         if not parsed.get("ok"):
             legacy = route_prompt_internal(prompt, context=parsed_context, planner_result=planner_result)
             if legacy.get("matched"):
@@ -1145,14 +1235,6 @@ def route_prompt(
                 "type": "router",
                 "action": "unknown",
                 "message": str(parsed.get("message") or "Sorry, I do not support that action yet."),
-                "parsed": parsed,
-            }
-        if parsed.get("needs_clarification"):
-            return {
-                "ok": False,
-                "type": "clarification",
-                "action": str(parsed.get("intent") or "unknown"),
-                "message": str(parsed.get("clarification_question") or "Please clarify your request."),
                 "parsed": parsed,
             }
 
@@ -1197,7 +1279,15 @@ def route_prompt(
                 str(parsed.get("doctype") or "").strip(),
                 str(parsed.get("docname") or "").strip(),
             )
+        elif intent == "create":
+            result = create_erp_document_internal(
+                doctype=str(parsed.get("doctype") or "").strip(),
+                values=parsed.get("values") or {},
+            )
         else:
+            legacy = route_prompt_internal(prompt, context=parsed_context, planner_result=planner_result)
+            if legacy.get("matched"):
+                return legacy
             return {
                 "ok": False,
                 "type": "router",

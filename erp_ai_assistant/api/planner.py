@@ -2,9 +2,10 @@ from typing import Any
 
 import frappe
 
+from .chat import get_pending_action
 from .context_resolver import normalize_context_payload
 from .intent_detector import detect_intent_heuristic, normalize_prompt
-from .resource_registry import list_resource_specs
+from .resource_registry import list_resource_specs, read_resource
 from .tool_registry import list_tool_specs
 
 
@@ -190,6 +191,59 @@ def _enrich_plan(plan: dict[str, Any], context: dict[str, Any]) -> dict[str, Any
     return plan
 
 
+def _resource_arguments(name: str, context: dict[str, Any], conversation: str | None = None) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    if name == "doctype_schema" and context.get("doctype"):
+        arguments["doctype"] = context.get("doctype")
+    elif name == "pending_assistant_action" and conversation:
+        arguments["conversation"] = conversation
+    return arguments
+
+
+def _planner_host_bundle(plan: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    conversation = str(context.get("conversation") or "").strip() or None
+    resources: dict[str, Any] = {}
+    for name in plan.get("resource_names") or []:
+        resource_name = str(name or "").strip()
+        if not resource_name:
+            continue
+        try:
+            resources[resource_name] = read_resource(
+                resource_name,
+                context=context,
+                arguments=_resource_arguments(resource_name, context, conversation=conversation),
+            )
+        except Exception as exc:
+            resources[resource_name] = {
+                "ok": False,
+                "type": "resource",
+                "resource": resource_name,
+                "message": str(exc) or "Resource read failed.",
+                "data": None,
+            }
+    return {
+        "context": {
+            "doctype": context.get("doctype"),
+            "docname": context.get("docname"),
+            "route": context.get("route"),
+            "conversation": conversation,
+        },
+        "pending_action": get_pending_action(conversation) if conversation else None,
+        "recommended_tools": [
+            {
+                "name": str(row.get("name") or "").strip(),
+                "description": row.get("description"),
+                "category": (row.get("annotations") or {}).get("category"),
+            }
+            for row in (plan.get("recommended_tools") or [])
+            if row.get("name")
+        ],
+        "recommended_resources": resources,
+        "route_target": plan.get("route_target"),
+        "intent": plan.get("intent"),
+    }
+
+
 def _normalize_model_plan(raw_plan: Any, prompt: str, heuristic: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(raw_plan, dict):
         return None
@@ -229,7 +283,12 @@ def classify_prompt_internal(prompt: str, context: dict[str, Any] | None = None)
         from . import ai as ai_api
 
         if ai_api._llm_chat_configured():
-            model_plan = _normalize_model_plan(ai_api.plan_prompt_with_model(prompt, context), prompt, heuristic)
+            host_bundle = _planner_host_bundle(result, context)
+            model_plan = _normalize_model_plan(
+                ai_api.plan_prompt_with_model(prompt, context, host_session=host_bundle),
+                prompt,
+                heuristic,
+            )
             if model_plan and not _prefer_heuristic(heuristic, model_plan):
                 result = _enrich_plan(model_plan, context)
             elif model_plan:

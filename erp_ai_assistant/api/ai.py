@@ -388,6 +388,56 @@ def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
     return "Current context: no active document. Treat this as a general workspace chat unless the user asks for ERP data."
 
 
+def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    current = context or {}
+    return (
+        "You are an ERPNext AI assistant connected to a Frappe server. "
+        "You have access to tools that can read ERP documents, list records, create records, update records, run reports, generate PDFs, and export Excel. "
+        "If the user asks for ERP data, always call a tool. "
+        "Never guess ERP data. Never invent document names, fields, item codes, workflow actions, or server problems. "
+        "Prefer tool calls over text explanations whenever live ERP data or mutations are involved. "
+        "If information is missing, ask a clarification question instead of guessing. "
+        "When creating documents, extract customer, supplier, items, quantities, dates, and any explicit field values from the prompt. "
+        "For exports and PDFs, call tools to produce the structured data or artifact payload; the host app handles the final file download UX. "
+        "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
+        "If a tool call fails, report the exact returned error text only. "
+        "Use ERP concepts precisely: Sales Order, Quotation, Customer, Supplier, Employee, Item, Purchase Order, Sales Invoice, Delivery Note. "
+        f"{_tool_access_summary(prompt, current)} "
+        f"Current context: doctype={current.get('doctype')}, docname={current.get('docname')}, route={current.get('route')}."
+    )
+
+
+def _llm_user_prompt(prompt: str) -> str:
+    cleaned = str(prompt or "").strip()
+    return (
+        "User request:\n"
+        f"{cleaned}\n\n"
+        "Respond by calling a tool when appropriate. "
+        "If required ERP details are missing, ask a concise clarification question."
+    ).strip()
+
+
+def _tool_priority_key(name: str) -> tuple[int, str]:
+    lowered = str(name or "").strip().lower()
+    if lowered in CORE_DOC_TOOL_NAMES:
+        return (0, lowered)
+    if lowered in REPORT_TOOL_NAMES:
+        return (1, lowered)
+    if "erp" in lowered:
+        return (2, lowered)
+    return (3, lowered)
+
+
+def _prioritize_tool_specs(tool_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        tool_specs,
+        key=lambda spec: _tool_priority_key(
+            spec.get("name")
+            or ((spec.get("function") or {}).get("name") if isinstance(spec.get("function"), dict) else "")
+        ),
+    )
+
+
 def _tool_access_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     if not _is_erp_intent(prompt, context or {}):
         return (
@@ -1711,23 +1761,29 @@ def _provider_chat(
     return _anthropic_chat(prompt, context, history=history, model=model, progress=progress, images=images)
 
 
-def plan_prompt_with_model(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+def plan_prompt_with_model(
+    prompt: str,
+    context: dict[str, Any],
+    model: str | None = None,
+    host_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if not _llm_chat_configured():
         raise RuntimeError("AI provider is not configured for model planning.")
 
     provider = _provider_name()
     if provider == "openai":
-        return _openai_plan_prompt(prompt, context, model=model)
+        return _openai_plan_prompt(prompt, context, model=model, host_session=host_session)
     if provider == "openai_compatible":
-        return _openai_compatible_plan_prompt(prompt, context, model=model)
-    return _anthropic_plan_prompt(prompt, context, model=model)
+        return _openai_compatible_plan_prompt(prompt, context, model=model, host_session=host_session)
+    return _anthropic_plan_prompt(prompt, context, model=model, host_session=host_session)
 
 
-def _planner_system_prompt(context: dict[str, Any]) -> str:
+def _planner_system_prompt(context: dict[str, Any], host_session: dict[str, Any] | None = None) -> str:
     tool_definitions = get_tool_definitions()
     resource_specs = list_resource_specs()
     tool_names = ", ".join(sorted(tool_definitions.keys())[:18])
     resource_names = ", ".join(str(row.get("name") or "").strip() for row in resource_specs[:12] if row.get("name"))
+    host_note = "A live host session bundle is included with current context, pending action state, and recommended resource payloads." if host_session else "No host session bundle is attached."
     return (
         "You are an intent planner for an ERPNext assistant. "
         "You only classify prompts and decide whether deterministic ERP tools should run. "
@@ -1743,11 +1799,12 @@ def _planner_system_prompt(context: dict[str, Any]) -> str:
         "reason should be a short explanation. "
         f"Available tool names include: {tool_names}. "
         f"Available resource names include: {resource_names}. "
+        f"{host_note} "
         f"{_context_summary(context)}"
     )
 
 
-def _planner_user_prompt(prompt: str, context: dict[str, Any]) -> str:
+def _planner_user_prompt(prompt: str, context: dict[str, Any], host_session: dict[str, Any] | None = None) -> str:
     tool_definitions = get_tool_definitions()
     resource_specs = list_resource_specs()
     return json.dumps(
@@ -1775,6 +1832,7 @@ def _planner_user_prompt(prompt: str, context: dict[str, Any]) -> str:
                 }
                 for row in resource_specs
             ],
+            "host_session": host_session or {},
             "response_schema": {
                 "intent": "one of: answer, guide, read, create, update, workflow, export, erp_chat, general_chat, unknown",
                 "confidence": "float between 0 and 1",
@@ -1807,7 +1865,12 @@ def _parse_json_object_text(raw_text: Any) -> dict[str, Any]:
     raise RuntimeError(f"Planner returned invalid JSON: {text[:240]}")
 
 
-def _openai_plan_prompt(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+def _openai_plan_prompt(
+    prompt: str,
+    context: dict[str, Any],
+    model: str | None = None,
+    host_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     api_key = _cfg("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OpenAI provider is selected but OPENAI_API_KEY is not configured.")
@@ -1827,11 +1890,11 @@ def _openai_plan_prompt(prompt: str, context: dict[str, Any], model: str | None 
     }
     request_payload: dict[str, Any] = {
         "model": selected_model,
-        "instructions": _planner_system_prompt(context),
+        "instructions": _planner_system_prompt(context, host_session=host_session),
         "input": [
             {
                 "role": "user",
-                "content": [{"type": "input_text", "text": _planner_user_prompt(prompt, context)}],
+                "content": [{"type": "input_text", "text": _planner_user_prompt(prompt, context, host_session=host_session)}],
             }
         ],
     }
@@ -1846,7 +1909,12 @@ def _openai_plan_prompt(prompt: str, context: dict[str, Any], model: str | None 
     return _parse_json_object_text(_openai_output_text(body))
 
 
-def _openai_compatible_plan_prompt(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+def _openai_compatible_plan_prompt(
+    prompt: str,
+    context: dict[str, Any],
+    model: str | None = None,
+    host_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     api_key = _cfg("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OpenAI-compatible provider is selected but OPENAI_API_KEY is not configured.")
@@ -1867,8 +1935,8 @@ def _openai_compatible_plan_prompt(prompt: str, context: dict[str, Any], model: 
     request_payload: dict[str, Any] = {
         "model": selected_model,
         "messages": [
-            {"role": "system", "content": _planner_system_prompt(context)},
-            {"role": "user", "content": _planner_user_prompt(prompt, context)},
+            {"role": "system", "content": _planner_system_prompt(context, host_session=host_session)},
+            {"role": "user", "content": _planner_user_prompt(prompt, context, host_session=host_session)},
         ],
         "stream": False,
     }
@@ -1885,7 +1953,12 @@ def _openai_compatible_plan_prompt(prompt: str, context: dict[str, Any], model: 
     return _parse_json_object_text(message.get("content"))
 
 
-def _anthropic_plan_prompt(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+def _anthropic_plan_prompt(
+    prompt: str,
+    context: dict[str, Any],
+    model: str | None = None,
+    host_session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     api_key = _cfg("ANTHROPIC_API_KEY")
     auth_token = _cfg("ANTHROPIC_AUTH_TOKEN")
     if not api_key and not auth_token:
@@ -1918,8 +1991,8 @@ def _anthropic_plan_prompt(prompt: str, context: dict[str, Any], model: str | No
         "stream": False,
         "temperature": temperature,
         "top_p": top_p,
-        "system": _planner_system_prompt(context),
-        "messages": [{"role": "user", "content": _planner_user_prompt(prompt, context)}],
+        "system": _planner_system_prompt(context, host_session=host_session),
+        "messages": [{"role": "user", "content": _planner_user_prompt(prompt, context, host_session=host_session)}],
     }
     response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
     if response.status_code >= 400:
@@ -1932,6 +2005,145 @@ def _anthropic_plan_prompt(prompt: str, context: dict[str, Any], model: str | No
         if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
     ]
     return _parse_json_object_text("\n".join(text_chunks).strip())
+
+
+def parse_prompt_with_model(prompt: str, model: str | None = None) -> str:
+    if not _llm_chat_configured():
+        raise RuntimeError("AI provider is not configured for fallback parsing.")
+
+    provider = _provider_name()
+    if provider == "openai":
+        return _openai_parse_prompt(prompt, model=model)
+    if provider == "openai_compatible":
+        return _openai_compatible_parse_prompt(prompt, model=model)
+    return _anthropic_parse_prompt(prompt, model=model)
+
+
+def _parser_system_prompt() -> str:
+    return (
+        "You are a strict ERPNext JSON parser. "
+        "Return exactly one valid JSON object with no markdown fences, no commentary, and no surrounding prose. "
+        "Never invent document names, record identifiers, item codes, workflow actions, or ERP field values. "
+        "If details are missing or ambiguous, set needs_clarification=true instead of guessing."
+    )
+
+
+def _openai_parse_prompt(prompt: str, model: str | None = None) -> str:
+    api_key = _cfg("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OpenAI provider is selected but OPENAI_API_KEY is not configured.")
+
+    selected_model = _resolve_model(model)
+    timeout_seconds = _llm_request_timeout_seconds()
+    temperature = 0
+    base_url = str(_cfg("OPENAI_BASE_URL", "https://api.openai.com")).rstrip("/")
+    responses_path = str(_cfg("OPENAI_RESPONSES_PATH", DEFAULT_OPENAI_RESPONSES_PATH) or DEFAULT_OPENAI_RESPONSES_PATH)
+    if not responses_path.startswith("/"):
+        responses_path = f"/{responses_path}"
+    endpoint = f"{base_url}{responses_path}"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
+    }
+    request_payload: dict[str, Any] = {
+        "model": selected_model,
+        "instructions": _parser_system_prompt(),
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
+    }
+    if _openai_supports_sampling_controls(selected_model):
+        request_payload["temperature"] = temperature
+    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
+    if response.status_code >= 400:
+        raise RuntimeError(f"AI endpoint rejected parser request ({endpoint}): {_extract_error_detail(response)}")
+    response.raise_for_status()
+    body = _parse_backend_json(response, endpoint)
+    return _openai_output_text(body)
+
+
+def _openai_compatible_parse_prompt(prompt: str, model: str | None = None) -> str:
+    api_key = _cfg("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OpenAI-compatible provider is selected but OPENAI_API_KEY is not configured.")
+
+    selected_model = _resolve_model(model)
+    timeout_seconds = _llm_request_timeout_seconds()
+    base_url = str(_cfg("OPENAI_BASE_URL", "https://integrate.api.nvidia.com")).rstrip("/")
+    path = str(_cfg("OPENAI_RESPONSES_PATH", "/v1/chat/completions") or "/v1/chat/completions")
+    if not path.startswith("/"):
+        path = f"/{path}"
+    endpoint = f"{base_url}{path}"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
+    }
+    request_payload: dict[str, Any] = {
+        "model": selected_model,
+        "messages": [
+            {"role": "system", "content": _parser_system_prompt()},
+            {"role": "user", "content": prompt},
+        ],
+        "stream": False,
+        "temperature": 0,
+    }
+    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
+    if response.status_code >= 400:
+        raise RuntimeError(f"AI endpoint rejected parser request ({endpoint}): {_extract_error_detail(response)}")
+    response.raise_for_status()
+    body = _parse_backend_json(response, endpoint)
+    choice = ((body.get("choices") or [{}])[0]) if isinstance(body.get("choices"), list) else {}
+    message = choice.get("message") or {}
+    return str(message.get("content") or "")
+
+
+def _anthropic_parse_prompt(prompt: str, model: str | None = None) -> str:
+    api_key = _cfg("ANTHROPIC_API_KEY")
+    auth_token = _cfg("ANTHROPIC_AUTH_TOKEN")
+    if not api_key and not auth_token:
+        raise RuntimeError("Anthropic provider is selected but authentication is not configured.")
+
+    selected_model = _resolve_model(model)
+    timeout_seconds = _llm_request_timeout_seconds()
+    max_tokens = min(max(300, _llm_request_max_tokens()), 800)
+    base_url = str(_cfg("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).rstrip("/")
+    messages_path = str(_cfg("ANTHROPIC_MESSAGES_PATH", "/v1/messages") or "/v1/messages")
+    if not messages_path.startswith("/"):
+        messages_path = f"/{messages_path}"
+    endpoint = f"{base_url}{messages_path}"
+    headers = {"content-type": "application/json"}
+    if api_key:
+        headers["x-api-key"] = api_key
+    else:
+        headers["authorization"] = f"Bearer {auth_token}"
+    anthropic_version = _cfg("ANTHROPIC_VERSION", "2023-06-01")
+    if anthropic_version:
+        headers["anthropic-version"] = anthropic_version
+    beta_param = _normalize_beta_param(_cfg("ANTHROPIC_BETA"))
+    if beta_param:
+        headers["anthropic-beta"] = beta_param
+    request_payload = {
+        "model": selected_model,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "temperature": 0,
+        "system": _parser_system_prompt(),
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
+    if response.status_code >= 400:
+        raise RuntimeError(f"AI endpoint rejected parser request ({endpoint}): {_extract_error_detail(response)}")
+    response.raise_for_status()
+    body = _parse_backend_json(response, endpoint)
+    text_chunks = [
+        block.get("text", "")
+        for block in (body.get("content") or [])
+        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+    ]
+    return "\n".join(text_chunks).strip()
 
 
 def _openai_chat(
@@ -1964,19 +2176,9 @@ def _openai_chat(
         "authorization": f"Bearer {api_key}",
     }
 
-    system = (
-        "You are a helpful general-purpose assistant with access to Frappe and ERPNext tools. "
-        "Use available tools whenever live data is needed or when creating/updating records. "
-        "For complex tasks, follow this process: plan briefly, execute tools, verify results, then answer. "
-        "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
-        f"{_tool_access_summary(prompt, context)} "
-        "If a user asks to export/download files (Excel/PDF/DOCX), call tools to produce the data payload; file artifacts are generated by the host app. "
-        "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
-        "Never invent connectivity/authentication/server issues. If a tool call fails, report the exact returned error text only. "
-        f"{_context_summary(context)}"
-    )
+    system = _erp_tool_system_prompt(prompt, context)
 
-    tool_specs = _openai_tool_specs(prompt, context)
+    tool_specs = _prioritize_tool_specs(_openai_tool_specs(prompt, context))
     previous_response_id: str | None = None
     pending_input: Any = _build_openai_input(history, prompt, images)
     tool_events: list[str] = []
@@ -2157,19 +2359,10 @@ def _openai_compatible_chat(
         "authorization": f"Bearer {api_key}",
     }
 
-    system = (
-        "You are a helpful general-purpose assistant with access to Frappe and ERPNext tools. "
-        "Use available tools whenever live data is needed or when creating/updating records. "
-        "For complex tasks, follow this process: plan briefly, execute tools, verify results, then answer. "
-        "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
-        f"{_tool_access_summary(prompt, context)} "
-        "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
-        "Never invent connectivity/authentication/server issues. If a tool call fails, report the exact returned error text only. "
-        f"{_context_summary(context)}"
-    )
+    system = _erp_tool_system_prompt(prompt, context)
 
     messages = _build_openai_compatible_messages(history, prompt, images)
-    tool_specs = _openai_compatible_tool_specs(prompt, context)
+    tool_specs = _prioritize_tool_specs(_openai_compatible_tool_specs(prompt, context))
     tool_events: list[str] = []
     rendered_payload = None
     had_tool_calls = False
@@ -2388,6 +2581,7 @@ def _anthropic_chat(
         for name, spec in tool_definitions.items()
         if name in allowed_names
     ]
+    tool_specs = _prioritize_tool_specs(tool_specs)
     if images:
         frappe.logger("erp_ai_assistant").info(
             "vision_request model=%s base_url=%s image_count=%s",
@@ -2396,17 +2590,7 @@ def _anthropic_chat(
             len(images),
         )
 
-    system = (
-        "You are a helpful general-purpose assistant with access to Frappe and ERPNext tools. "
-        "Use available tools whenever live data is needed or when creating/updating records. "
-        "For complex tasks, follow this process: plan briefly, execute tools, verify results, then answer. "
-        "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
-        f"{_tool_access_summary(prompt, context)} "
-        "If a user asks to export/download files (Excel/PDF/DOCX), call tools to produce the data payload; file artifacts are generated by the host app. "
-        "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
-        "Never invent connectivity/authentication/server issues. If a tool call fails, report the exact returned error text only. "
-        f"{_context_summary(context)}"
-    )
+    system = _erp_tool_system_prompt(prompt, context)
     messages: list[dict[str, Any]] = _build_messages_with_images(history, prompt, images)
     tool_events: list[str] = []
     rendered_payload = None
@@ -2662,7 +2846,7 @@ def _build_openai_input(
         if role == "user":
             last_user_index = len(normalized) - 1
 
-    current_content = _build_openai_input_content(prompt, images)
+    current_content = _build_openai_input_content(_llm_user_prompt(prompt), images)
     if current_content:
         if last_user_index >= 0 and images:
             normalized[last_user_index]["content"] = current_content
@@ -2688,7 +2872,7 @@ def _build_openai_compatible_messages(
             continue
         normalized.append({"role": role, "content": content})
 
-    current_content = _build_openai_compatible_content(prompt, images)
+    current_content = _build_openai_compatible_content(_llm_user_prompt(prompt), images)
     normalized.append({"role": "user", "content": current_content})
     return normalized
 
@@ -2784,9 +2968,9 @@ def _build_messages_with_images(
     image_blocks = _build_image_blocks(images)
 
     if not image_blocks:
-        return rows or [{"role": "user", "content": prompt}]
+        return rows or [{"role": "user", "content": _llm_user_prompt(prompt)}]
 
-    merged_content = _build_user_multimodal_content(prompt, image_blocks)
+    merged_content = _build_user_multimodal_content(_llm_user_prompt(prompt), image_blocks)
     for index in range(len(rows) - 1, -1, -1):
         if str(rows[index].get("role") or "").strip().lower() == "user":
             rows[index]["content"] = merged_content

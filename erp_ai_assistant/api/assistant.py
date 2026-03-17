@@ -28,6 +28,7 @@ from .erp_tools import describe_erp_schema as describe_erp_schema_tool
 from .file_tools import export_doctype_list_excel as export_doctype_list_excel_tool
 from .file_tools import export_employee_list_excel as export_employee_list_excel_tool
 from .file_tools import generate_document_pdf as generate_document_pdf_tool
+from .host_runtime import execute_host_turn, get_host_capabilities as get_host_capabilities_internal, build_host_session
 from .planner import classify_prompt as classify_prompt_tool
 from .resource_registry import get_resource_catalog_summary, list_resource_specs, read_resource
 from .tool_registry import get_tool_catalog_summary, list_tool_specs
@@ -125,6 +126,19 @@ def _planner_event(planner_result: dict[str, Any]) -> dict[str, Any]:
         "recommended_tools": planner_result.get("tool_names") or [],
         "recommended_resources": planner_result.get("resource_names") or [],
         "reason": planner_result.get("reason"),
+    }
+
+
+def _host_event(host_session: dict[str, Any]) -> dict[str, Any]:
+    planner = host_session.get("planner") or {}
+    resources = host_session.get("recommended_resources") or {}
+    return {
+        "type": "host",
+        "route_target": host_session.get("route_target"),
+        "pending_action": bool(host_session.get("pending_action")),
+        "recommended_tools": [str(row.get("name") or "").strip() for row in (host_session.get("recommended_tools") or []) if row.get("name")],
+        "recommended_resources": list(resources.keys())[:6],
+        "planner_intent": planner.get("intent"),
     }
 
 
@@ -254,6 +268,27 @@ def classify_prompt(prompt: str, context: dict[str, Any] | str | None = None) ->
 
 
 @frappe.whitelist()
+def get_host_capabilities() -> dict[str, Any]:
+    return get_host_capabilities_internal()
+
+
+@frappe.whitelist()
+def preview_host_session(
+    prompt: str,
+    conversation: str | None = None,
+    doctype: str | None = None,
+    docname: str | None = None,
+    route: str | None = None,
+) -> dict[str, Any]:
+    context = build_request_context(doctype=doctype, docname=docname, route=route, user=frappe.session.user)
+    return {
+        "ok": True,
+        "type": "host_session",
+        "session": build_host_session(prompt, context, conversation=conversation),
+    }
+
+
+@frappe.whitelist()
 def list_available_tools(category: str | None = None) -> dict[str, Any]:
     return {
         "ok": True,
@@ -357,8 +392,14 @@ def handle_prompt(
                 resumed["matched"] = True
                 resumed["action"] = str(resumed.get("action") or "continue_pending_action").strip()
 
-    should_route = bool(planner_result.get("should_route")) or bool(resumed)
-    routed = resumed or (route_prompt_pipeline(prompt_text, context=context, planner_result=planner_result) if should_route else {"matched": False})
+    host_turn = execute_host_turn(
+        prompt_text,
+        context=context,
+        conversation=conversation_name,
+        planner_result=planner_result,
+    ) if prompt_text else {"matched": False, "result": {"matched": False}, "session": {"planner": planner_result, "route_target": "provider_chat"}}
+    host_result = host_turn.get("result") or {"matched": False}
+    routed = resumed or (host_result if host_turn.get("matched") else {"matched": False})
     if not routed.get("matched") and isinstance(pending_action, dict) and pending_action:
         missing_fields = pending_action.get("missing_fields") or []
         missing_child_rows = pending_action.get("missing_child_rows") or []
@@ -413,7 +454,7 @@ def handle_prompt(
         conversation_name,
         "assistant",
         reply_text,
-        tool_events=json.dumps([_planner_event(planner_result)] + _build_tool_event_payload(routed), default=str),
+        tool_events=json.dumps([_planner_event(planner_result), _host_event(host_turn.get("session") or {})] + _build_tool_event_payload(routed), default=str),
         attachments_json=json.dumps(attachments, default=str),
     )
     if routed.get("pending_action"):
@@ -423,9 +464,10 @@ def handle_prompt(
     return {
         "conversation": conversation_name,
         "reply": reply_text,
-        "tool_events": [_planner_event(planner_result)] + _build_tool_event_payload(routed),
+        "tool_events": [_planner_event(planner_result), _host_event(host_turn.get("session") or {})] + _build_tool_event_payload(routed),
         "payload": routed,
         "attachments": attachments,
         "context": context,
+        "host_session": host_turn.get("session"),
         "message_name": assistant_message.get("name"),
     }

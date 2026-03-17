@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Any
 
@@ -61,12 +62,79 @@ def _empty_parse(normalized_prompt: str, *, ok: bool = False, source: str = "rul
         "customer": None,
         "items": [],
         "filters": {},
+        "fields": [],
+        "values": {},
         "count_target": None,
         "report_name": None,
         "needs_clarification": False,
         "clarification_question": None,
         "message": message,
     }
+
+
+ALLOWED_INTENTS = {
+    "create",
+    "update",
+    "read",
+    "search",
+    "count",
+    "export",
+    "workflow",
+    "answer",
+    "create_sales_order",
+    "generate_pdf",
+    "count_records",
+    "export_employee_excel",
+    "export_doctype_excel",
+    "unknown",
+}
+
+INTENT_CANONICAL_MAP = {
+    "create": "create",
+    "new": "create",
+    "add": "create",
+    "make": "create",
+    "update": "update",
+    "change": "update",
+    "modify": "update",
+    "set": "update",
+    "read": "read",
+    "show": "read",
+    "view": "read",
+    "open": "read",
+    "get": "read",
+    "search": "search",
+    "find": "search",
+    "count": "count_records",
+    "count_records": "count_records",
+    "export": "export_doctype_excel",
+    "download": "export_doctype_excel",
+    "pdf": "generate_pdf",
+    "generate_pdf": "generate_pdf",
+    "workflow": "workflow",
+    "answer": "answer",
+    "create_sales_order": "create_sales_order",
+    "export_employee_excel": "export_employee_excel",
+    "export_doctype_excel": "export_doctype_excel",
+    "unknown": "unknown",
+}
+
+DEFAULT_PARSE_SCHEMA = {
+    "intent": "unknown",
+    "doctype": None,
+    "docname": None,
+    "customer": None,
+    "items": [],
+    "filters": {},
+    "fields": [],
+    "values": {},
+    "count_target": None,
+    "report_name": None,
+    "needs_clarification": False,
+    "clarification_question": None,
+    "confidence": 0.0,
+    "message": None,
+}
 
 
 def normalize_prompt(prompt: str) -> str:
@@ -103,6 +171,89 @@ def _normalize_count_alias(label: str) -> str | None:
         "item": "items",
     }
     return mapping.get(lowered)
+
+
+def _coerce_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_json_loads(text: str) -> dict[str, Any] | None:
+    text = str(text or "").strip()
+    if not text:
+        return None
+    try:
+        loaded = json.loads(text)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if match:
+        try:
+            loaded = json.loads(match.group(0))
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            return None
+    return None
+
+
+def _normalize_doctype(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    return DOCTYPE_ALIASES.get(lowered, raw)
+
+
+def _normalize_intent(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    intent = INTENT_CANONICAL_MAP.get(raw, raw)
+    return intent if intent in ALLOWED_INTENTS else "unknown"
+
+
+def _normalize_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+        item_code = str(row.get("item_code") or row.get("item") or row.get("item_name") or "").strip()
+        if not item_code:
+            continue
+        qty = row.get("qty", row.get("quantity", 1))
+        rate = row.get("rate")
+        normalized_row: dict[str, Any] = {
+            "item_code": item_code,
+            "qty": _coerce_float(qty, 1.0) or 1.0,
+        }
+        if rate not in (None, ""):
+            normalized_row["rate"] = _coerce_float(rate, 0.0)
+        normalized.append(normalized_row)
+    return normalized
+
+
+def _normalize_fields(fields: Any) -> list[str]:
+    if not isinstance(fields, list):
+        return []
+    out: list[str] = []
+    for field in fields:
+        value = str(field or "").strip()
+        if value:
+            out.append(value)
+    return out
+
+
+def _normalize_filters(filters: Any) -> dict[str, Any]:
+    return filters if isinstance(filters, dict) else {}
+
+
+def _normalize_values(values: Any) -> dict[str, Any]:
+    return values if isinstance(values, dict) else {}
 
 
 def extract_customer(prompt: str) -> str | None:
@@ -267,10 +418,183 @@ def apply_clarification_rules(parsed: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def _postprocess_sales_order(parsed: dict[str, Any]) -> dict[str, Any]:
+    lowered_doctype = str(parsed.get("doctype") or "").strip().lower()
+    if parsed["intent"] == "create" and lowered_doctype == "sales order":
+        parsed["intent"] = "create_sales_order"
+    if parsed["intent"] == "create_sales_order":
+        parsed["doctype"] = "Sales Order"
+    customer = parsed.get("customer")
+    if not customer and isinstance(parsed.get("values"), dict):
+        customer = parsed["values"].get("customer")
+        if customer:
+            parsed["customer"] = customer
+    return parsed
+
+
+def _postprocess_exports(parsed: dict[str, Any], normalized_prompt: str) -> dict[str, Any]:
+    if parsed["intent"] == "export_doctype_excel" and parsed.get("doctype") == "Employee":
+        parsed["intent"] = "export_employee_excel"
+    if parsed["intent"] in {"export", "create"} and any(
+        term in normalized_prompt.lower() for term in ("excel", "xlsx", "csv", "spreadsheet")
+    ):
+        parsed["intent"] = "export_doctype_excel"
+        if parsed.get("doctype") == "Employee":
+            parsed["intent"] = "export_employee_excel"
+    return parsed
+
+
+def _postprocess_pdf(parsed: dict[str, Any], normalized_prompt: str) -> dict[str, Any]:
+    if parsed["intent"] == "generate_pdf":
+        return parsed
+    if any(term in normalized_prompt.lower() for term in ("pdf", "print", "printable")):
+        if parsed.get("doctype") or parsed.get("docname"):
+            parsed["intent"] = "generate_pdf"
+    return parsed
+
+
+def _finalize_llm_parse(raw: dict[str, Any], normalized_prompt: str) -> dict[str, Any]:
+    parsed = dict(DEFAULT_PARSE_SCHEMA)
+    parsed["intent"] = _normalize_intent(raw.get("intent"))
+    parsed["doctype"] = _normalize_doctype(raw.get("doctype"))
+    parsed["docname"] = str(raw.get("docname") or "").strip() or None
+    parsed["customer"] = str(raw.get("customer") or "").strip() or None
+    parsed["items"] = _normalize_items(raw.get("items"))
+    parsed["filters"] = _normalize_filters(raw.get("filters"))
+    parsed["fields"] = _normalize_fields(raw.get("fields"))
+    parsed["values"] = _normalize_values(raw.get("values"))
+    parsed["count_target"] = str(raw.get("count_target") or "").strip() or None
+    parsed["report_name"] = str(raw.get("report_name") or "").strip() or None
+    parsed["needs_clarification"] = bool(raw.get("needs_clarification", False))
+    parsed["clarification_question"] = str(raw.get("clarification_question") or "").strip() or None
+    parsed["confidence"] = max(0.0, min(_coerce_float(raw.get("confidence"), 0.0), 1.0))
+    parsed["message"] = str(raw.get("message") or "").strip() or None
+
+    parsed = _postprocess_sales_order(parsed)
+    parsed = _postprocess_exports(parsed, normalized_prompt)
+    parsed = _postprocess_pdf(parsed, normalized_prompt)
+
+    if not parsed.get("customer"):
+        parsed["customer"] = extract_customer(normalized_prompt)
+    if not parsed.get("items"):
+        parsed["items"] = extract_items(normalized_prompt)
+    if not parsed.get("doctype") and parsed["intent"] in {"generate_pdf", "export_doctype_excel", "export_employee_excel"}:
+        parsed["doctype"] = extract_export_doctype(normalized_prompt)
+    if parsed["intent"] == "generate_pdf" and not parsed.get("docname"):
+        doctype, docname = extract_doctype_and_docname(normalized_prompt)
+        parsed["doctype"] = parsed.get("doctype") or doctype
+        parsed["docname"] = parsed.get("docname") or docname
+    if parsed["intent"] == "count_records" and not parsed.get("count_target"):
+        parsed["count_target"] = extract_count_target(normalized_prompt)
+    return parsed
+
+
+def _build_llm_parse_prompt(prompt: str, context: dict[str, Any] | None = None) -> str:
+    current = context or {}
+    allowed_doctypes = sorted(set(DOCTYPE_ALIASES.values()))
+    return f"""
+You are an ERPNext intent parser.
+
+Convert the user's message into STRICT JSON only.
+Do not wrap the JSON in markdown.
+Do not add commentary.
+Return exactly one JSON object.
+
+Allowed intents:
+- create
+- update
+- read
+- search
+- count_records
+- export_doctype_excel
+- export_employee_excel
+- generate_pdf
+- workflow
+- answer
+- create_sales_order
+- unknown
+
+Known ERP doctypes:
+{json.dumps(allowed_doctypes)}
+
+Current UI context:
+{json.dumps(current, ensure_ascii=False)}
+
+User prompt:
+{json.dumps(prompt, ensure_ascii=False)}
+
+Return schema:
+{{
+  "intent": "unknown",
+  "doctype": null,
+  "docname": null,
+  "customer": null,
+  "items": [],
+  "filters": {{}},
+  "fields": [],
+  "values": {{}},
+  "count_target": null,
+  "report_name": null,
+  "needs_clarification": false,
+  "clarification_question": null,
+  "confidence": 0.0,
+  "message": null
+}}
+
+Rules:
+1. Prefer create_sales_order for Sales Order creation requests.
+2. Prefer generate_pdf for print/pdf requests.
+3. Prefer export_doctype_excel or export_employee_excel for excel/xlsx/csv/spreadsheet requests.
+4. Use count_records only for counting requests.
+5. Never invent document names.
+6. Never invent item codes.
+7. If required information is missing, set needs_clarification=true.
+8. confidence must be between 0 and 1.
+9. Output valid JSON only.
+""".strip()
+
+
+def _call_llm_json_parser(prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    try:
+        from . import ai as ai_api
+
+        if not ai_api._llm_chat_configured():
+            return None
+        raw = ai_api.parse_prompt_with_model(_build_llm_parse_prompt(prompt, context=context))
+        return _safe_json_loads(raw)
+    except Exception:
+        return None
+
+
 def fallback_parse_prompt(prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized = normalize_prompt(prompt)
-    # Future LLM/Ollama/FAC/MCP JSON parser plugs in here.
-    return _empty_parse(normalized, ok=False, source="fallback", message="Could not parse prompt.")
+    current = normalize_context_payload(context)
+    raw = _call_llm_json_parser(normalized, current)
+    if not raw:
+        return _empty_parse(normalized, ok=False, source="fallback", message="Could not parse prompt.")
+
+    parsed = _finalize_llm_parse(raw, normalized)
+    parsed["normalized_prompt"] = normalized
+    parsed["source"] = "llm"
+
+    if parsed["intent"] == "unknown":
+        parsed["ok"] = False
+        parsed["message"] = parsed.get("message") or "Could not confidently understand the request."
+        return parsed
+
+    if parsed["confidence"] < 0.65:
+        parsed["ok"] = False
+        parsed["needs_clarification"] = True
+        parsed["clarification_question"] = (
+            parsed.get("clarification_question")
+            or "Please rephrase or add the missing ERP details so I can do this correctly."
+        )
+        parsed["message"] = parsed.get("message") or "Low confidence parse."
+        return parsed
+
+    parsed["ok"] = True
+    parsed["message"] = None
+    return parsed
 
 
 def parse_prompt(prompt: str, context: dict[str, Any] | None = None) -> dict[str, Any]:
