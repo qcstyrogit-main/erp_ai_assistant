@@ -22,6 +22,8 @@ SETTING_KEY_MAP = {
     "ERP_AI_OPENAI_MODEL": "openai_default_model",
     "OPENAI_MODELS": "openai_models",
     "ERP_AI_OPENAI_MODELS": "openai_models",
+    "OPENAI_VISION_MODEL": "openai_vision_model",
+    "ERP_AI_OPENAI_VISION_MODEL": "openai_vision_model",
     "OPENAI_RESPONSES_PATH": "openai_responses_path",
     "ERP_AI_OPENAI_RESPONSES_PATH": "openai_responses_path",
     "ERP_AI_OPENAI_MCP_ENABLED": "enable_openai_mcp",

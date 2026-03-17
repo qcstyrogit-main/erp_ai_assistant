@@ -1,28 +1,78 @@
 # ERP AI Assistant
 
-Installable Frappe/ERPNext app that turns ERPNext into a Claude Desktop-style web assistant backed by FAC.
+Installable Frappe/ERPNext app that adds a Claude Desktop-style assistant inside ERPNext.
 
-It provides:
+It includes:
 - a Desk floating assistant bubble
-- a Desk assistant workspace
-- a website assistant page
+- a Desk workspace entry
+- a web assistant page
 - conversation and message DocTypes
-- multimodal chat with image attachments
-- FAC-backed ERP tool calling
-- downloadable Excel/PDF/Word artifacts generated from chat results
+- natural-language ERP routing
+- internal tool and resource registries
+- Excel/PDF export support
+- optional provider-backed chat and planning
 
-The app is intended to be the web counterpart of Claude Desktop for ERPNext:
-- chat inside ERPNext
-- call FAC tools with ERP permissions
-- read ERP records and reports
-- create/export files from tool results
-- work with images when the configured model endpoint supports vision
+## What It Is
+
+This app is no longer just a chat frontend.
+
+It now behaves like a small assistant host inside ERPNext:
+- user prompt enters the assistant UI
+- planner classifies the request
+- parser/router resolves ERP intent and context
+- tool registry exposes safe ERP/file actions
+- resource registry exposes ERP context and metadata
+- deterministic ERP execution runs when appropriate
+- provider-backed chat can handle general conversation or broader planning
+
+That makes the app much closer to a Claude Desktop-style architecture:
+- discoverable tools
+- discoverable resources
+- planner-driven routing
+- safe execution inside ERPNext
+
+## Main Capabilities
+
+- Chat in Desk and web
+- General chat when an AI provider is configured
+- Deterministic ERP read/list/search/count prompts
+- Draft document creation for common ERP transactions
+- Generic metadata-aware create/update flows
+- Workflow actions like submit/cancel/approve
+- Excel exports with user-requested fields
+- Human-readable Excel column labels
+- PDF generation for ERP documents
+- Pending-action continuation in chat
+- Tool catalog and resource catalog inspection
+
+## Current Assistant Flow
+
+The current backend shape is:
+
+`User Prompt`
+-> `Normalizer`
+-> `Planner`
+-> `Parser`
+-> `Context Resolver`
+-> `Clarification / Pending Action Logic`
+-> `Tool Router`
+-> `ERP Tools / File Tools`
+-> `Structured Assistant Response`
+
+There are now two important internal registries:
+
+- `tool_registry.py`
+  Exposes assistant actions like create, update, export, schema lookup, workflow, report execution, and generic document tools.
+- `resource_registry.py`
+  Exposes assistant-readable context like current document, doctype schema, available doctypes, current page context, and pending assistant action.
 
 ## App Name
+
 - Python module: `erp_ai_assistant`
 - Bench install target: `erp_ai_assistant`
 
-## Install On ERPNext
+## Install
+
 From your Bench folder:
 
 ```bash
@@ -33,85 +83,133 @@ bench build
 bench restart
 ```
 
-If your Bench already has this app path linked, you can skip `get-app` and just run install/migrate/build.
+If the app is already present in your bench, skip `get-app`.
 
 ## Usage
-- Desk bubble appears automatically for logged-in users.
+
+- Desk bubble loads automatically from `hooks.py`
 - Desk workspace route: `/app/assistant-workspace`
 - Website route: `/assistant`
-- Configure provider credentials in `AI Provider Settings` after install/migrate.
+- Configure provider credentials in `AI Provider Settings`
 
-## What The App Is
-- UI host for an ERP-native AI assistant inside Frappe/ERPNext
-- web client for FAC-backed tool use
-- conversation layer for prompts, tool activity, attachments, and exports
-- artifact renderer for downloadable responses
+## Example Prompts
 
-## Current Capabilities
-- Chat with OpenAI, OpenAI-compatible, or Anthropic providers
-- Attach images in the prompt and render them in chat
-- Use FAC-discovered ERP tools with role and permission checks
-- Run deterministic tool-first flows for common ERP intents
-- Export tool results as Excel, PDF, or Word from the assistant response
-- Use the assistant in Desk and on the website
+Read and search:
+- `how many active employees`
+- `show me sales invoices for customer ANICA`
+- `pull out Macdenver Conti Magbojos details`
+- `list available tools`
+- `list available resources`
 
-## Architecture
-- `erp_ai_assistant` is the UI and conversation app
-- `frappe_assistant_core` is the tool backend
-- the model provider handles reasoning
-- FAC tool results are rendered back into chat responses and downloadable artifacts
+Create and update:
+- `create customer with customer name Aqua Flask`
+- `create new employee with name Juan Dela Cruz`
+- `update employee Macdenver Magbojos birthday to April 30, 1993`
+- `create sales order for customer ABC with items ITEM-001 qty 2`
 
-In practice, this app behaves like:
-1. user sends prompt in ERPNext
-2. app sends prompt to model provider
-3. model can call FAC-backed ERP tools
-4. tool results are returned to the model
-5. assistant renders final answer and optional downloadable files
+Exports:
+- `export employee list to excel`
+- `export employee list to excel with fields employee id, employee name, department`
+- `export sales invoices for customer ANICA to excel with fields sales invoice id, customer, posting date, grand total`
+- `generate pdf for sales invoice SINV-0001`
 
-## AI Provider Setup
-1. Run:
+Workflow:
+- `submit sales order SO-0001`
+- `cancel sales invoice SINV-0001`
+- `approve leave application HR-LAP-0001`
 
-```bash
-bench --site <your-site> migrate
-```
+## Public API Endpoints
 
-2. In Desk, open `AI Provider Settings`.
-3. Choose `OpenAI` or `Anthropic`.
-4. Set the matching API key and default model.
-5. For OpenAI remote MCP tools, enable `Enable Remote MCP Servers For OpenAI` and provide JSON like:
+Assistant:
+- `erp_ai_assistant.api.assistant.handle_prompt`
+- `erp_ai_assistant.api.assistant.ping_assistant`
+- `erp_ai_assistant.api.assistant.answer_erp_query`
+- `erp_ai_assistant.api.assistant.list_available_tools`
+- `erp_ai_assistant.api.assistant.get_tool_catalog`
+- `erp_ai_assistant.api.assistant.list_available_resources`
+- `erp_ai_assistant.api.assistant.get_resource_catalog`
+- `erp_ai_assistant.api.assistant.read_available_resource`
 
-```json
-[
-  {
-    "server_label": "your-mcp",
-    "server_url": "https://your-mcp-server.example.com",
-    "authorization": "Bearer <token>",
-    "require_approval": "never"
-  }
-]
-```
+Router / planner:
+- `erp_ai_assistant.api.router.route_prompt`
+- `erp_ai_assistant.api.assistant.classify_prompt`
 
-## Environment Variable Fallbacks
-If you prefer site config or environment variables, the app also reads:
+ERP actions:
+- `erp_ai_assistant.api.assistant.create_sales_order`
+- `erp_ai_assistant.api.assistant.create_quotation`
+- `erp_ai_assistant.api.assistant.create_purchase_order`
+- `erp_ai_assistant.api.assistant.create_erp_document`
+- `erp_ai_assistant.api.assistant.update_erp_document`
+- `erp_ai_assistant.api.assistant.submit_erp_document`
+- `erp_ai_assistant.api.assistant.cancel_erp_document`
+- `erp_ai_assistant.api.assistant.run_workflow_action`
+
+Files:
+- `erp_ai_assistant.api.assistant.export_doctype_list_excel`
+- `erp_ai_assistant.api.file_tools.export_employee_list_excel`
+- `erp_ai_assistant.api.file_tools.generate_document_pdf`
+
+MCP/FAC-style proxy:
+- `erp_ai_assistant.api.fac_proxy.handle_mcp`
+
+Supported MCP-style operations:
+- `tools/list`
+- `tools/call`
+- `resources/list`
+- `resources/read`
+
+## Provider Setup
+
+Open `AI Provider Settings` in Desk and configure one of:
+- `OpenAI`
+- `OpenAI Compatible`
+- `Anthropic`
+
+General chat and model-backed planning depend on provider configuration.
+Deterministic ERP routing still works even when no provider is configured.
+
+## Environment Variable / Site Config Fallbacks
+
+The app also reads these when provider settings are not filled:
 
 - `ERP_AI_PROVIDER`
-- `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_MODELS`, `OPENAI_RESPONSES_PATH`
-- `ERP_AI_OPENAI_MCP_ENABLED`, `ERP_AI_OPENAI_MCP_SERVERS`
-- `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MESSAGES_PATH`
-- `ANTHROPIC_MODEL`, `ANTHROPIC_MODELS`, `ANTHROPIC_VISION_MODEL`
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`
+- `OPENAI_MODEL`
+- `OPENAI_MODELS`
+- `OPENAI_RESPONSES_PATH`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_AUTH_TOKEN`
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_MESSAGES_PATH`
+- `ANTHROPIC_MODEL`
+- `ANTHROPIC_MODELS`
+- `ANTHROPIC_VISION_MODEL`
+- `ERP_AI_OPENAI_MCP_ENABLED`
+- `ERP_AI_OPENAI_MCP_SERVERS`
+
+## Important Files
+
+- `erp_ai_assistant/hooks.py`
+- `erp_ai_assistant/api/assistant.py`
+- `erp_ai_assistant/api/ai.py`
+- `erp_ai_assistant/api/planner.py`
+- `erp_ai_assistant/api/router.py`
+- `erp_ai_assistant/api/tool_registry.py`
+- `erp_ai_assistant/api/resource_registry.py`
+- `erp_ai_assistant/api/file_tools.py`
+- `erp_ai_assistant/public/js/assistant_bubble.js`
+- `erp_ai_assistant/public/js/web_assistant.js`
 
 ## Notes
-- Vision depends on the configured endpoint actually supporting image input.
-- FAC remains the source of truth for ERP tool availability and permission checks.
-- Export attachments are generated on demand from chat payloads instead of relying on static saved documents.
 
-## Main Paths
-- `erp_ai_assistant/hooks.py`
-- `erp_ai_assistant/api/*.py`
-- `erp_ai_assistant/doctype/ai_conversation/*`
-- `erp_ai_assistant/doctype/ai_message/*`
-- `erp_ai_assistant/public/js/assistant_bubble.js`
-- `erp_ai_assistant/public/css/assistant_bubble.css`
-- `erp_ai_assistant/www/assistant.html`
-- `erp_ai_assistant/public/js/web_assistant.js`
-- `erp_ai_assistant/public/css/web_assistant.css`
+- This app is closer to Claude Desktop in architecture, not by copying the desktop wrapper app, but by using:
+  - planner
+  - tool registry
+  - resource registry
+  - host-style routing and execution
+- It is still a hybrid assistant, not a perfect "any prompt always works" system.
+- The strongest current path is:
+  - planner-guided ERP execution
+  - deterministic tool execution
+  - provider-backed fallback chat

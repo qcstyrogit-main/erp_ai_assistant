@@ -22,6 +22,7 @@ def _stringify_cell(value: Any) -> str:
 
 
 def _payload_to_rows(payload: Any) -> list[dict[str, Any]]:
+    payload = _unwrap_export_payload(payload)
     if payload is None:
         return []
     if isinstance(payload, list):
@@ -41,6 +42,27 @@ def _payload_to_rows(payload: Any) -> list[dict[str, Any]]:
         if compact:
             return [compact]
     return [{"value": _stringify_cell(payload)}]
+
+
+def _unwrap_export_payload(payload: Any) -> Any:
+    current = payload
+    for _ in range(5):
+        if not isinstance(current, dict):
+            return current
+        if isinstance(current.get("data"), list):
+            return current.get("data")
+        if isinstance(current.get("result"), list):
+            return current.get("result")
+        nested = current.get("result")
+        if isinstance(nested, dict) and nested is not current:
+            current = nested
+            continue
+        data_value = current.get("data")
+        if isinstance(data_value, dict) and data_value is not current:
+            current = data_value
+            continue
+        break
+    return current
 
 
 def _normalize_export_payload(payload: str) -> tuple[str, list[dict[str, Any]]]:

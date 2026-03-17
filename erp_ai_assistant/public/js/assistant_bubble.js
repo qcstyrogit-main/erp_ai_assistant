@@ -3,7 +3,7 @@
 
   /**
    * @class ERPAssistantBubble
-   * @description Main class for ERP AI Assistant UI component
+   * @description Main class for the AI assistant UI component
    * Manages conversations, messages, and user interactions
    */
   class ERPAssistantBubble {
@@ -43,6 +43,7 @@
 
       /** @type {Array<Object>} */
       this.pendingImages = [];
+
     }
 
     boot() {
@@ -60,21 +61,21 @@
       bubble.className = "erp-ai-assistant-bubble";
       bubble.innerHTML = `
         <span class="erp-ai-assistant-bubble__icon">AI</span>
-        <span class="erp-ai-assistant-bubble__label">ERP Assistant</span>
+        <span class="erp-ai-assistant-bubble__label">AI Assistant</span>
       `;
-      bubble.setAttribute("aria-label", "Open ERP AI Assistant");
-      bubble.setAttribute("title", "ERP Assistant\nClick to open\nCtrl+Enter: Quick open");
+      bubble.setAttribute("aria-label", "Open AI Assistant");
+      bubble.setAttribute("title", "AI Assistant\nClick to open\nCtrl+Enter: Quick open");
 
       const drawer = document.createElement("div");
       drawer.id = "erp-ai-assistant-drawer";
       drawer.className = "erp-ai-assistant-drawer";
       drawer.setAttribute("role", "dialog");
-      drawer.setAttribute("aria-label", "ERP AI Assistant Dialog");
+      drawer.setAttribute("aria-label", "AI Assistant Dialog");
       drawer.innerHTML = `
         <div class="erp-ai-assistant-drawer__sidebar">
           <div class="erp-ai-assistant-drawer__sidebar-head">
             <div>
-              <div class="erp-ai-assistant-drawer__eyebrow">ERP AI Assistant</div>
+              <div class="erp-ai-assistant-drawer__eyebrow">AI Assistant</div>
               <h3>Conversations</h3>
             </div>
             <div class="erp-ai-assistant-drawer__sidebar-actions">
@@ -94,7 +95,7 @@
           </div>
           <div class="erp-ai-assistant-messages"></div>
           <div class="erp-ai-assistant-composer">
-            <textarea rows="3" placeholder="Ask about this record, generate a report, or update data..." aria-label="Message input"></textarea>
+            <textarea rows="3" placeholder="Ask anything. If you are on a document, I can also use that ERP context..." aria-label="Message input"></textarea>
             <div class="erp-ai-assistant-image-preview"></div>
             <input type="file" class="erp-ai-assistant-image-input" accept="image/*" multiple hidden />
             <div class="erp-ai-assistant-composer__actions">
@@ -253,23 +254,30 @@
         route = window.location.hash.replace(/^#/, "").split("/").filter(Boolean);
       }
 
+      const routeText = route.join("/");
+      const [view, doctype, docname] = route;
+      const isFormRoute = view === "Form";
       const form = window.cur_frm || (typeof cur_frm !== "undefined" ? cur_frm : null);
+      const formMatchesRoute = Boolean(
+        form
+        && form.doc
+        && isFormRoute
+        && String(form.doctype || "") === String(doctype || "")
+        && String(form.docname || "") === String(docname || "")
+      );
 
-      if (form && form.doc) {
+      if (formMatchesRoute) {
         return {
           doctype: form.doctype || null,
           docname: form.docname || null,
-          route: route.join("/"),
+          route: routeText,
         };
       }
 
-      const [view, doctype, docname] = route;
-      const isForm = view === "Form";
-
       return {
-        doctype: isForm ? doctype || null : null,
-        docname: isForm ? docname || null : null,
-        route: route.join("/"),
+        doctype: isFormRoute ? doctype || null : null,
+        docname: isFormRoute ? docname || null : null,
+        route: routeText,
       };
     }
 
@@ -282,12 +290,12 @@
         }
       } catch (error) {
         // Keep UI alive even if route/context cannot be resolved on a custom Desk page.
-        console.warn("ERP Assistant: context resolution failed", error);
+        console.warn("AI Assistant: context resolution failed", error);
       }
 
       const text = context.doctype && context.docname
         ? `${context.doctype} / ${context.docname}`
-        : "General ERP workspace";
+        : "General chat";
 
       if (this.elements.context) {
         this.elements.context.textContent = text;
@@ -438,9 +446,9 @@
           bubble.appendChild(this._renderToolEventRow(toolEvents));
         }
 
-        const attachments = this._parseAttachments(message.attachments_json);
-        if (attachments.length) {
-          bubble.appendChild(this._renderAttachmentRow(attachments));
+        const attachmentPackage = this._parseAttachmentPackage(message.attachments_json);
+        if (attachmentPackage.attachments.length) {
+          bubble.appendChild(this._renderAttachmentRow(attachmentPackage.attachments));
         }
 
         // Add copy button for assistant messages
@@ -661,17 +669,22 @@
       }
     }
 
-    _parseAttachments(raw) {
-      if (!raw) return [];
+    _parseAttachmentPackage(raw) {
+      if (!raw) return { attachments: [], exports: {} };
       try {
         const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-        if (Array.isArray(parsed)) return parsed.filter((item) => item && item.file_url);
-        if (parsed && Array.isArray(parsed.attachments)) {
-          return parsed.attachments.filter((item) => item && item.file_url);
+        if (Array.isArray(parsed)) {
+          return { attachments: parsed.filter((item) => item && item.file_url), exports: {} };
         }
-        return [];
+        if (parsed && Array.isArray(parsed.attachments)) {
+          return {
+            attachments: parsed.attachments.filter((item) => item && item.file_url),
+            exports: parsed.exports && typeof parsed.exports === "object" ? parsed.exports : {},
+          };
+        }
+        return { attachments: [], exports: {} };
       } catch (error) {
-        return [];
+        return { attachments: [], exports: {} };
       }
     }
 
@@ -679,55 +692,146 @@
       if (!raw) return [];
       try {
         const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-        return Array.isArray(parsed) ? parsed.map((item) => String(item || "").trim()).filter(Boolean) : [];
+        return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
       } catch (error) {
         return [];
       }
     }
 
     _renderToolEventRow(events) {
+      const textEvents = events.filter((item) => typeof item === "string" && String(item || "").trim());
+      const structuredEvents = events.filter((item) => item && typeof item === "object" && !Array.isArray(item));
       const wrap = document.createElement("details");
       wrap.className = "erp-ai-assistant-message__tools";
       wrap.open = false;
-      const items = events.slice(-8).map((item) => `<li>${this._escapeHtml(item)}</li>`).join("");
+      const items = textEvents.slice(-8).map((item) => `<li>${this._escapeHtml(item)}</li>`).join("");
       wrap.innerHTML = `
         <summary class="erp-ai-assistant-message__tools-summary">Tool activity</summary>
+        <div class="erp-ai-assistant-message__tool-blocks"></div>
         <ul class="erp-ai-assistant-message__tools-list">${items}</ul>
       `;
+      const blocks = wrap.querySelector(".erp-ai-assistant-message__tool-blocks");
+      structuredEvents.forEach((item) => {
+        const card = this._renderStructuredToolEvent(item);
+        if (card) blocks.appendChild(card);
+      });
+      const list = wrap.querySelector(".erp-ai-assistant-message__tools-list");
+      if (!items) {
+        list.remove();
+      }
       return wrap;
+    }
+
+    _renderStructuredToolEvent(item) {
+      const type = String(item?.type || "").trim();
+      if (!type) return null;
+      const wrap = document.createElement("div");
+      wrap.className = "erp-ai-assistant-message__tool-card";
+      if (type === "missing_fields") {
+        const rows = Array.isArray(item.items) ? item.items : [];
+        wrap.innerHTML = `
+          <div class="erp-ai-assistant-message__tool-title">Missing fields</div>
+          <div class="erp-ai-assistant-message__tool-chips">
+            ${rows.slice(0, 8).map((row) => `<span class="erp-ai-assistant-message__tool-chip">${this._escapeHtml(row.label || row.fieldname || "")}</span>`).join("")}
+          </div>
+        `;
+        return wrap;
+      }
+      if (type === "missing_child_rows") {
+        const rows = Array.isArray(item.items) ? item.items : [];
+        wrap.innerHTML = `
+          <div class="erp-ai-assistant-message__tool-title">Incomplete child rows</div>
+          <div class="erp-ai-assistant-message__tool-options">
+            ${rows.slice(0, 6).map((row) => `<div class="erp-ai-assistant-message__tool-option"><strong>${this._escapeHtml((row.table_label || "Rows") + " row " + (row.row_index || ""))}</strong><small>${this._escapeHtml((row.fields || []).map((field) => field.label || field.fieldname || "").join(", "))}</small></div>`).join("")}
+          </div>
+        `;
+        return wrap;
+      }
+      if (type === "candidates") {
+        const rows = Array.isArray(item.items) ? item.items : [];
+        wrap.innerHTML = `
+          <div class="erp-ai-assistant-message__tool-title">Choose one</div>
+          <div class="erp-ai-assistant-message__tool-options">
+            ${rows.slice(0, 6).map((row) => `<div class="erp-ai-assistant-message__tool-option"><strong>${this._escapeHtml(row.name || "")}</strong><small>${this._escapeHtml(row.label || "")}</small></div>`).join("")}
+          </div>
+        `;
+        return wrap;
+      }
+      if (type === "document_ref") {
+        const url = String(item.url || "").trim();
+        const label = `${item.doctype || "Document"} ${item.name || ""}`.trim();
+        wrap.innerHTML = `
+          <div class="erp-ai-assistant-message__tool-title">Document</div>
+          <div class="erp-ai-assistant-message__tool-link">${url ? this._renderAnchor(url, label) : this._escapeHtml(label)}</div>
+        `;
+        return wrap;
+      }
+      if (type === "planner") {
+        const source = String(item.source || "").trim();
+        const reason = String(item.reason || "").trim();
+        wrap.innerHTML = `
+          <div class="erp-ai-assistant-message__tool-title">Planner</div>
+          <div class="erp-ai-assistant-message__tool-option">
+            <strong>${this._escapeHtml(String(item.intent || "unknown"))}</strong>
+            <small>confidence ${this._escapeHtml(String(item.confidence ?? ""))}${source ? ` • ${this._escapeHtml(source)}` : ""}${reason ? ` • ${this._escapeHtml(reason)}` : ""}</small>
+          </div>
+        `;
+        return wrap;
+      }
+      return null;
     }
 
     _renderAttachmentRow(attachments) {
       const wrap = document.createElement("div");
       wrap.className = "erp-ai-assistant-message__attachments";
       attachments.forEach((item) => {
-        const link = document.createElement("a");
-        link.className = "erp-ai-assistant-message__attachment";
-        link.href = item.file_url;
-        link.target = "_blank";
-        link.rel = "noopener noreferrer";
-        const label = item.label || item.file_type || "File";
+        const card = document.createElement("button");
+        card.className = "erp-ai-assistant-message__attachment";
+        card.type = "button";
         const name = item.filename || "download";
-        if (this._isImageUrl(item.file_url)) {
-          link.classList.add("is-image");
-          link.innerHTML = `
-            <img class="erp-ai-assistant-message__attachment-image" src="${this._escapeHtml(item.file_url)}" alt="${this._escapeHtml(name)}" loading="lazy" />
-            <span class="erp-ai-assistant-message__attachment-meta">
-              <strong>${this._escapeHtml(name)}</strong>
-              <small>${this._escapeHtml(label)}</small>
-            </span>
-          `;
-        } else {
-          link.innerHTML = `
-            <span class="erp-ai-assistant-message__attachment-meta">
-              <strong>${this._escapeHtml(name)}</strong>
-              <small>${this._escapeHtml(label)}</small>
-            </span>
-          `;
-        }
-        wrap.appendChild(link);
+        card.title = `Download ${name}`;
+        card.innerHTML = `
+          <span class="erp-ai-assistant-message__attachment-meta">
+            <strong>${this._escapeHtml(name)}</strong>
+          </span>
+        `;
+        card.addEventListener("click", () => this._downloadAttachment(item));
+        wrap.appendChild(card);
       });
       return wrap;
+    }
+
+    async _downloadAttachment(item) {
+      const fileUrl = String(item?.file_url || "").trim();
+      const filename = String(item?.filename || "download").trim() || "download";
+      if (!fileUrl) return;
+
+      const triggerDownload = (href) => {
+        const link = document.createElement("a");
+        link.href = href;
+        link.download = filename;
+        link.rel = "noopener";
+        link.style.display = "none";
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+      };
+
+      if (fileUrl.startsWith("data:")) {
+        triggerDownload(fileUrl);
+        return;
+      }
+
+      try {
+        const response = await fetch(fileUrl, { credentials: "same-origin" });
+        if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        triggerDownload(objectUrl);
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+      } catch (error) {
+        triggerDownload(fileUrl);
+      }
     }
 
     ensureConversation(callback) {
@@ -781,7 +885,7 @@
         this._setGeneratingState(true);
 
         const request = frappe.call({
-          method: "erp_ai_assistant.api.ai.send_prompt",
+          method: "erp_ai_assistant.api.assistant.handle_prompt",
           args: {
             conversation: conversationName,
             prompt,
@@ -878,27 +982,29 @@
         <div class="erp-ai-assistant-progress">
           <div class="erp-ai-assistant-progress__head">
             <span class="erp-ai-assistant-progress__spinner" aria-hidden="true"></span>
-            <span>Working</span>
+            <span>Responding</span>
           </div>
           <div class="erp-ai-assistant-progress__steps"></div>
+          <div class="erp-ai-assistant-progress__partial" style="display:none;"></div>
         </div>
       `;
 
       this.elements.messages.appendChild(indicator);
-      this._updateTypingSteps(Array.isArray(steps) ? steps : ["Preparing request"]);
+      this._updateTypingSteps(Array.isArray(steps) ? steps : ["Preparing response"], "");
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
     }
 
-    _updateTypingSteps(steps) {
+    _updateTypingSteps(steps, partialText) {
       const indicator = document.getElementById("erp-ai-assistant-typing");
       if (!indicator) return;
       const wrap = indicator.querySelector(".erp-ai-assistant-progress__steps");
+      const partial = indicator.querySelector(".erp-ai-assistant-progress__partial");
       if (!wrap) return;
 
       const normalized = Array.isArray(steps)
         ? steps.map((item) => String(item || "").trim()).filter(Boolean)
         : [];
-      const finalSteps = normalized.length ? normalized : ["Preparing request"];
+      const finalSteps = normalized.length ? normalized : ["Preparing response"];
 
       wrap.innerHTML = "";
       finalSteps.slice(-4).forEach((step) => {
@@ -907,11 +1013,15 @@
         row.textContent = step;
         wrap.appendChild(row);
       });
+      if (partial) {
+        partial.textContent = String(partialText || "").trim();
+        partial.style.display = partial.textContent ? "block" : "none";
+      }
     }
 
     _startProgressPolling(conversationName) {
       this._stopProgressPolling();
-      this._showTypingIndicator(["Preparing request"]);
+      this._showTypingIndicator(["Preparing response"]);
 
       if (!conversationName) return;
 
@@ -925,7 +1035,7 @@
           callback: (response) => {
             const progress = response?.message || {};
             const steps = Array.isArray(progress.steps) ? progress.steps : [];
-            this._updateTypingSteps(steps);
+            this._updateTypingSteps(steps, progress.partial_text || "");
           },
           always: () => {
             this.progressPollPending = false;

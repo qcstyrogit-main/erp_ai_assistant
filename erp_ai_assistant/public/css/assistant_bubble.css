@@ -563,6 +563,62 @@
   color: var(--ai-text-secondary);
 }
 
+.erp-ai-assistant-message__tool-blocks {
+  padding: 0 12px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.erp-ai-assistant-message__tool-card {
+  border: 1px solid rgba(31, 41, 55, 0.08);
+  background: rgba(31, 41, 55, 0.04);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.erp-ai-assistant-message__tool-title {
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.erp-ai-assistant-message__tool-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.erp-ai-assistant-message__tool-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(217, 119, 87, 0.12);
+  color: var(--ai-text-primary);
+  font-size: 12px;
+}
+
+.erp-ai-assistant-message__tool-options {
+  display: grid;
+  gap: 6px;
+}
+
+.erp-ai-assistant-message__tool-option {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.erp-ai-assistant-message__tool-option small {
+  color: var(--ai-text-secondary);
+}
+
+.erp-ai-assistant-message__tool-link {
+  font-size: 13px;
+}
+
 .erp-ai-assistant-message__attachment {
   display: inline-flex;
   align-items: center;
@@ -576,6 +632,10 @@
   font-weight: 600;
   text-decoration: none;
   min-width: 180px;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  text-align: left;
 }
 
 .erp-ai-assistant-message__attachment:hover {
@@ -587,6 +647,11 @@
   border-color: rgba(255, 255, 255, 0.3);
   background: rgba(255, 255, 255, 0.12);
   color: #fffaf5;
+}
+
+.erp-ai-assistant-message__attachment-meta {
+  display: flex;
+  align-items: center;
 }
 
 .erp-ai-assistant-message__attachment.is-image {

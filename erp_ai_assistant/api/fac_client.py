@@ -2,8 +2,8 @@ from typing import Any
 
 import frappe
 
-from .fac_proxy import TOOL_DEFINITIONS as FALLBACK_TOOL_DEFINITIONS
-from .fac_proxy import _dispatch_tool as fallback_dispatch_tool
+from .tool_registry import execute_tool as fallback_dispatch_tool
+from .tool_registry import get_tool_definitions as get_fallback_tool_definitions
 
 
 def _fac_registry():
@@ -18,12 +18,12 @@ def _fac_registry():
 def get_tool_definitions() -> dict[str, dict[str, Any]]:
     registry = _fac_registry()
     if not registry:
-        return dict(FALLBACK_TOOL_DEFINITIONS)
+        return get_fallback_tool_definitions()
 
     try:
         tools = registry.get_available_tools(user=frappe.session.user)
     except Exception:
-        return dict(FALLBACK_TOOL_DEFINITIONS)
+        return get_fallback_tool_definitions()
 
     definitions: dict[str, dict[str, Any]] = {}
     for tool in tools:
@@ -40,7 +40,7 @@ def get_tool_definitions() -> dict[str, dict[str, Any]]:
             "inputSchema": input_schema,
             "annotations": tool.get("annotations"),
         }
-    return definitions or dict(FALLBACK_TOOL_DEFINITIONS)
+    return definitions or get_fallback_tool_definitions()
 
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
@@ -51,6 +51,6 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     try:
         return registry.execute_tool(name, arguments or {})
     except Exception:
-        if name in FALLBACK_TOOL_DEFINITIONS:
+        if name in get_fallback_tool_definitions():
             return fallback_dispatch_tool(name, arguments)
         raise

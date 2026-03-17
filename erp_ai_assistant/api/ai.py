@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import ast
 from typing import Any, Optional
 
 import frappe
@@ -11,6 +12,8 @@ from .chat import add_message, create_conversation
 from .export import add_message_attachment_urls, create_message_artifacts
 from .fac_client import dispatch_tool, get_tool_definitions
 from .provider_settings import get_active_provider, get_provider_setting, get_remote_mcp_servers
+from .resource_registry import list_resource_specs
+from .router import route_prompt_internal
 
 
 TOOL_NAME_MAP = {
@@ -41,6 +44,35 @@ WRITE_TOOL_NAMES = {
     "update_document",
 }
 DELETE_TOOL_NAMES = {"delete_document"}
+CORE_DOC_TOOL_NAMES = {
+    "get_document",
+    "list_documents",
+    "create_document",
+    "update_document",
+    "delete_document",
+    "submit_document",
+    "search_documents",
+    "search_doctype",
+    "search_link",
+    "get_doctype_info",
+    "run_workflow",
+}
+REPORT_TOOL_NAMES = {
+    "generate_report",
+    "report_list",
+    "report_requirements",
+}
+ANALYSIS_TOOL_NAMES = {
+    "run_python_code",
+    "analyze_business_data",
+    "run_database_query",
+    "create_visualization",
+    "create_dashboard",
+    "create_dashboard_chart",
+    "list_user_dashboards",
+    "chatgpt_search",
+    "chatgpt_fetch",
+}
 
 
 def _cfg(key: str, default: Any = None) -> Any:
@@ -309,7 +341,59 @@ def _allowed_tool_names(prompt: str, available_names: Optional[set[str]] = None)
     return allowed
 
 
-def _tool_access_summary(prompt: str) -> str:
+def _selected_tool_names_for_prompt(prompt: str, context: dict[str, Any], available_names: set[str]) -> set[str]:
+    allowed = _allowed_tool_names(prompt, available_names)
+    text = (prompt or "").strip().lower()
+    if not allowed:
+        return set()
+
+    if not _is_erp_intent(prompt, context):
+        return set()
+
+    document_tools = allowed & CORE_DOC_TOOL_NAMES
+    report_tools = allowed & REPORT_TOOL_NAMES
+    analysis_tools = allowed & ANALYSIS_TOOL_NAMES
+
+    if any(term in text for term in ("chart", "dashboard", "visual", "analyze", "analysis", "python", "sql", "query")):
+        selected = document_tools | report_tools | analysis_tools
+        return selected or allowed
+
+    if "report" in text or "filter" in text or "requirement" in text:
+        selected = document_tools | report_tools
+        return selected or allowed
+
+    if _has_write_intent(prompt) or _has_destructive_intent(prompt):
+        selected = document_tools
+        return selected or allowed
+
+    selected = document_tools | report_tools
+    return selected or allowed
+
+
+def _has_active_document_context(context: Optional[dict[str, Any]] = None) -> bool:
+    current = context or {}
+    return bool(current.get("doctype") and current.get("docname"))
+
+
+def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
+    current = context or {}
+    if _has_active_document_context(current):
+        return (
+            f"Current context: doctype={current.get('doctype')}, "
+            f"docname={current.get('docname')}, route={current.get('route')}."
+        )
+    route = str(current.get("route") or "").strip()
+    if route:
+        return f"Current context: no active document. Current route={route}."
+    return "Current context: no active document. Treat this as a general workspace chat unless the user asks for ERP data."
+
+
+def _tool_access_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    if not _is_erp_intent(prompt, context or {}):
+        return (
+            "If the request is general and does not need ERP/Frappe data, answer directly without tools. "
+            "Only use ERP tools when the user asks about live ERP data, reports, workflows, or record changes."
+        )
     if _has_destructive_intent(prompt):
         return "You may use read, create, update, and delete ERP tools when the request explicitly requires it."
     if _has_write_intent(prompt):
@@ -340,6 +424,7 @@ def _progress_update(
     step: str | None = None,
     done: bool = False,
     error: str | None = None,
+    partial_text: str | None = None,
 ) -> None:
     if not progress:
         return
@@ -362,8 +447,10 @@ def _progress_update(
         "done": bool(done),
         "error": (error or "").strip() or None,
         "model": progress.get("model"),
+        "partial_text": partial_text if partial_text is not None else progress.get("partial_text"),
         "updated_at": frappe.utils.now(),
     }
+    progress["partial_text"] = payload.get("partial_text")
     expires_in_sec = 300 if done else 900
     frappe.cache().set_value(
         _progress_cache_key(conversation, user),
@@ -442,6 +529,7 @@ def send_prompt(
         response = _generate_response(
             prompt_text,
             context,
+            conversation=conversation_name,
             history=history,
             model=selected_model,
             progress=progress,
@@ -457,10 +545,12 @@ def send_prompt(
         conversation=conversation_name,
         prompt=prompt_text,
     )
+    attachments = _merge_attachment_packages(attachments, response.get("attachments"))
+    reply_text = _finalize_reply_text(response["text"], prompt_text, attachments)
     message = add_message(
         conversation_name,
         "assistant",
-        response["text"],
+        reply_text,
         tool_events=json.dumps(response.get("tool_events", [])),
         attachments_json=json.dumps({"attachments": [], "exports": {}}),
     )
@@ -468,11 +558,11 @@ def send_prompt(
     if attachments.get("attachments"):
         assistant_message = frappe.get_doc("AI Message", message["name"])
         assistant_message.db_set("attachments_json", json.dumps(attachments, default=str), update_modified=False)
-    _progress_update(progress, stage="completed", done=True, step="Response ready")
+    _progress_update(progress, stage="completed", done=True, step="Response ready", partial_text="")
 
     return {
         "conversation": conversation_name,
-        "reply": response["text"],
+        "reply": reply_text,
         "tool_events": response.get("tool_events", []),
         "payload": response.get("payload"),
         "attachments": attachments,
@@ -495,6 +585,28 @@ def _build_message_attachments(payload: Any, title: str, conversation: str, prom
     except Exception:
         frappe.log_error(frappe.get_traceback(), "ERP AI Assistant Artifact Generation Error")
         return {"attachments": [], "exports": {}}
+
+
+def _merge_attachment_packages(*packages: Any) -> dict[str, Any]:
+    merged = {"attachments": [], "exports": {}}
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        attachments = package.get("attachments") or []
+        exports = package.get("exports") or {}
+        if isinstance(attachments, list):
+            merged["attachments"].extend(item for item in attachments if isinstance(item, dict))
+        if isinstance(exports, dict):
+            merged["exports"].update(exports)
+    return merged
+
+
+def _finalize_reply_text(text: str, prompt: str, attachments: dict[str, Any]) -> str:
+    attachment_rows = attachments.get("attachments") or []
+    if attachment_rows and _requested_export_formats(prompt) and any(item.get("export_id") for item in attachment_rows):
+        labels = ", ".join(str(item.get("label") or item.get("file_type") or "file").strip() for item in attachment_rows[:3])
+        return f"Prepared your export. Use the downloadable attachment below{f' ({labels})' if labels else ''}."
+    return text
 
 
 def _requested_export_formats(prompt: str) -> list[str]:
@@ -536,8 +648,9 @@ def _requested_export_formats(prompt: str) -> list[str]:
     return formats
 
 
-def _should_execute_plan_before_llm(prompt: str, plan: dict[str, Any]) -> bool:
-    tool = str(plan.get("tool") or "").strip()
+def _should_execute_plan_before_llm(prompt: str, plan: dict[str, Any] | list[dict[str, Any]]) -> bool:
+    first_step = plan[0] if isinstance(plan, list) and plan else plan
+    tool = str((first_step or {}).get("tool") or "").strip()
     text = (prompt or "").strip().lower()
     if tool in {"get_document", "get_list", "get_report", "report_list", "report_requirements"}:
         return True
@@ -560,26 +673,73 @@ def _should_execute_plan_before_llm(prompt: str, plan: dict[str, Any]) -> bool:
     return any(term in text for term in strong_terms)
 
 
+def _is_erp_intent(prompt: str, context: dict[str, Any]) -> bool:
+    text = (prompt or "").strip().lower()
+    if context.get("doctype") and context.get("docname"):
+        return True
+    if not text:
+        return False
+    erp_markers = (
+        "customer",
+        "supplier",
+        "employee",
+        "item",
+        "invoice",
+        "order",
+        "quotation",
+        "lead",
+        "opportunity",
+        "report",
+        "dashboard",
+        "chart",
+        "doctype",
+        "workflow",
+        "erp",
+        "sales",
+        "purchase",
+        "stock",
+        "accounts",
+        "hr",
+    )
+    return any(marker in text for marker in erp_markers)
+
+
 def _generate_response(
     prompt: str,
     context: dict[str, Any],
+    conversation: str | None = None,
     history: Optional[list[dict[str, Any]]] = None,
     model: str | None = None,
     progress: Optional[dict[str, Any]] = None,
     images: Optional[list[dict[str, str]]] = None,
 ) -> dict[str, Any]:
-    direct_plan = _plan_prompt(prompt, context)
+    deterministic_result = _deterministic_router_response(prompt, context)
+    if deterministic_result is not None:
+        _progress_update(progress, stage="working", step="Preparing response")
+        return deterministic_result
+
+    direct_plan = _plan_prompt_steps(prompt, context)
     requested_formats = _requested_export_formats(prompt)
 
     if direct_plan and (requested_formats or _should_execute_plan_before_llm(prompt, direct_plan)):
-        _progress_update(progress, stage="working", step=f"Running tool: {direct_plan['tool']}")
-        result = _run_tool(direct_plan["tool"], direct_plan["arguments"])
+        result, tool_events = _execute_plan_steps(direct_plan, progress=progress)
+        final_step = direct_plan[-1]
         _progress_update(progress, stage="working", step="Preparing response")
         return {
-            "text": _render_tool_output(direct_plan["tool"], result, direct_plan.get("heading")),
-            "tool_events": [f"{direct_plan['tool']} {direct_plan['arguments']}"],
+            "text": _render_tool_output(final_step["tool"], result, final_step.get("heading")),
+            "tool_events": tool_events,
             "payload": result,
         }
+
+    if requested_formats and conversation:
+        follow_up_payload = _rerun_last_exportable_tool(conversation, progress=progress)
+        if follow_up_payload is not None:
+            _progress_update(progress, stage="working", step="Preparing response")
+            return {
+                "text": "Prepared export from the previous result in this conversation.",
+                "tool_events": [],
+                "payload": follow_up_payload,
+            }
 
     if _llm_chat_configured():
         try:
@@ -623,19 +783,84 @@ def _generate_response(
             }
 
     if direct_plan:
-        _progress_update(progress, stage="working", step=f"Running tool: {direct_plan['tool']}")
-        result = _run_tool(direct_plan["tool"], direct_plan["arguments"])
+        result, tool_events = _execute_plan_steps(direct_plan, progress=progress)
+        final_step = direct_plan[-1]
         _progress_update(progress, stage="working", step="Preparing response")
         return {
-            "text": _render_tool_output(direct_plan["tool"], result, direct_plan.get("heading")),
-            "tool_events": [f"{direct_plan['tool']} {direct_plan['arguments']}"],
+            "text": _render_tool_output(final_step["tool"], result, final_step.get("heading")),
+            "tool_events": tool_events,
             "payload": result,
         }
 
-    guidance = "AI provider is not configured for open-ended chat yet. Try direct prompts like 'Show me list of customers' or 'Summarize this record'."
-    if context.get("doctype") and context.get("docname"):
+    guidance = (
+        "AI provider is not configured for open-ended chat yet. "
+        "You can still use ERP-native prompts like 'Show me list of customers' or 'Summarize this record'."
+    )
+    if _has_active_document_context(context):
         guidance += f" Current context: {context['doctype']} / {context['docname']}."
     return {"text": guidance, "tool_events": [], "payload": None}
+
+
+def _deterministic_router_response(prompt: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    if not str(prompt or "").strip():
+        return None
+    planner_result = None
+    try:
+        from .planner import classify_prompt_internal
+
+        planner_result = classify_prompt_internal(prompt, context or {})
+    except Exception:
+        planner_result = None
+    routed = route_prompt_internal(prompt, context=context or {}, planner_result=planner_result)
+    if not routed.get("matched"):
+        return None
+
+    result_type = str(routed.get("type") or "").strip().lower()
+    if routed.get("ok"):
+        if result_type == "answer":
+            return {
+                "text": str(routed.get("answer") or routed.get("message") or "Completed."),
+                "tool_events": ["router deterministic"],
+                "payload": routed.get("data"),
+            }
+        if result_type == "document":
+            doc_link = str(routed.get("url") or "").strip()
+            doc_label = f"{routed.get('doctype')} {routed.get('name')}".strip()
+            link_text = f"\n\nOpen document: [{doc_label}]({doc_link})" if doc_link else ""
+            return {
+                "text": f"{str(routed.get('message') or 'Document created successfully.')}{link_text}",
+                "tool_events": ["router deterministic", f"document {routed.get('doctype')} {routed.get('name')}"],
+                "payload": routed,
+            }
+        if result_type == "file":
+            file_name = str(routed.get("file_name") or "download").strip()
+            file_url = str(routed.get("file_url") or "").strip()
+            text = f"{str(routed.get('message') or 'File generated successfully.')}\n\nFile: {file_name}"
+            if file_url:
+                text += f"\nDownload: {file_url}"
+            return {
+                "text": text,
+                "tool_events": ["router deterministic", f"file {file_name}"],
+                "payload": routed.get("data"),
+                "attachments": {
+                    "attachments": [
+                        {
+                            "id": f"file-{file_name}",
+                            "label": "File",
+                            "filename": file_name,
+                            "file_type": file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "file",
+                            "file_url": file_url,
+                        }
+                    ] if file_url else [],
+                    "exports": {},
+                },
+            }
+
+    return {
+        "text": str(routed.get("message") or "Request could not be completed."),
+        "tool_events": ["router deterministic"],
+        "payload": routed,
+    }
 
 
 def _llm_chat_configured() -> bool:
@@ -679,7 +904,7 @@ def _conversation_history_for_llm(conversation_name: str, limit: int = 24) -> li
     messages = frappe.get_all(
         "AI Message",
         filters={"conversation": conversation_name},
-        fields=["role", "content"],
+        fields=["role", "content", "attachments_json"],
         order_by="creation desc",
         limit_page_length=max(1, limit),
     )
@@ -687,46 +912,123 @@ def _conversation_history_for_llm(conversation_name: str, limit: int = 24) -> li
     for row in reversed(messages):
         role = (row.get("role") or "").strip().lower()
         content = (row.get("content") or "").strip()
-        if not content:
+        attachments = _parse_message_attachments(row.get("attachments_json"))
+        attachment_notes = _describe_message_attachments(attachments)
+        if not content and not attachments:
             continue
+        history_text = _merge_history_content_and_attachment_notes(content, attachment_notes)
         if role == "user":
-            history.append({"role": "user", "content": content})
+            history.append(
+                {
+                    "role": "user",
+                    "content": history_text,
+                }
+            )
         elif role == "assistant":
-            history.append({"role": "assistant", "content": content})
+            history.append({"role": "assistant", "content": history_text})
     return history
 
 
+def _rerun_last_exportable_tool(
+    conversation_name: str,
+    *,
+    progress: Optional[dict[str, Any]] = None,
+) -> Any:
+    rows = frappe.get_all(
+        "AI Message",
+        filters={"conversation": conversation_name, "role": "assistant"},
+        fields=["tool_events"],
+        order_by="creation desc",
+        limit_page_length=6,
+    )
+    for row in rows:
+        event = _last_exportable_tool_event(row.get("tool_events"))
+        if not event:
+            continue
+        tool_name, arguments = event
+        _progress_update(progress, stage="working", step=f"Reusing previous result: {tool_name}")
+        return _run_tool(tool_name, arguments)
+    return None
+
+
+def _last_exportable_tool_event(raw: Any) -> tuple[str, dict[str, Any]] | None:
+    eligible_tools = {
+        "get_list",
+        "get_document",
+        "get_report",
+        "list_documents",
+        "generate_report",
+    }
+    if not raw:
+        return None
+    try:
+        events = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
+    if not isinstance(events, list):
+        return None
+    for item in reversed(events):
+        text = str(item or "").strip()
+        if not text or text.endswith("(error)") or " (error)" in text:
+            continue
+        tool_name, arguments = _parse_tool_event(text)
+        if tool_name in eligible_tools:
+            return tool_name, arguments
+    return None
+
+
+def _parse_tool_event(text: str) -> tuple[str, dict[str, Any]]:
+    raw = str(text or "").strip()
+    if not raw:
+        return "", {}
+    if " " not in raw:
+        return raw, {}
+    tool_name, raw_args = raw.split(" ", 1)
+    try:
+        parsed = ast.literal_eval(raw_args.strip())
+        if isinstance(parsed, dict):
+            return tool_name.strip(), parsed
+    except Exception:
+        pass
+    return tool_name.strip(), {}
+
+
 def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any]]:
-    raw_text = _normalize_name(prompt)
+    steps = _plan_prompt_steps(prompt, context)
+    return steps[0] if steps else None
+
+
+def _plan_prompt_steps(prompt: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_text = _normalize_planner_prompt(prompt)
     text = raw_text.lower()
-    export_terms = ("create", "export", "download", "save")
+    export_terms = ("create", "export", "download", "save", "generate")
     export_format_terms = ("excel", "xlsx", "spreadsheet", "csv", "pdf", "word", "docx", "file", "document")
     is_export_request = any(term in text for term in export_terms) and any(term in text for term in export_format_terms)
     list_doctypes = _known_doctype_catalog()
 
     if context.get("doctype") and context.get("docname"):
         if re.match(r"^(summarize|show|explain)( this| current)?( record| document)?$", text):
-            return {
+            return [{
                 "tool": "get_document",
                 "arguments": {"doctype": context["doctype"], "name": context["docname"]},
                 "heading": f"{context['doctype']} {context['docname']}",
-            }
+            }]
 
         if is_export_request and re.match(
-            r"^(create|export|download|save)( me)?( this| current)?( record| document)?( as| to| in)?( excel| xlsx| spreadsheet| csv| pdf| word| docx| file| document)?$",
+            r"^(create|export|download|save|generate)( me)?( this| current)?( record| document)?( as| to| in)?( excel| xlsx| spreadsheet| csv| pdf| word| docx| file| document)?$",
             text,
             re.IGNORECASE,
         ):
-            return {
+            return [{
                 "tool": "get_document",
                 "arguments": {"doctype": context["doctype"], "name": context["docname"]},
                 "heading": f"{context['doctype']} {context['docname']}",
-            }
+            }]
 
         if text.startswith("update this ") and " set " in text:
             updates = _parse_field_assignments(raw_text.split(" set ", 1)[1])
             if updates:
-                return {
+                return [{
                     "tool": "update_document",
                     "arguments": {
                         "doctype": context["doctype"],
@@ -734,60 +1036,76 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
                         "document": updates,
                     },
                 "heading": f"Updated {context['doctype']} {context['docname']}",
-                }
+                }]
+        context_workflow_plan = _plan_context_workflow_action(raw_text, context)
+        if context_workflow_plan:
+            return context_workflow_plan
 
     export_list_match = re.match(
-        r"^(create|export|download|save)( me)?( the)?( list of)? (?P<label>employees?|customers?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)( .+)?$",
+        r"^(create|export|download|save|generate)( me)?( the)?( list of)? (?P<label>employees?|customers?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)( .+)?$",
         text,
         re.IGNORECASE,
     )
     export_list_alt_match = re.match(
-        r"^(create|export|download|save)( me)?( an?|the)?( excel|xlsx|spreadsheet|csv|pdf|word|docx)?( file| document)?( of| for)? (?P<label>employees?|customers?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)$",
+        r"^(create|export|download|save|generate)( me)?( an?|the)?( excel|xlsx|spreadsheet|csv|pdf|word|docx)?( file| document)?( of| for)? (?P<label>employees?|customers?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)$",
         text,
         re.IGNORECASE,
     )
     export_list_target = export_list_match or export_list_alt_match
-    if is_export_request and export_list_target:
-        doctype_key = str(export_list_target.group("label") or "").strip().lower().rstrip("s")
+    if is_export_request:
+        doctype_key = None
+        if export_list_target:
+            doctype_key = str(export_list_target.group("label") or "").strip().lower().rstrip("s")
+        if not doctype_key:
+            doctype_key = _match_known_doctype_alias(text, plural_only=True)
         if doctype_key in list_doctypes:
             doctype, fields = list_doctypes[doctype_key]
-            return {
+            filters = _doctype_year_filters(doctype, raw_text)
+            return [{
                 "tool": "get_list",
                 "arguments": {
                     "doctype": doctype,
                     "fields": fields,
+                    "filters": filters,
                     "limit_page_length": 200,
                     "order_by": "modified desc",
                 },
                 "heading": f"{doctype} list",
-            }
+            }]
 
     generic_report_list_match = re.match(
-        r"^(show|list|get|find)( me)?( the)? (?P<module>accounts|selling|stock|hr|crm|buying)? ?reports?$",
+        r"^(show|list|get|find|fetch|display|retrieve|pull)( me)?( the)? (?P<module>accounts|selling|stock|hr|crm|buying)? ?reports?$",
         text,
         re.IGNORECASE,
     )
     if generic_report_list_match:
         module = _normalize_report_module(generic_report_list_match.group("module"))
-        return {
+        return [{
             "tool": "report_list",
             "arguments": {"module": module} if module else {},
             "heading": "Available reports",
-        }
+        }]
 
     report_requirements_match = re.match(
-        r"^(show|get|list|what are)( me)?( the)?( filters| requirements| filter requirements| report requirements)( for)? (?P<name>.+)$",
+        r"^(show|get|list|find|fetch|what are)( me)?( the)?( filters| requirements| filter requirements| report requirements)( for)? (?P<name>.+)$",
         raw_text,
         re.IGNORECASE,
     )
     if report_requirements_match:
         report_name = _normalize_name(report_requirements_match.group("name"))
         if report_name:
-            return {
-                "tool": "report_requirements",
-                "arguments": {"report_name": report_name},
-                "heading": report_name,
-            }
+            return [
+                {
+                    "tool": "report_list",
+                    "arguments": {},
+                    "heading": "Available reports",
+                },
+                {
+                    "tool": "report_requirements",
+                    "arguments": {"report_name": report_name},
+                    "heading": report_name,
+                },
+            ]
 
     report_match = re.match(
         r"^(create|export|download|save)( me)?( the)?( report)? (?P<name>.+?)( (as|to|in) (excel|xlsx|spreadsheet|csv|pdf|word|docx|file|document))$",
@@ -798,14 +1116,52 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
         report_name = _normalize_name(report_match.group("name"))
         report_name = re.sub(r"^(report)\s+", "", report_name, flags=re.IGNORECASE).strip()
         if report_name:
-            return {
-                "tool": "get_report",
-                "arguments": {"report_name": report_name, "filters": {}},
-                "heading": report_name,
-            }
+            return [
+                {
+                    "tool": "report_list",
+                    "arguments": {},
+                    "heading": "Available reports",
+                },
+                {
+                    "tool": "report_requirements",
+                    "arguments": {"report_name": report_name},
+                    "heading": report_name,
+                },
+                {
+                    "tool": "get_report",
+                    "arguments": {"report_name": report_name, "filters": _report_prompt_filters(raw_text)},
+                    "heading": report_name,
+                },
+            ]
+
+    report_run_match = re.match(
+        r"^(show|run|get|generate|open|display)( me)?( the)? (?P<name>.+?) report( for .+)?$",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if report_run_match:
+        report_name = _normalize_name(report_run_match.group("name"))
+        if report_name:
+            return [
+                {
+                    "tool": "report_list",
+                    "arguments": {},
+                    "heading": "Available reports",
+                },
+                {
+                    "tool": "report_requirements",
+                    "arguments": {"report_name": report_name},
+                    "heading": report_name,
+                },
+                {
+                    "tool": "get_report",
+                    "arguments": {"report_name": report_name, "filters": _report_prompt_filters(raw_text)},
+                    "heading": report_name,
+                },
+            ]
 
     generic_list_match = re.match(
-        r"^(show|list|get)( me)?( the)?( list of)? (?P<label>customers?|employees?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)$",
+        r"^(show|list|get|find|fetch|display|retrieve|pull)( me)?( the)?( list of)? (?P<label>customers?|employees?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)$",
         text,
         re.IGNORECASE,
     )
@@ -813,7 +1169,7 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
         doctype_key = str(generic_list_match.group("label") or "").strip().lower().rstrip("s")
         if doctype_key in list_doctypes:
             doctype, fields = list_doctypes[doctype_key]
-            return {
+            return [{
                 "tool": "get_list",
                 "arguments": {
                     "doctype": doctype,
@@ -822,13 +1178,29 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
                     "order_by": "modified desc",
                 },
                 "heading": f"{doctype} list",
-            }
+            }]
 
     named_doc_patterns = {
         key: value[0] for key, value in list_doctypes.items()
     }
+    create_resolution_plan = _plan_named_create(raw_text, named_doc_patterns)
+    if create_resolution_plan:
+        return create_resolution_plan
+
+    update_resolution_plan = _plan_named_update(raw_text, named_doc_patterns)
+    if update_resolution_plan:
+        return update_resolution_plan
+
+    delete_resolution_plan = _plan_named_delete(raw_text, named_doc_patterns)
+    if delete_resolution_plan:
+        return delete_resolution_plan
+
+    named_workflow_plan = _plan_named_workflow_action(raw_text, named_doc_patterns)
+    if named_workflow_plan:
+        return named_workflow_plan
+
     named_doc_match = re.match(
-        r"^(show|get)( me)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+)$",
+        r"^(show|get|find|fetch|display|retrieve|pull)( me)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+)$",
         raw_text,
         re.IGNORECASE,
     )
@@ -836,19 +1208,19 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
         doctype_key = str(named_doc_match.group("label") or "").strip().lower()
         doctype = named_doc_patterns.get(doctype_key)
         if doctype:
-            return {
+            return [{
                 "tool": "get_document",
                 "arguments": {"doctype": doctype, "name": _normalize_name(named_doc_match.group("name"))},
                 "heading": f"{doctype} {_normalize_name(named_doc_match.group('name'))}",
-            }
+            }]
 
     export_named_doc_match = re.match(
-        r"^(create|export|download|save)( me)?( the)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+?)( (as|to|in) (excel|xlsx|spreadsheet|csv|pdf|word|docx|file|document))$",
+        r"^(create|export|download|save|generate)( me)?( the)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+?)( (as|to|in) (excel|xlsx|spreadsheet|csv|pdf|word|docx|file|document))$",
         raw_text,
         re.IGNORECASE,
     )
     export_named_doc_alt_match = re.match(
-        r"^(create|export|download|save)( me)?( an?|the)?( excel|xlsx|spreadsheet|csv|pdf|word|docx)?( file| document)?( of| for)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+)$",
+        r"^(create|export|download|save|generate)( me)?( an?|the)?( excel|xlsx|spreadsheet|csv|pdf|word|docx)?( file| document)?( of| for)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+)$",
         raw_text,
         re.IGNORECASE,
     )
@@ -857,13 +1229,270 @@ def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any
         doctype_key = str(export_named_doc_target.group("label") or "").strip().lower()
         doctype = named_doc_patterns.get(doctype_key)
         if doctype:
-            return {
+            return [{
                 "tool": "get_document",
                 "arguments": {"doctype": doctype, "name": _normalize_name(export_named_doc_target.group("name"))},
                 "heading": f"{doctype} {_normalize_name(export_named_doc_target.group('name'))}",
-            }
+            }]
 
-    return None
+    if is_export_request:
+        for alias, doctype_key in _known_doctype_aliases().items():
+            if alias == doctype_key:
+                pattern = rf"\b{re.escape(alias)}\b\s+(?P<name>.+)$"
+                match = re.search(pattern, raw_text, re.IGNORECASE)
+                if match and doctype_key in named_doc_patterns:
+                    doctype = named_doc_patterns[doctype_key]
+                    return [{
+                        "tool": "get_document",
+                        "arguments": {"doctype": doctype, "name": _normalize_name(match.group('name'))},
+                        "heading": f"{doctype} {_normalize_name(match.group('name'))}",
+                    }]
+
+    return []
+
+
+def _plan_named_update(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
+    match = re.match(
+        r"^(update|change|modify|set)\s+(?:(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)\s+)?(?P<target>.+?)\s+(?P<field>[a-zA-Z][\w\s]*?)\s+(?:to|as)\s+(?P<value>.+)$",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+
+    label = str(match.group("label") or "").strip().lower()
+    field_label = _normalize_name(match.group("field"))
+    target = _normalize_name(match.group("target"))
+    value = _coerce_value(match.group("value"))
+    doctype_key = label or _infer_update_doctype(field_label)
+    doctype = named_doc_patterns.get(doctype_key or "")
+    display_field = _doctype_display_field(doctype)
+    if not doctype or not display_field or not target:
+        return []
+
+    updates = _parse_field_assignments(f"{field_label}: {match.group('value')}")
+    if not updates:
+        updates = {_normalize_field_key(field_label): value}
+
+    return [
+        {
+            "tool": "get_list",
+            "arguments": {
+                "doctype": doctype,
+                "fields": ["name", display_field],
+                "filters": [[display_field, "=", target]],
+                "limit_page_length": 1,
+                "order_by": "modified desc",
+            },
+            "heading": f"Lookup {doctype}",
+        },
+        {
+            "tool": "update_document",
+            "arguments": {
+                "doctype": doctype,
+                "name_from_previous_result": True,
+                "document": updates,
+            },
+            "heading": f"Updated {doctype} {target}",
+        },
+    ]
+
+
+def _plan_named_create(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
+    lowered = str(raw_text or "").strip().lower()
+    if lowered.startswith("how to ") or lowered.startswith("how do i ") or lowered.startswith("how can i "):
+        return []
+    match = re.match(
+        r"^(create|new|add)\s+(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)(?:\s+(?:with|set))?\s+(?P<data>.+)$",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+    doctype = named_doc_patterns.get(str(match.group("label") or "").strip().lower())
+    payload = _parse_create_fields(match.group("data"))
+    if not doctype or not payload:
+        return []
+    return [
+        {
+            "tool": "create_document",
+            "arguments": {
+                "doctype": doctype,
+                "document": payload,
+            },
+            "heading": f"Created {doctype}",
+        }
+    ]
+
+
+def _plan_named_delete(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
+    match = re.match(
+        r"^(delete|remove|erase|trash|purge)\s+(?:(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)\s+)?(?P<target>.+)$",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+
+    label = str(match.group("label") or "").strip().lower()
+    target = _normalize_name(match.group("target"))
+    doctype = named_doc_patterns.get(label or "")
+    display_field = _doctype_display_field(doctype)
+    if not doctype or not target:
+        return []
+
+    if display_field == "name":
+        return [
+            {
+                "tool": "delete_document",
+                "arguments": {"doctype": doctype, "name": target},
+                "heading": f"Deleted {doctype} {target}",
+            }
+        ]
+
+    return [
+        {
+            "tool": "get_list",
+            "arguments": {
+                "doctype": doctype,
+                "fields": ["name", display_field],
+                "filters": [[display_field, "=", target]],
+                "limit_page_length": 1,
+                "order_by": "modified desc",
+            },
+            "heading": f"Lookup {doctype}",
+        },
+        {
+            "tool": "delete_document",
+            "arguments": {"doctype": doctype, "name_from_previous_result": True},
+            "heading": f"Deleted {doctype} {target}",
+        },
+    ]
+
+
+def _plan_named_workflow_action(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
+    match = re.match(
+        r"^(?P<action>submit|approve|reject|cancel|reopen)\s+(?:(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)\s+)?(?P<target>.+)$",
+        raw_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+    action = str(match.group("action") or "").strip().lower()
+    doctype = named_doc_patterns.get(str(match.group("label") or "").strip().lower())
+    target = _normalize_name(match.group("target"))
+    if not doctype or not target:
+        return []
+    display_field = _doctype_display_field(doctype)
+    if action == "submit":
+        tool_name = "submit_document"
+    else:
+        tool_name = "run_workflow"
+    if display_field == "name":
+        arguments = {"doctype": doctype, "name": target}
+        if tool_name == "run_workflow":
+            arguments["action"] = action.title()
+        return [{"tool": tool_name, "arguments": arguments, "heading": f"{action.title()} {doctype} {target}"}]
+    arguments = {
+        "doctype": doctype,
+        "fields": ["name", display_field],
+        "filters": [[display_field, "=", target]],
+        "limit_page_length": 1,
+        "order_by": "modified desc",
+    }
+    final_arguments = {"doctype": doctype, "name_from_previous_result": True}
+    if tool_name == "run_workflow":
+        final_arguments["action"] = action.title()
+    return [
+        {"tool": "get_list", "arguments": arguments, "heading": f"Lookup {doctype}"},
+        {"tool": tool_name, "arguments": final_arguments, "heading": f"{action.title()} {doctype} {target}"},
+    ]
+
+
+def _plan_context_workflow_action(raw_text: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    match = re.match(r"^(submit|approve|reject|cancel|reopen)( this| current)?( record| document)?$", raw_text, re.IGNORECASE)
+    if not match or not context.get("doctype") or not context.get("docname"):
+        return []
+    action = str(match.group(1) or "").strip().lower()
+    if action == "submit":
+        return [{
+            "tool": "submit_document",
+            "arguments": {"doctype": context["doctype"], "name": context["docname"]},
+            "heading": f"Submitted {context['doctype']} {context['docname']}",
+        }]
+    return [{
+        "tool": "run_workflow",
+        "arguments": {"doctype": context["doctype"], "name": context["docname"], "action": action.title()},
+        "heading": f"{action.title()} {context['doctype']} {context['docname']}",
+    }]
+
+
+def _normalize_planner_prompt(prompt: str) -> str:
+    text = _normalize_name(prompt)
+    if not text:
+        return text
+    filler_patterns = [
+        r"^(can you|could you|would you|will you)\s+",
+        r"^(please|kindly)\s+",
+        r"^(can you help me\??|help me)\s*",
+        r"^(i want you to|i want to)\s+",
+    ]
+    normalized = text
+    changed = True
+    while changed:
+        changed = False
+        for pattern in filler_patterns:
+            updated = re.sub(pattern, "", normalized, flags=re.IGNORECASE).strip()
+            if updated != normalized:
+                normalized = updated
+                changed = True
+    normalized = re.sub(r"^[,:;\-]\s*", "", normalized).strip()
+    return normalized or text
+
+
+def _parse_create_fields(text: str) -> dict[str, Any]:
+    parsed = _parse_field_assignments(text)
+    if parsed:
+        return parsed
+    chunks = [item.strip() for item in re.split(r",|\band\b", str(text or ""), flags=re.IGNORECASE) if item.strip()]
+    values: dict[str, Any] = {}
+    for chunk in chunks:
+        token_match = re.match(r"^(?P<key>[a-zA-Z][\w\s]+?)\s+(?P<value>.+)$", chunk)
+        if not token_match:
+            continue
+        key = _normalize_field_key(token_match.group("key"))
+        values[key] = _coerce_value(token_match.group("value"))
+    return values
+
+
+def _report_prompt_filters(prompt: str) -> dict[str, Any]:
+    text = str(prompt or "")
+    year_match = re.search(r"\b(20\d{2})\b", text)
+    if not year_match:
+        return {}
+    year = int(year_match.group(1))
+    return {
+        "from_date": f"{year}-01-01",
+        "to_date": f"{year}-12-31",
+    }
+
+
+def _infer_update_doctype(field_label: str) -> str:
+    normalized = str(field_label or "").strip().lower()
+    if normalized in {"salary", "basic salary", "designation", "department"}:
+        return "employee"
+    return ""
+
+
+def _doctype_display_field(doctype: str | None) -> str:
+    mapping = {
+        "Employee": "employee_name",
+        "Customer": "customer_name",
+        "Item": "item_name",
+        "Supplier": "supplier_name",
+        "Lead": "lead_name",
+    }
+    return mapping.get(str(doctype or "").strip(), "name")
 
 
 def _known_doctype_catalog() -> dict[str, tuple[str, list[str]]]:
@@ -880,6 +1509,176 @@ def _known_doctype_catalog() -> dict[str, tuple[str, list[str]]]:
         "lead": ("Lead", ["name", "lead_name", "company_name", "status", "email_id"]),
         "opportunity": ("Opportunity", ["name", "party_name", "opportunity_type", "status", "opportunity_from"]),
     }
+
+
+def _known_doctype_aliases() -> dict[str, str]:
+    return {
+        "employee": "employee",
+        "employees": "employee",
+        "customer": "customer",
+        "customers": "customer",
+        "item": "item",
+        "items": "item",
+        "sales order": "sales order",
+        "sales orders": "sales order",
+        "sales invoice": "sales invoice",
+        "sales invoices": "sales invoice",
+        "purchase order": "purchase order",
+        "purchase orders": "purchase order",
+        "purchase invoice": "purchase invoice",
+        "purchase invoices": "purchase invoice",
+        "supplier": "supplier",
+        "suppliers": "supplier",
+        "quotation": "quotation",
+        "quotations": "quotation",
+        "lead": "lead",
+        "leads": "lead",
+        "opportunity": "opportunity",
+        "opportunities": "opportunity",
+    }
+
+
+def _match_known_doctype_alias(text: str, *, plural_only: bool = False) -> str | None:
+    normalized = str(text or "").strip().lower()
+    aliases = _known_doctype_aliases()
+    for alias in sorted(aliases.keys(), key=len, reverse=True):
+        if plural_only and alias == aliases[alias]:
+            continue
+        if re.search(rf"\b{re.escape(alias)}\b", normalized):
+            return aliases[alias]
+    return None
+
+
+def _doctype_year_filters(doctype: str, prompt: str) -> list[list[Any]]:
+    year_match = re.search(r"\b(20\d{2})\b", str(prompt or ""))
+    if not year_match:
+        return []
+    date_field_map = {
+        "Sales Order": "transaction_date",
+        "Sales Invoice": "posting_date",
+        "Purchase Order": "transaction_date",
+        "Purchase Invoice": "posting_date",
+        "Quotation": "transaction_date",
+    }
+    date_field = date_field_map.get(str(doctype or "").strip())
+    if not date_field:
+        return []
+    year = int(year_match.group(1))
+    return [
+        [date_field, ">=", f"{year}-01-01"],
+        [date_field, "<=", f"{year}-12-31"],
+    ]
+
+
+def _execute_plan_steps(
+    steps: list[dict[str, Any]],
+    *,
+    progress: Optional[dict[str, Any]] = None,
+) -> tuple[Any, list[str]]:
+    tool_events: list[str] = []
+    latest_result: Any = None
+    for step in steps:
+        tool_name = str(step.get("tool") or "").strip()
+        arguments = dict(step.get("arguments") or {})
+        heading = str(step.get("heading") or tool_name or "tool").strip()
+        if not tool_name:
+            continue
+        if arguments.pop("name_from_previous_result", False):
+            resolved_name = _extract_name_from_tool_result(latest_result)
+            if not resolved_name:
+                raise RuntimeError("Could not resolve the target document from the previous lookup result.")
+            arguments["name"] = resolved_name
+        _progress_update(progress, stage="working", step=f"Running tool: {tool_name}")
+        latest_result = _run_tool(tool_name, arguments)
+        tool_events.append(f"{tool_name} {arguments}")
+        if tool_name == "report_list":
+            report_name = str((steps[-1].get("arguments") or {}).get("report_name") or "").strip()
+            if report_name and not _report_exists_in_payload(latest_result, report_name):
+                raise RuntimeError(f"Report not found: {report_name}")
+        if tool_name == "report_requirements" and steps[-1].get("tool") == "get_report":
+            final_filters = _default_report_filters(latest_result)
+            if final_filters:
+                steps[-1].setdefault("arguments", {})
+                steps[-1]["arguments"]["filters"] = final_filters
+        _progress_update(progress, stage="working", step=f"Prepared {heading}")
+    return latest_result, tool_events
+
+
+def _extract_name_from_tool_result(payload: Any) -> str:
+    rows = _unwrap_tool_payload(payload)
+    if isinstance(rows, list) and rows:
+        first = rows[0]
+        if isinstance(first, dict):
+            return str(first.get("name") or "").strip()
+    if isinstance(rows, dict):
+        return str(rows.get("name") or "").strip()
+    return ""
+
+
+def _unwrap_tool_payload(payload: Any) -> Any:
+    current = payload
+    for _ in range(6):
+        if not isinstance(current, dict):
+            return current
+        if isinstance(current.get("data"), list):
+            return current.get("data")
+        if isinstance(current.get("result"), list):
+            return current.get("result")
+        if isinstance(current.get("data"), dict):
+            current = current.get("data")
+            continue
+        if isinstance(current.get("result"), dict):
+            current = current.get("result")
+            continue
+        return current
+    return current
+
+
+def _report_exists_in_payload(payload: Any, report_name: str) -> bool:
+    if not report_name:
+        return True
+    rows = []
+    if isinstance(payload, dict):
+        rows = payload.get("reports") or payload.get("data") or payload.get("result") or []
+    elif isinstance(payload, list):
+        rows = payload
+    normalized = _normalize_name(report_name).lower()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        current = _normalize_name(row.get("report_name") or row.get("name") or "").lower()
+        if current == normalized:
+            return True
+    return False
+
+
+def _default_report_filters(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    requirements = payload.get("requirements") or payload.get("filters") or payload.get("data") or []
+    filters: dict[str, Any] = {}
+    if isinstance(requirements, dict):
+        requirements = requirements.get("filters") or []
+    if not isinstance(requirements, list):
+        return filters
+    today = frappe.utils.nowdate()
+    month_start = frappe.utils.get_first_day(today)
+    for row in requirements:
+        if not isinstance(row, dict):
+            continue
+        key = str(row.get("fieldname") or row.get("field") or row.get("name") or "").strip()
+        label = str(row.get("label") or key).strip().lower()
+        if not key:
+            continue
+        if "company" in label:
+            default_company = frappe.defaults.get_user_default("Company")
+            if default_company:
+                filters[key] = default_company
+        elif any(marker in label for marker in ("from date", "start date", "date from")):
+            filters[key] = month_start
+        elif any(marker in label for marker in ("to date", "end date", "date to")):
+            filters[key] = today
+    return filters
 
 
 def _normalize_report_module(value: Any) -> str | None:
@@ -910,6 +1709,229 @@ def _provider_chat(
     if _provider_name() == "openai_compatible":
         return _openai_compatible_chat(prompt, context, history=history, model=model, progress=progress, images=images)
     return _anthropic_chat(prompt, context, history=history, model=model, progress=progress, images=images)
+
+
+def plan_prompt_with_model(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    if not _llm_chat_configured():
+        raise RuntimeError("AI provider is not configured for model planning.")
+
+    provider = _provider_name()
+    if provider == "openai":
+        return _openai_plan_prompt(prompt, context, model=model)
+    if provider == "openai_compatible":
+        return _openai_compatible_plan_prompt(prompt, context, model=model)
+    return _anthropic_plan_prompt(prompt, context, model=model)
+
+
+def _planner_system_prompt(context: dict[str, Any]) -> str:
+    tool_definitions = get_tool_definitions()
+    resource_specs = list_resource_specs()
+    tool_names = ", ".join(sorted(tool_definitions.keys())[:18])
+    resource_names = ", ".join(str(row.get("name") or "").strip() for row in resource_specs[:12] if row.get("name"))
+    return (
+        "You are an intent planner for an ERPNext assistant. "
+        "You only classify prompts and decide whether deterministic ERP tools should run. "
+        "Never claim to execute anything. Never answer the user's task directly. "
+        "Return strict JSON only, with no markdown fences and no extra prose. "
+        "Allowed intents: answer, guide, read, create, update, workflow, export, erp_chat, general_chat, unknown. "
+        "Set should_route=true only when the deterministic ERP router should try first. "
+        "If the user is asking how/process/steps, choose guide, not create/update. "
+        "If the user is asking normal non-ERP conversation, choose general_chat. "
+        "If the user is asking about ERP data, documents, exports, or mutations, choose the closest ERP intent. "
+        "Confidence must be a number between 0 and 1. "
+        "normalized_prompt should remove filler words but preserve the user's meaning. "
+        "reason should be a short explanation. "
+        f"Available tool names include: {tool_names}. "
+        f"Available resource names include: {resource_names}. "
+        f"{_context_summary(context)}"
+    )
+
+
+def _planner_user_prompt(prompt: str, context: dict[str, Any]) -> str:
+    tool_definitions = get_tool_definitions()
+    resource_specs = list_resource_specs()
+    return json.dumps(
+        {
+            "task": "classify_prompt",
+            "prompt": prompt,
+            "context": {
+                "doctype": context.get("doctype"),
+                "docname": context.get("docname"),
+                "route": context.get("route"),
+            },
+            "available_tools": [
+                {
+                    "name": name,
+                    "description": spec.get("description"),
+                    "category": (spec.get("annotations") or {}).get("category"),
+                }
+                for name, spec in tool_definitions.items()
+            ],
+            "available_resources": [
+                {
+                    "name": row.get("name"),
+                    "title": row.get("title"),
+                    "description": row.get("description"),
+                }
+                for row in resource_specs
+            ],
+            "response_schema": {
+                "intent": "one of: answer, guide, read, create, update, workflow, export, erp_chat, general_chat, unknown",
+                "confidence": "float between 0 and 1",
+                "should_route": "boolean",
+                "normalized_prompt": "string",
+                "reason": "short string",
+            },
+        },
+        default=str,
+    )
+
+
+def _parse_json_object_text(raw_text: Any) -> dict[str, Any]:
+    if isinstance(raw_text, dict):
+        return raw_text
+    text = str(raw_text or "").strip()
+    if not text:
+        raise RuntimeError("Planner returned empty output.")
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        parsed = json.loads(match.group(0))
+        if isinstance(parsed, dict):
+            return parsed
+    raise RuntimeError(f"Planner returned invalid JSON: {text[:240]}")
+
+
+def _openai_plan_prompt(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    api_key = _cfg("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OpenAI provider is selected but OPENAI_API_KEY is not configured.")
+
+    selected_model = _resolve_model(model)
+    timeout_seconds = _llm_request_timeout_seconds()
+    temperature = _llm_temperature()
+    top_p = _llm_top_p()
+    base_url = str(_cfg("OPENAI_BASE_URL", "https://api.openai.com")).rstrip("/")
+    responses_path = str(_cfg("OPENAI_RESPONSES_PATH", DEFAULT_OPENAI_RESPONSES_PATH) or DEFAULT_OPENAI_RESPONSES_PATH)
+    if not responses_path.startswith("/"):
+        responses_path = f"/{responses_path}"
+    endpoint = f"{base_url}{responses_path}"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
+    }
+    request_payload: dict[str, Any] = {
+        "model": selected_model,
+        "instructions": _planner_system_prompt(context),
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": _planner_user_prompt(prompt, context)}],
+            }
+        ],
+    }
+    if _openai_supports_sampling_controls(selected_model):
+        request_payload["temperature"] = temperature
+        request_payload["top_p"] = top_p
+    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
+    if response.status_code >= 400:
+        raise RuntimeError(f"AI endpoint rejected planner request ({endpoint}): {_extract_error_detail(response)}")
+    response.raise_for_status()
+    body = _parse_backend_json(response, endpoint)
+    return _parse_json_object_text(_openai_output_text(body))
+
+
+def _openai_compatible_plan_prompt(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    api_key = _cfg("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OpenAI-compatible provider is selected but OPENAI_API_KEY is not configured.")
+
+    selected_model = _resolve_model(model)
+    timeout_seconds = _llm_request_timeout_seconds()
+    temperature = _llm_temperature()
+    top_p = _llm_top_p()
+    base_url = str(_cfg("OPENAI_BASE_URL", "https://integrate.api.nvidia.com")).rstrip("/")
+    path = str(_cfg("OPENAI_RESPONSES_PATH", "/v1/chat/completions") or "/v1/chat/completions")
+    if not path.startswith("/"):
+        path = f"/{path}"
+    endpoint = f"{base_url}{path}"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {api_key}",
+    }
+    request_payload: dict[str, Any] = {
+        "model": selected_model,
+        "messages": [
+            {"role": "system", "content": _planner_system_prompt(context)},
+            {"role": "user", "content": _planner_user_prompt(prompt, context)},
+        ],
+        "stream": False,
+    }
+    if _openai_compatible_supports_sampling_controls(selected_model):
+        request_payload["temperature"] = temperature
+        request_payload["top_p"] = top_p
+    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
+    if response.status_code >= 400:
+        raise RuntimeError(f"AI endpoint rejected planner request ({endpoint}): {_extract_error_detail(response)}")
+    response.raise_for_status()
+    body = _parse_backend_json(response, endpoint)
+    choice = ((body.get("choices") or [{}])[0]) if isinstance(body.get("choices"), list) else {}
+    message = choice.get("message") or {}
+    return _parse_json_object_text(message.get("content"))
+
+
+def _anthropic_plan_prompt(prompt: str, context: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    api_key = _cfg("ANTHROPIC_API_KEY")
+    auth_token = _cfg("ANTHROPIC_AUTH_TOKEN")
+    if not api_key and not auth_token:
+        raise RuntimeError("Anthropic provider is selected but authentication is not configured.")
+
+    selected_model = _resolve_model(model)
+    timeout_seconds = _llm_request_timeout_seconds()
+    max_tokens = min(max(300, _llm_request_max_tokens()), 800)
+    temperature = _llm_temperature()
+    top_p = _llm_top_p()
+    base_url = str(_cfg("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).rstrip("/")
+    messages_path = str(_cfg("ANTHROPIC_MESSAGES_PATH", "/v1/messages") or "/v1/messages")
+    if not messages_path.startswith("/"):
+        messages_path = f"/{messages_path}"
+    endpoint = f"{base_url}{messages_path}"
+    headers = {"content-type": "application/json"}
+    if api_key:
+        headers["x-api-key"] = api_key
+    else:
+        headers["authorization"] = f"Bearer {auth_token}"
+    anthropic_version = _cfg("ANTHROPIC_VERSION", "2023-06-01")
+    if anthropic_version:
+        headers["anthropic-version"] = anthropic_version
+    beta_param = _normalize_beta_param(_cfg("ANTHROPIC_BETA"))
+    if beta_param:
+        headers["anthropic-beta"] = beta_param
+    request_payload = {
+        "model": selected_model,
+        "max_tokens": max_tokens,
+        "stream": False,
+        "temperature": temperature,
+        "top_p": top_p,
+        "system": _planner_system_prompt(context),
+        "messages": [{"role": "user", "content": _planner_user_prompt(prompt, context)}],
+    }
+    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
+    if response.status_code >= 400:
+        raise RuntimeError(f"AI endpoint rejected planner request ({endpoint}): {_extract_error_detail(response)}")
+    response.raise_for_status()
+    body = _parse_backend_json(response, endpoint)
+    text_chunks = [
+        block.get("text", "")
+        for block in (body.get("content") or [])
+        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+    ]
+    return _parse_json_object_text("\n".join(text_chunks).strip())
 
 
 def _openai_chat(
@@ -943,24 +1965,28 @@ def _openai_chat(
     }
 
     system = (
-        "You are a helpful Frappe and ERPNext assistant. "
+        "You are a helpful general-purpose assistant with access to Frappe and ERPNext tools. "
         "Use available tools whenever live data is needed or when creating/updating records. "
         "For complex tasks, follow this process: plan briefly, execute tools, verify results, then answer. "
         "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
-        f"{_tool_access_summary(prompt)} "
+        f"{_tool_access_summary(prompt, context)} "
         "If a user asks to export/download files (Excel/PDF/DOCX), call tools to produce the data payload; file artifacts are generated by the host app. "
         "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
         "Never invent connectivity/authentication/server issues. If a tool call fails, report the exact returned error text only. "
-        f"Current context: doctype={context.get('doctype')}, docname={context.get('docname')}, route={context.get('route')}."
+        f"{_context_summary(context)}"
     )
 
-    tool_specs = _openai_tool_specs(prompt)
+    tool_specs = _openai_tool_specs(prompt, context)
     previous_response_id: str | None = None
     pending_input: Any = _build_openai_input(history, prompt, images)
     tool_events: list[str] = []
     rendered_payload = None
     had_tool_calls = False
     verification_requested = False
+    tools_enabled = bool(tool_specs)
+    plain_text_retry_requested = False
+    seen_tool_signatures: set[str] = set()
+    last_tool_name: str | None = None
 
     for _round in range(max_tool_rounds):
         _progress_update(progress, stage="thinking", step="Thinking")
@@ -968,15 +1994,16 @@ def _openai_chat(
             "model": model,
             "instructions": system,
             "input": pending_input,
-            "tools": tool_specs,
         }
+        if tools_enabled:
+            request_payload["tools"] = tool_specs
         if _openai_supports_sampling_controls(model):
             request_payload["temperature"] = temperature
             request_payload["top_p"] = top_p
         if previous_response_id:
             request_payload["previous_response_id"] = previous_response_id
         tool_choice = _tool_choice_payload(force_tool_use, prompt, context, mode="openai")
-        if tool_choice is not None:
+        if tools_enabled and tool_choice is not None:
             request_payload["tool_choice"] = tool_choice
 
         try:
@@ -1008,6 +2035,22 @@ def _openai_chat(
                 "OpenAI MCP server requested approval. Set require_approval to 'never' in MCP server config or complete approval externally."
             )
 
+        if function_calls and not tools_enabled:
+            fallback_text = _openai_output_text(body)
+            if fallback_text:
+                _progress_update(progress, stage="working", step="Preparing response")
+                return {
+                    "text": fallback_text,
+                    "tool_events": tool_events,
+                    "payload": rendered_payload,
+                }
+            if not plain_text_retry_requested:
+                plain_text_retry_requested = True
+                _progress_update(progress, stage="working", step="Provider returned stray tool calls; retrying text-only")
+                pending_input = "Answer the user's last message directly in plain text. Do not call tools."
+                continue
+            raise RuntimeError("Provider returned tool calls even though no tools were offered.")
+
         if not function_calls:
             if had_tool_calls and verify_pass_enabled and not verification_requested and previous_response_id:
                 verification_requested = True
@@ -1021,14 +2064,35 @@ def _openai_chat(
                 "payload": rendered_payload,
             }
 
+        current_signatures = [
+            _tool_call_signature(str(tool_call.get("name") or "").strip(), _parse_openai_tool_arguments(tool_call.get("arguments")))
+            for tool_call in function_calls
+        ]
+        if current_signatures and all(signature in seen_tool_signatures for signature in current_signatures):
+            if rendered_payload is not None:
+                _progress_update(progress, stage="working", step="Preparing response")
+                return {
+                    "text": _render_provider_tool_output(last_tool_name, rendered_payload),
+                    "tool_events": tool_events,
+                    "payload": rendered_payload,
+                }
+            if not plain_text_retry_requested:
+                plain_text_retry_requested = True
+                _progress_update(progress, stage="working", step="Provider repeated the same tool calls; forcing final answer")
+                pending_input = "You already have the tool results. Answer the user directly in plain text without any more tool calls."
+                tools_enabled = False
+                continue
+
         had_tool_calls = True
         pending_results = []
         for tool_call in function_calls:
             tool_name = str(tool_call.get("name") or "").strip()
             tool_input = _parse_openai_tool_arguments(tool_call.get("arguments"))
+            seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input)
+                last_tool_name = tool_name
                 rendered_payload = tool_result
                 tool_events.append(f"{tool_name} {tool_input}")
                 pending_results.append(
@@ -1094,24 +2158,27 @@ def _openai_compatible_chat(
     }
 
     system = (
-        "You are a helpful Frappe and ERPNext assistant. "
+        "You are a helpful general-purpose assistant with access to Frappe and ERPNext tools. "
         "Use available tools whenever live data is needed or when creating/updating records. "
         "For complex tasks, follow this process: plan briefly, execute tools, verify results, then answer. "
         "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
-        f"{_tool_access_summary(prompt)} "
+        f"{_tool_access_summary(prompt, context)} "
         "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
         "Never invent connectivity/authentication/server issues. If a tool call fails, report the exact returned error text only. "
-        f"Current context: doctype={context.get('doctype')}, docname={context.get('docname')}, route={context.get('route')}."
+        f"{_context_summary(context)}"
     )
 
     messages = _build_openai_compatible_messages(history, prompt, images)
-    tool_specs = _openai_compatible_tool_specs(prompt)
+    tool_specs = _openai_compatible_tool_specs(prompt, context)
     tool_events: list[str] = []
     rendered_payload = None
     had_tool_calls = False
     verification_requested = False
     disable_tool_choice = False
-    tools_enabled = True
+    tools_enabled = bool(tool_specs)
+    plain_text_retry_requested = False
+    seen_tool_signatures: set[str] = set()
+    last_tool_name: str | None = None
 
     for _round in range(max_tool_rounds):
         _progress_update(progress, stage="thinking", step="Thinking")
@@ -1176,6 +2243,21 @@ def _openai_compatible_chat(
         tool_calls = message.get("tool_calls") or []
         text_body = str(message.get("content") or "").strip()
 
+        if tool_calls and not tools_enabled:
+            if text_body:
+                _progress_update(progress, stage="working", step="Preparing response")
+                return {
+                    "text": text_body,
+                    "tool_events": tool_events,
+                    "payload": rendered_payload,
+                }
+            if not plain_text_retry_requested:
+                plain_text_retry_requested = True
+                _progress_update(progress, stage="working", step="Provider returned stray tool calls; retrying text-only")
+                messages.append({"role": "user", "content": "Answer directly in plain text. Do not call tools."})
+                continue
+            raise RuntimeError("Provider returned tool calls even though no tools were offered.")
+
         if not tool_calls:
             if had_tool_calls and verify_pass_enabled and not verification_requested:
                 verification_requested = True
@@ -1189,15 +2271,41 @@ def _openai_compatible_chat(
                 "payload": rendered_payload,
             }
 
+        current_signatures = []
+        for tool_call in tool_calls:
+            function_payload = tool_call.get("function") or {}
+            current_signatures.append(
+                _tool_call_signature(
+                    str(function_payload.get("name") or "").strip(),
+                    _parse_openai_tool_arguments(function_payload.get("arguments")),
+                )
+            )
+        if current_signatures and all(signature in seen_tool_signatures for signature in current_signatures):
+            if rendered_payload is not None:
+                _progress_update(progress, stage="working", step="Preparing response")
+                return {
+                    "text": _render_provider_tool_output(last_tool_name, rendered_payload),
+                    "tool_events": tool_events,
+                    "payload": rendered_payload,
+                }
+            if not plain_text_retry_requested:
+                plain_text_retry_requested = True
+                _progress_update(progress, stage="working", step="Provider repeated the same tool calls; forcing final answer")
+                tools_enabled = False
+                messages.append({"role": "user", "content": "You already have the tool results. Answer directly in plain text without any more tool calls."})
+                continue
+
         had_tool_calls = True
         messages.append({"role": "assistant", "content": text_body or "", "tool_calls": tool_calls})
         for tool_call in tool_calls:
             function_payload = tool_call.get("function") or {}
             tool_name = str(function_payload.get("name") or "").strip()
             tool_input = _parse_openai_tool_arguments(function_payload.get("arguments"))
+            seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input)
+                last_tool_name = tool_name
                 rendered_payload = tool_result
                 tool_events.append(f"{tool_name} {tool_input}")
                 messages.append(
@@ -1270,7 +2378,7 @@ def _anthropic_chat(
     if beta_param and tool_choice_mode == "anthropic":
         headers["anthropic-beta"] = beta_param
     tool_definitions = get_tool_definitions()
-    allowed_names = _allowed_tool_names(prompt, set(tool_definitions))
+    allowed_names = _selected_tool_names_for_prompt(prompt, context, set(tool_definitions))
     tool_specs = [
         {
             "name": name,
@@ -1289,15 +2397,15 @@ def _anthropic_chat(
         )
 
     system = (
-        "You are a helpful Frappe and ERPNext assistant. "
+        "You are a helpful general-purpose assistant with access to Frappe and ERPNext tools. "
         "Use available tools whenever live data is needed or when creating/updating records. "
         "For complex tasks, follow this process: plan briefly, execute tools, verify results, then answer. "
         "Prefer tool calls over guessing. Keep responses concise, factual, and action-oriented. "
-        f"{_tool_access_summary(prompt)} "
+        f"{_tool_access_summary(prompt, context)} "
         "If a user asks to export/download files (Excel/PDF/DOCX), call tools to produce the data payload; file artifacts are generated by the host app. "
         "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
         "Never invent connectivity/authentication/server issues. If a tool call fails, report the exact returned error text only. "
-        f"Current context: doctype={context.get('doctype')}, docname={context.get('docname')}, route={context.get('route')}."
+        f"{_context_summary(context)}"
     )
     messages: list[dict[str, Any]] = _build_messages_with_images(history, prompt, images)
     tool_events: list[str] = []
@@ -1372,7 +2480,11 @@ def _anthropic_chat(
                 _progress_update(progress, stage="working", step="Provider rejected tool calls; retrying text-only")
                 continue
         response.raise_for_status()
-        body = _parse_backend_json(response, endpoint)
+        content_type = (response.headers.get("content-type") or "").lower()
+        if stream_enabled and "text/event-stream" in content_type:
+            body = _parse_sse_stream(response, endpoint, progress=progress)
+        else:
+            body = _parse_backend_json(response, endpoint)
         content_blocks = body.get("content", [])
         messages.append({"role": "assistant", "content": content_blocks})
 
@@ -1455,6 +2567,7 @@ def _anthropic_chat(
                 )
 
         messages.append({"role": "user", "content": tool_results})
+        _progress_update(progress, stage="working", partial_text="")
 
     raise RuntimeError(
         f"AI assistant exceeded configured tool-call rounds ({max_tool_rounds}). "
@@ -1496,9 +2609,9 @@ def _is_tool_choice_function_none_error(detail: str) -> bool:
     )
 
 
-def _openai_tool_specs(prompt: str) -> list[dict[str, Any]]:
+def _openai_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     tool_definitions = get_tool_definitions()
-    allowed_names = _allowed_tool_names(prompt, set(tool_definitions))
+    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, set(tool_definitions))
     specs = [
         {
             "type": "function",
@@ -1514,9 +2627,9 @@ def _openai_tool_specs(prompt: str) -> list[dict[str, Any]]:
     return specs
 
 
-def _openai_compatible_tool_specs(prompt: str) -> list[dict[str, Any]]:
+def _openai_compatible_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     tool_definitions = get_tool_definitions()
-    allowed_names = _allowed_tool_names(prompt, set(tool_definitions))
+    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, set(tool_definitions))
     return [
         {
             "type": "function",
@@ -1542,7 +2655,7 @@ def _build_openai_input(
         role = str(row.get("role") or "").strip().lower()
         if role not in {"user", "assistant"}:
             continue
-        content = _build_openai_input_content(str(row.get("content") or "").strip(), None)
+        content = _build_openai_input_content(str(row.get("content") or "").strip(), row.get("images"))
         if not content:
             continue
         normalized.append({"role": role, "content": content})
@@ -1570,7 +2683,7 @@ def _build_openai_compatible_messages(
         role = str(row.get("role") or "").strip().lower()
         if role not in {"user", "assistant"}:
             continue
-        content = _build_openai_compatible_content(str(row.get("content") or "").strip(), None)
+        content = _build_openai_compatible_content(str(row.get("content") or "").strip(), row.get("images"))
         if content in ("", []):
             continue
         normalized.append({"role": role, "content": content})
@@ -1661,7 +2774,13 @@ def _openai_compatible_supports_sampling_controls(model: str | None) -> bool:
 def _build_messages_with_images(
     history: Optional[list[dict[str, Any]]], prompt: str, images: Optional[list[dict[str, str]]] = None
 ) -> list[dict[str, Any]]:
-    rows = [dict(item) for item in (history or [])]
+    rows = []
+    for item in history or []:
+        row = dict(item)
+        role = str(row.get("role") or "").strip().lower()
+        if role == "user":
+            row["content"] = _build_user_multimodal_content(str(row.get("content") or "").strip(), _build_image_blocks(row.get("images")))
+        rows.append(row)
     image_blocks = _build_image_blocks(images)
 
     if not image_blocks:
@@ -1706,6 +2825,56 @@ def _build_image_blocks(images: Optional[list[dict[str, str]]]) -> list[dict[str
             }
         )
     return blocks
+
+
+def _parse_message_attachments(raw: Any) -> list[dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        attachments = payload.get("attachments") or []
+        return [item for item in attachments if isinstance(item, dict)]
+    return []
+
+
+def _history_image_attachments(attachments: list[dict[str, Any]]) -> list[dict[str, str]]:
+    images: list[dict[str, str]] = []
+    for attachment in attachments:
+        file_url = str(attachment.get("file_url") or "").strip()
+        media_type, data = _extract_base64_image(file_url)
+        if not media_type or not data:
+            continue
+        images.append({"media_type": media_type, "data": data})
+    return images
+
+
+def _describe_message_attachments(attachments: list[dict[str, Any]]) -> list[str]:
+    notes: list[str] = []
+    for attachment in attachments[:4]:
+        filename = str(attachment.get("filename") or "attachment").strip()
+        label = str(attachment.get("label") or attachment.get("file_type") or "file").strip()
+        if str(attachment.get("file_url") or "").startswith("data:image/"):
+            notes.append(f"Attached image: {filename}")
+        else:
+            notes.append(f"Attached file: {filename} ({label})")
+    return notes
+
+
+def _merge_history_content_and_attachment_notes(content: str, notes: list[str]) -> str:
+    body = str(content or "").strip()
+    if not notes:
+        return body
+    note_text = "\n".join(notes)
+    if not body:
+        return note_text
+    if note_text in body:
+        return body
+    return f"{body}\n\n{note_text}"
 
 
 def _parse_prompt_images(images: str | list[dict[str, Any]] | None) -> list[dict[str, str]]:
@@ -1822,6 +2991,17 @@ def _resolve_model(model: str | None) -> str:
 
 def _resolve_model_for_request(model: str | None, *, has_images: bool) -> str:
     """Resolve model, optionally routing image prompts to a vision-capable alias."""
+    if has_images and _provider_name() in {"openai", "openai_compatible"}:
+        vision_model = str(
+            _cfg(
+                "ERP_AI_OPENAI_VISION_MODEL",
+                _cfg("OPENAI_VISION_MODEL", ""),
+            )
+        ).strip()
+        if vision_model:
+            available = _available_llm_models()
+            if not available or vision_model in available:
+                return vision_model
     if _provider_name() not in {"openai", "openai_compatible"} and has_images:
         vision_model = str(
             _cfg(
@@ -1841,6 +3021,7 @@ def _available_llm_models() -> list[str]:
     is_openai_family = provider in {"openai", "openai_compatible"}
     models_key = "OPENAI_MODELS" if is_openai_family else "ANTHROPIC_MODELS"
     default_key = "OPENAI_MODEL" if is_openai_family else "ANTHROPIC_MODEL"
+    vision_key = "OPENAI_VISION_MODEL" if is_openai_family else "ANTHROPIC_VISION_MODEL"
     default_value = DEFAULT_OPENAI_MODEL if is_openai_family else "claude-sonnet-4-6"
     raw = _cfg(models_key)
     models: list[str] = []
@@ -1864,6 +3045,9 @@ def _available_llm_models() -> list[str]:
     default_model = str(_cfg(default_key, default_value)).strip()
     if default_model:
         models.append(default_model)
+    vision_model = str(_cfg(vision_key, "")).strip()
+    if vision_model:
+        models.append(vision_model)
 
     unique: list[str] = []
     seen = set()
@@ -1909,11 +3093,45 @@ def _parse_backend_json(response: requests.Response, endpoint: str) -> dict[str,
 
 
 def _parse_sse_response(text: str, endpoint: str) -> dict[str, Any]:
+    return _parse_sse_events((text or "").splitlines(), endpoint)
+
+
+def _parse_sse_stream(
+    response: requests.Response,
+    endpoint: str,
+    progress: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    decoded_lines = []
+    partial_text = ""
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if raw_line is None:
+            continue
+        line = str(raw_line)
+        decoded_lines.append(line)
+        stripped = line.strip()
+        if not stripped.startswith("data:"):
+            continue
+        raw_data = stripped[len("data:") :].strip()
+        if not raw_data or raw_data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(raw_data)
+        except Exception:
+            continue
+        if payload.get("type") == "content_block_delta":
+            delta = payload.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                partial_text += str(delta.get("text") or "")
+                _progress_update(progress, stage="thinking", partial_text=partial_text)
+    return _parse_sse_events(decoded_lines, endpoint)
+
+
+def _parse_sse_events(lines: list[str], endpoint: str) -> dict[str, Any]:
     blocks_by_index: dict[int, dict[str, Any]] = {}
     message_payload: dict[str, Any] = {}
     stop_reason = None
 
-    for raw_line in (text or "").splitlines():
+    for raw_line in lines:
         line = raw_line.strip()
         if not line.startswith("data:"):
             continue
@@ -1965,7 +3183,7 @@ def _parse_sse_response(text: str, endpoint: str) -> dict[str, Any]:
         content = message_payload.get("content") or []
 
     if not content:
-        preview = (text or "").strip().replace("\n", " ")[:300]
+        preview = "\n".join(lines).strip().replace("\n", " ")[:300]
         raise RuntimeError(
             f"AI endpoint returned SSE but no parsable content from {endpoint}. Body preview: {preview or '<empty>'}"
         )
@@ -2000,6 +3218,30 @@ def _run_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
         arguments["data"] = arguments.pop("document")
 
     return dispatch_tool(mapped_name, arguments)
+
+
+def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
+    return f"{str(tool_name or '').strip()}::{json.dumps(arguments or {}, sort_keys=True, default=str)}"
+
+
+def _render_provider_tool_output(tool_name: str | None, payload: Any) -> str:
+    reverse_map = {
+        "list_documents": "get_list",
+        "generate_report": "get_report",
+    }
+    normalized = reverse_map.get(str(tool_name or "").strip(), str(tool_name or "").strip())
+    if normalized in {
+        "get_list",
+        "get_document",
+        "get_report",
+        "report_list",
+        "report_requirements",
+        "create_document",
+        "update_document",
+        "delete_document",
+    }:
+        return _render_tool_output(normalized, payload)
+    return _format_generic_result(payload, "Result")
 
 
 def _filters_to_object(filters: Any) -> dict[str, Any]:
@@ -2159,6 +3401,19 @@ def _summarize_title(text: str) -> str:
 def _parse_field_assignments(text: str) -> dict[str, Any]:
     assignments: dict[str, Any] = {}
     normalized = text.strip().replace(" and ", ", ")
+    for part in [item.strip() for item in normalized.split(",") if item.strip()]:
+        if "=" in part:
+            raw_key, raw_value = part.split("=", 1)
+        elif ":" in part:
+            raw_key, raw_value = part.split(":", 1)
+        else:
+            continue
+        key = _normalize_field_key(raw_key)
+        assignments[key] = _coerce_value(raw_value.strip())
+    return assignments
+
+
+def _normalize_field_key(raw_key: str) -> str:
     aliases = {
         "territory": "territory",
         "designation": "designation",
@@ -2167,21 +3422,24 @@ def _parse_field_assignments(text: str) -> dict[str, Any]:
         "phone": "mobile_no",
         "department": "department",
         "description": "description",
+        "salary": "salary",
+        "basic salary": "basic_salary",
+        "company email": "company_email",
+        "status": "status",
     }
-    for part in [item.strip() for item in normalized.split(",") if item.strip()]:
-        if "=" in part:
-            raw_key, raw_value = part.split("=", 1)
-        elif ":" in part:
-            raw_key, raw_value = part.split(":", 1)
-        else:
-            continue
-        key = aliases.get(raw_key.strip().lower(), raw_key.strip().replace(" ", "_"))
-        assignments[key] = _coerce_value(raw_value.strip())
-    return assignments
+    normalized = str(raw_key or "").strip().lower()
+    return aliases.get(normalized, normalized.replace(" ", "_"))
 
 
 def _coerce_value(value: str) -> Any:
     cleaned = value.strip().strip("\"'")
+    compact_match = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*([kKmM])", cleaned)
+    if compact_match:
+        number = float(compact_match.group(1))
+        suffix = compact_match.group(2).lower()
+        multiplier = 1000 if suffix == "k" else 1_000_000
+        expanded = number * multiplier
+        return int(expanded) if float(expanded).is_integer() else expanded
     if re.fullmatch(r"-?\d+", cleaned):
         return int(cleaned)
     if re.fullmatch(r"-?\d+\.\d+", cleaned):

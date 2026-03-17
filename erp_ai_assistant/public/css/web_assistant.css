@@ -374,6 +374,62 @@
   color: var(--ai-muted);
 }
 
+.erp-web-assistant__tool-blocks {
+  padding: 0 12px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.erp-web-assistant__tool-card {
+  border: 1px solid rgba(31, 41, 55, 0.08);
+  background: rgba(31, 41, 55, 0.04);
+  border-radius: 10px;
+  padding: 10px;
+}
+
+.erp-web-assistant__tool-title {
+  font-size: 12px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+.erp-web-assistant__tool-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.erp-web-assistant__tool-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(217, 119, 87, 0.12);
+  color: var(--ai-text);
+  font-size: 12px;
+}
+
+.erp-web-assistant__tool-options {
+  display: grid;
+  gap: 6px;
+}
+
+.erp-web-assistant__tool-option {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.58);
+}
+
+.erp-web-assistant__tool-option small {
+  color: var(--ai-muted);
+}
+
+.erp-web-assistant__tool-link {
+  font-size: 13px;
+}
+
 .erp-web-assistant__attachment {
   display: inline-flex;
   align-items: center;

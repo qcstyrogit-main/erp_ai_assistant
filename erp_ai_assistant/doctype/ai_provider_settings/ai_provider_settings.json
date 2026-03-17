@@ -48,6 +48,13 @@
       "description": "List allowed models as comma-separated values or a JSON array."
     },
     {
+      "fieldname": "openai_vision_model",
+      "fieldtype": "Data",
+      "label": "OpenAI Vision Model",
+      "depends_on": "eval:[\"OpenAI\",\"OpenAI Compatible\"].includes(doc.provider)",
+      "description": "Optional model used automatically when image inputs are attached."
+    },
+    {
       "fieldname": "anthropic_default_model",
       "fieldtype": "Data",
       "label": "Anthropic Default Model",

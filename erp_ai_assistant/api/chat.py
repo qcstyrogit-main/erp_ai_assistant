@@ -1,5 +1,6 @@
 import frappe
 from frappe import _
+import json
 
 
 CHAT_DOCTYPES = ("AI Conversation", "AI Message")
@@ -72,6 +73,31 @@ def get_conversation(name: str):
         "conversation": doc.as_dict(),
         "messages": messages,
     }
+
+
+def get_pending_action(conversation: str) -> dict | None:
+    doc = _get_conversation(conversation)
+    if not frappe.db.has_column("AI Conversation", "pending_action_json"):
+        return None
+    raw = str(doc.pending_action_json or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def set_pending_action(conversation: str, payload: dict | None) -> None:
+    doc = _get_conversation(conversation)
+    if not frappe.db.has_column("AI Conversation", "pending_action_json"):
+        return
+    doc.db_set("pending_action_json", json.dumps(payload or {}, default=str) if payload else "", update_modified=False)
+
+
+def clear_pending_action(conversation: str) -> None:
+    set_pending_action(conversation, None)
 
 
 @frappe.whitelist()

@@ -25,6 +25,13 @@
       "fieldtype": "Check",
       "label": "Pinned",
       "default": "0"
+    },
+    {
+      "fieldname": "pending_action_json",
+      "fieldtype": "Long Text",
+      "label": "Pending Action JSON",
+      "hidden": 1,
+      "read_only": 1
     }
   ],
   "permissions": [

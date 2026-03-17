@@ -156,70 +156,171 @@
     return restoreTokens(rendered, tokens);
   }
 
-  function parseAttachments(raw) {
-    if (!raw) return [];
+  function parseAttachmentPackage(raw) {
+    if (!raw) return { attachments: [], exports: {} };
     try {
       const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      if (Array.isArray(parsed)) return parsed.filter((item) => item && item.file_url);
-      if (parsed && Array.isArray(parsed.attachments)) {
-        return parsed.attachments.filter((item) => item && item.file_url);
+      if (Array.isArray(parsed)) {
+        return { attachments: parsed.filter((item) => item && item.file_url), exports: {} };
       }
-      return [];
+      if (parsed && Array.isArray(parsed.attachments)) {
+        return {
+          attachments: parsed.attachments.filter((item) => item && item.file_url),
+          exports: parsed.exports && typeof parsed.exports === "object" ? parsed.exports : {},
+        };
+      }
+      return { attachments: [], exports: {} };
     } catch (error) {
-      return [];
+      return { attachments: [], exports: {} };
     }
   }
 
   function renderAttachments(raw) {
-    const attachments = parseAttachments(raw);
+    const pkg = parseAttachmentPackage(raw);
+    const attachments = pkg.attachments;
+    const exports = pkg.exports || {};
     if (!attachments.length) return "";
     const cards = attachments.map((item) => {
       const name = safeHtml(item.filename || "download");
       const label = safeHtml(item.label || item.file_type || "File");
       const url = safeHtml(item.file_url);
+      const preview = exports[item.export_id] && Array.isArray(exports[item.export_id].rows)
+        ? renderAttachmentPreview(exports[item.export_id].rows)
+        : "";
+      const actions = `
+        <span class="erp-web-assistant__attachment-actions">
+          <a class="erp-web-assistant__link" href="${url}" download="${name}">Download</a>
+        </span>
+      `;
       if (isImageUrl(item.file_url)) {
         return `
-          <a class="erp-web-assistant__attachment is-image" href="${url}" target="_blank" rel="noopener noreferrer">
+          <div class="erp-web-assistant__attachment is-image">
             <img class="erp-web-assistant__attachment-image" src="${url}" alt="${name}" loading="lazy" />
             <span class="erp-web-assistant__attachment-meta">
               <strong>${name}</strong>
               <small>${label}</small>
             </span>
-          </a>
+            ${actions}
+          </div>
         `;
       }
       return `
-        <a class="erp-web-assistant__attachment" href="${url}" target="_blank" rel="noopener noreferrer">
+        <div class="erp-web-assistant__attachment">
           <span class="erp-web-assistant__attachment-meta">
             <strong>${name}</strong>
             <small>${label}</small>
           </span>
-        </a>
+          ${actions}
+          ${preview}
+        </div>
       `;
     }).join("");
 
     return `<div class="erp-web-assistant__attachments">${cards}</div>`;
   }
 
+  function renderAttachmentPreview(rows) {
+    const previewRows = Array.isArray(rows) ? rows.filter((row) => row && typeof row === "object").slice(0, 3) : [];
+    if (!previewRows.length) return "";
+    const headers = Object.keys(previewRows[0]).slice(0, 4);
+    if (!headers.length) return "";
+    return `
+      <div class="erp-web-assistant__attachment-preview">
+        <div class="erp-web-assistant__table-wrap">
+          <table class="erp-web-assistant__table">
+            <thead><tr>${headers.map((header) => `<th>${renderInline(header)}</th>`).join("")}</tr></thead>
+            <tbody>
+              ${previewRows.map((row) => `<tr>${headers.map((header) => `<td>${renderInline(row[header] == null ? "" : String(row[header]))}</td>`).join("")}</tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    `;
+  }
+
   function parseToolEvents(raw) {
     if (!raw) return [];
     try {
       const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      return Array.isArray(parsed) ? parsed.map((item) => String(item || "").trim()).filter(Boolean) : [];
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
     } catch (error) {
       return [];
     }
   }
 
+  function renderStructuredToolEvent(item) {
+    const type = String(item?.type || "").trim();
+    if (!type) return "";
+    if (type === "missing_fields") {
+      const rows = Array.isArray(item.items) ? item.items : [];
+      return `
+        <div class="erp-web-assistant__tool-card">
+          <div class="erp-web-assistant__tool-title">Missing fields</div>
+          <div class="erp-web-assistant__tool-chips">
+            ${rows.slice(0, 8).map((row) => `<span class="erp-web-assistant__tool-chip">${safeHtml(row.label || row.fieldname || "")}</span>`).join("")}
+          </div>
+        </div>
+      `;
+    }
+    if (type === "missing_child_rows") {
+      const rows = Array.isArray(item.items) ? item.items : [];
+      return `
+        <div class="erp-web-assistant__tool-card">
+          <div class="erp-web-assistant__tool-title">Incomplete child rows</div>
+          <div class="erp-web-assistant__tool-options">
+            ${rows.slice(0, 6).map((row) => `<div class="erp-web-assistant__tool-option"><strong>${safeHtml((row.table_label || "Rows") + " row " + (row.row_index || ""))}</strong><small>${safeHtml((row.fields || []).map((field) => field.label || field.fieldname || "").join(", "))}</small></div>`).join("")}
+          </div>
+        </div>
+      `;
+    }
+    if (type === "candidates") {
+      const rows = Array.isArray(item.items) ? item.items : [];
+      return `
+        <div class="erp-web-assistant__tool-card">
+          <div class="erp-web-assistant__tool-title">Choose one</div>
+          <div class="erp-web-assistant__tool-options">
+            ${rows.slice(0, 6).map((row) => `<div class="erp-web-assistant__tool-option"><strong>${safeHtml(row.name || "")}</strong><small>${safeHtml(row.label || "")}</small></div>`).join("")}
+          </div>
+        </div>
+      `;
+    }
+    if (type === "document_ref") {
+      const label = `${item.doctype || "Document"} ${item.name || ""}`.trim();
+      return `
+        <div class="erp-web-assistant__tool-card">
+          <div class="erp-web-assistant__tool-title">Document</div>
+          <div class="erp-web-assistant__tool-link">${item.url ? renderAnchor(item.url, label) : safeHtml(label)}</div>
+        </div>
+      `;
+    }
+    if (type === "planner") {
+      const source = String(item.source || "").trim();
+      const reason = String(item.reason || "").trim();
+      return `
+        <div class="erp-web-assistant__tool-card">
+          <div class="erp-web-assistant__tool-title">Planner</div>
+          <div class="erp-web-assistant__tool-option">
+            <strong>${safeHtml(String(item.intent || "unknown"))}</strong>
+            <small>confidence ${safeHtml(String(item.confidence ?? ""))}${source ? ` • ${safeHtml(source)}` : ""}${reason ? ` • ${safeHtml(reason)}` : ""}</small>
+          </div>
+        </div>
+      `;
+    }
+    return "";
+  }
+
   function renderToolEvents(raw) {
     const events = parseToolEvents(raw);
     if (!events.length) return "";
+    const textEvents = events.filter((item) => typeof item === "string" && String(item || "").trim());
+    const structuredEvents = events.filter((item) => item && typeof item === "object" && !Array.isArray(item));
     return `
       <details class="erp-web-assistant__tools">
         <summary class="erp-web-assistant__tools-summary">Tool activity</summary>
-        <ul class="erp-web-assistant__tools-list">
-          ${events.slice(-8).map((item) => `<li>${safeHtml(item)}</li>`).join("")}
-        </ul>
+        ${structuredEvents.length ? `<div class="erp-web-assistant__tool-blocks">${structuredEvents.map((item) => renderStructuredToolEvent(item)).join("")}</div>` : ""}
+        ${textEvents.length ? `<ul class="erp-web-assistant__tools-list">
+          ${textEvents.slice(-8).map((item) => `<li>${safeHtml(item)}</li>`).join("")}
+        </ul>` : ""}
       </details>
     `;
   }
@@ -301,7 +402,7 @@
     updateContext() {
       let route = "";
       if (window.location.hash) route = window.location.hash.slice(1);
-      this.el.context.textContent = route || "General ERP workspace";
+      this.el.context.textContent = route || "General workspace";
     }
 
     loadHistory() {
@@ -409,7 +510,7 @@
       this.ensureConversation((conversationName) => {
         this.startProgressPolling(conversationName);
         frappe.call({
-          method: "erp_ai_assistant.api.ai.send_prompt",
+          method: "erp_ai_assistant.api.assistant.handle_prompt",
           args: {
             conversation: conversationName,
             prompt: prompt,
@@ -585,7 +686,7 @@
 
     startProgressPolling(conversationName) {
       this.stopProgressPolling();
-      this.showProgress(["Preparing request"]);
+      this.showProgress(["Preparing response"]);
       if (!conversationName) return;
 
       const pollProgress = () => {
@@ -597,7 +698,7 @@
           callback: (response) => {
             const progress = response?.message || {};
             const steps = Array.isArray(progress.steps) ? progress.steps : [];
-            this.showProgress(steps);
+            this.showProgress(steps, progress.partial_text || "");
           },
           always: () => {
             this.progressPollPending = false;
@@ -620,13 +721,14 @@
       this.hideProgress();
     }
 
-    showProgress(steps) {
+    showProgress(steps, partialText) {
       const existing = this.el.messages.querySelector(".erp-web-assistant__msg.is-progress");
       if (existing) {
         const stepWrap = existing.querySelector(".erp-web-assistant__progress-steps");
+        const partialWrap = existing.querySelector(".erp-web-assistant__progress-partial");
         if (stepWrap) {
           const items = Array.isArray(steps) ? steps.filter(Boolean) : [];
-          const finalItems = items.length ? items.slice(-4) : ["Preparing request"];
+          const finalItems = items.length ? items.slice(-4) : ["Preparing response"];
           stepWrap.innerHTML = "";
           finalItems.forEach((item) => {
             const row = document.createElement("div");
@@ -634,6 +736,10 @@
             row.textContent = item;
             stepWrap.appendChild(row);
           });
+        }
+        if (partialWrap) {
+          partialWrap.textContent = String(partialText || "").trim();
+          partialWrap.style.display = partialWrap.textContent ? "block" : "none";
         }
         return;
       }
@@ -644,12 +750,13 @@
         <span class="erp-web-assistant__msg-meta">Assistant</span>
         <div class="erp-web-assistant__progress-head">
           <span class="erp-web-assistant__progress-spinner" aria-hidden="true"></span>
-          <span>Working</span>
+          <span>Responding</span>
         </div>
         <div class="erp-web-assistant__progress-steps"></div>
+        <div class="erp-web-assistant__progress-partial" style="display:none;"></div>
       `;
       this.el.messages.appendChild(progress);
-      this.showProgress(steps);
+      this.showProgress(steps, partialText);
       this.el.messages.scrollTop = this.el.messages.scrollHeight;
     }
 
