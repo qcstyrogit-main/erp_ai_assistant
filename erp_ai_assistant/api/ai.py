@@ -1427,27 +1427,20 @@ def _plan_named_update(raw_text: str, named_doc_patterns: dict[str, str]) -> lis
     if not updates:
         updates = {_normalize_field_key(field_label): value}
 
+    preferred_field = next(iter(updates.keys()), field_label)
+    preferred_value = updates.get(preferred_field, value)
+
     return [
         {
-            "tool": "get_list",
+            "tool": "update_erp_document",
             "arguments": {
                 "doctype": doctype,
-                "fields": ["name", display_field],
-                "filters": [[display_field, "=", target]],
-                "limit_page_length": 1,
-                "order_by": "modified desc",
-            },
-            "heading": f"Lookup {doctype}",
-        },
-        {
-            "tool": "update_document",
-            "arguments": {
-                "doctype": doctype,
-                "name_from_previous_result": True,
-                "document": updates,
+                "record": target,
+                "field": preferred_field,
+                "value": preferred_value,
             },
             "heading": f"Updated {doctype} {target}",
-        },
+        }
     ]
 
 
