@@ -1,5 +1,13 @@
 (function () {
-  window.__ERP_AI_ASSISTANT_BUILD__ = "2026-03-09-context-guard-v2";
+  window.__ERP_AI_ASSISTANT_BUILD__ = "2026-03-18-global-desk-context-v1";
+
+  function shouldShowToolActivity() {
+    try {
+      return window.localStorage?.getItem("erp_ai_assistant_debug_tools") === "1";
+    } catch (error) {
+      return false;
+    }
+  }
 
   /**
    * @class ERPAssistantBubble
@@ -44,10 +52,13 @@
       /** @type {Array<Object>} */
       this.pendingImages = [];
 
+      /** @type {boolean} */
+      this.globalEventsBound = false;
+
     }
 
     boot() {
-      if (frappe.session.user === "Guest") return;
+      if (!window.frappe || frappe.session?.user === "Guest") return;
       if (document.getElementById("erp-ai-assistant-bubble")) return;
       this.render();
       this.bindGlobalEvents();
@@ -210,8 +221,15 @@
     }
 
     bindGlobalEvents() {
+      if (this.globalEventsBound) return;
+      this.globalEventsBound = true;
       window.addEventListener("hashchange", () => this.updateContextHint());
       $(document).on("page-change", () => this.updateContextHint());
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) {
+          this.updateContextHint();
+        }
+      });
     }
 
     toggleDrawer(forceState) {
@@ -255,8 +273,10 @@
       }
 
       const routeText = route.join("/");
-      const [view, doctype, docname] = route;
-      const isFormRoute = view === "Form";
+      const [rawView, doctype, docname, extra] = route;
+      const view = String(rawView || "").trim();
+      const normalizedView = view.toLowerCase();
+      const isFormRoute = normalizedView === "form";
       const form = window.cur_frm || (typeof cur_frm !== "undefined" ? cur_frm : null);
       const formMatchesRoute = Boolean(
         form
@@ -271,6 +291,71 @@
           doctype: form.doctype || null,
           docname: form.docname || null,
           route: routeText,
+          label: `${form.doctype || "Document"} / ${form.docname || ""}`.trim(),
+        };
+      }
+
+      if (normalizedView === "list") {
+        const listView = String(extra || "").trim();
+        return {
+          doctype: doctype || null,
+          docname: null,
+          route: routeText,
+          label: doctype ? `${doctype} List${listView ? ` / ${listView}` : ""}` : "List View",
+        };
+      }
+
+      if (normalizedView === "tree") {
+        return {
+          doctype: doctype || null,
+          docname: null,
+          route: routeText,
+          label: doctype ? `${doctype} Tree` : "Tree View",
+        };
+      }
+
+      if (normalizedView === "kanban") {
+        return {
+          doctype: doctype || null,
+          docname: null,
+          route: routeText,
+          label: doctype ? `${doctype} Kanban` : "Kanban View",
+        };
+      }
+
+      if (normalizedView === "query-report" || normalizedView === "report") {
+        return {
+          doctype: null,
+          docname: null,
+          route: routeText,
+          label: doctype ? `Report / ${doctype}` : "Report",
+        };
+      }
+
+      if (normalizedView === "workspace") {
+        return {
+          doctype: null,
+          docname: null,
+          route: routeText,
+          label: doctype ? `Workspace / ${doctype}` : "Workspace",
+        };
+      }
+
+      if (normalizedView === "dashboard") {
+        return {
+          doctype: null,
+          docname: null,
+          route: routeText,
+          label: doctype ? `Dashboard / ${doctype}` : "Dashboard",
+        };
+      }
+
+      if (normalizedView === "print") {
+        return {
+          doctype: doctype || null,
+          docname: docname || null,
+          route: routeText,
+          label: doctype && docname ? `${doctype} / ${docname} (Print)` : "Print View",
         };
       }
 
@@ -278,11 +363,12 @@
         doctype: isFormRoute ? doctype || null : null,
         docname: isFormRoute ? docname || null : null,
         route: routeText,
+        label: routeText || "General chat",
       };
     }
 
     updateContextHint() {
-      let context = { doctype: null, docname: null, route: "" };
+      let context = { doctype: null, docname: null, route: "", label: "General chat" };
       try {
         const resolved = this.getCurrentContext();
         if (resolved && typeof resolved === "object") {
@@ -295,7 +381,7 @@
 
       const text = context.doctype && context.docname
         ? `${context.doctype} / ${context.docname}`
-        : "General chat";
+        : (context.label || "General chat");
 
       if (this.elements.context) {
         this.elements.context.textContent = text;
@@ -442,7 +528,7 @@
         bodyElement.innerHTML = this._formatMessageContent(content);
 
         const toolEvents = this._parseToolEvents(message.tool_events);
-        if (toolEvents.length) {
+        if (shouldShowToolActivity() && toolEvents.length) {
           bubble.appendChild(this._renderToolEventRow(toolEvents));
         }
 
@@ -576,13 +662,13 @@
       const tokens = [];
       let value = String(text || "");
 
-      value = value.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/[^\s)]+)\)/g, (_, alt, url) => {
+      value = value.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/)[^\s)]+|data:image\/[^\s)]+)\)/g, (_, alt, url) => {
         const token = `__ERP_AI_INLINE_${tokens.length}__`;
         tokens.push(this._renderInlineImage(url, alt));
         return token;
       });
 
-      value = value.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
+      value = value.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, (_, label, url) => {
         const token = `__ERP_AI_INLINE_${tokens.length}__`;
         tokens.push(this._renderAnchor(url, label));
         return token;
@@ -883,6 +969,7 @@
 
         this.abortRequested = false;
         this._setGeneratingState(true);
+        this._startProgressPolling(conversationName);
 
         const request = frappe.call({
           method: "erp_ai_assistant.api.assistant.handle_prompt",
@@ -896,38 +983,37 @@
             images: imagePayload.length ? JSON.stringify(imagePayload) : undefined,
           },
           callback: (response) => {
-            this.refreshHistory();
-            this.loadConversation(conversationName);
+            const payload = response?.message || {};
+            if (payload.queued) {
+              return;
+            }
+            this._finishPromptRun(conversationName);
           },
           error: (error) => {
             if (this.abortRequested) return;
+            this._finishPromptRun(null, { keepMessages: true });
             frappe.show_alert({ message: error.message || "Assistant request failed", indicator: "red" });
           },
           always: () => {
             this.pendingPromptRequest = null;
-            this._stopProgressPolling();
-            this._setGeneratingState(false);
-            this._hideTypingIndicator();
-            this.abortRequested = false;
           },
         });
 
         this.pendingPromptRequest = request;
-        this._startProgressPolling(conversationName);
       });
     }
 
     stopPrompt() {
-      if (!this.isGenerating || !this.pendingPromptRequest) {
+      if (!this.isGenerating) {
         return;
       }
 
       this.abortRequested = true;
-      this.pendingPromptRequest.abort("abort");
+      if (this.pendingPromptRequest) {
+        this.pendingPromptRequest.abort("abort");
+      }
       this.pendingPromptRequest = null;
-      this._stopProgressPolling();
-      this._setGeneratingState(false);
-      this._hideTypingIndicator();
+      this._finishPromptRun(null, { keepMessages: true });
     }
 
     _addUserMessageToUI(prompt, images) {
@@ -1036,6 +1122,15 @@
             const progress = response?.message || {};
             const steps = Array.isArray(progress.steps) ? progress.steps : [];
             this._updateTypingSteps(steps, progress.partial_text || "");
+            if (progress.done) {
+              this._stopProgressPolling();
+              if (progress.error) {
+                this._finishPromptRun(null, { keepMessages: true });
+                frappe.show_alert({ message: progress.error || "Assistant request failed", indicator: "red" });
+                return;
+              }
+              this._finishPromptRun(conversationName);
+            }
           },
           always: () => {
             this.progressPollPending = false;
@@ -1061,6 +1156,22 @@
       const indicator = document.getElementById("erp-ai-assistant-typing");
       if (indicator) {
         indicator.remove();
+      }
+    }
+
+    _finishPromptRun(conversationName, options) {
+      const settings = options || {};
+      this._stopProgressPolling();
+      this._setGeneratingState(false);
+      this._hideTypingIndicator();
+      this.abortRequested = false;
+      if (conversationName) {
+        this.refreshHistory();
+        this.loadConversation(conversationName);
+        return;
+      }
+      if (!settings.keepMessages) {
+        this.refreshHistory();
       }
     }
 
@@ -1255,9 +1366,21 @@
   }
 
   frappe.provide("erp_ai_assistant");
-  erp_ai_assistant.drawer = new ERPAssistantBubble();
+  erp_ai_assistant.drawer = erp_ai_assistant.drawer || new ERPAssistantBubble();
 
-  frappe.after_ajax(() => {
+  const bootAssistantDrawer = () => {
     erp_ai_assistant.drawer.boot();
-  });
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", bootAssistantDrawer, { once: true });
+  } else {
+    bootAssistantDrawer();
+  }
+
+  if (typeof frappe.after_ajax === "function") {
+    frappe.after_ajax(() => {
+      bootAssistantDrawer();
+    });
+  }
 })();

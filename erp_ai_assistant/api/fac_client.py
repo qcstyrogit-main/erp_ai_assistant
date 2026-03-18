@@ -4,10 +4,6 @@ from typing import Any
 import frappe
 import requests
 
-from .tool_registry import execute_tool as fallback_dispatch_tool
-from .tool_registry import get_tool_definitions as get_fallback_tool_definitions
-
-
 DEFAULT_FAC_MCP_TIMEOUT = 30.0
 
 
@@ -213,18 +209,13 @@ def get_tool_definitions() -> dict[str, dict[str, Any]]:
     except Exception:
         pass
 
-    return get_fallback_tool_definitions()
+    return {}
 
 
 def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
     registry, local_definitions = _local_fac_available()
     if registry and local_definitions:
-        try:
-            return registry.execute_tool(name, arguments or {})
-        except Exception:
-            if name in get_fallback_tool_definitions():
-                return fallback_dispatch_tool(name, arguments)
-            raise
+        return registry.execute_tool(name, arguments or {})
 
     try:
         return _extract_remote_tool_result(
@@ -237,9 +228,9 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
             )
         )
     except Exception:
-        pass
-
-    return fallback_dispatch_tool(name, arguments)
+        raise RuntimeError(
+            "FAC-native tool execution failed because no FAC tool backend was available for this request."
+        )
 
 
 def test_fac_connection() -> dict[str, Any]:

@@ -137,6 +137,28 @@ may still not complete as a real update.
 
 That is a FAC capability issue, not an ERP AI Assistant connection issue.
 
+## Recommended FAC Tool Roadmap
+
+For this app to behave like a strong ERP assistant, FAC should expose business-level tools instead of relying only on generic CRUD primitives.
+
+Recommended priority:
+- `find_one_document`
+- `update_document`
+- `export_doctype_records`
+- `create_report`
+- `get_report_definition`
+- `update_report`
+- `run_report`
+- `export_report`
+
+Detailed tool contract:
+- [docs/fac_tool_blueprint.md](/d:/frappe_docker/development/frappe-bench/apps/erp_ai_assistant/docs/fac_tool_blueprint.md)
+
+Why this matters:
+- `create_document` alone is too low-level for reliable report creation
+- generic search tools are too broad for deterministic ERP actions
+- explicit business tools let FAC validate inputs and confirm real success
+
 ## Public API Endpoints
 
 Assistant:
@@ -149,11 +171,7 @@ Assistant:
 - `erp_ai_assistant.api.assistant.get_resource_catalog`
 - `erp_ai_assistant.api.assistant.read_available_resource`
 - `erp_ai_assistant.api.assistant.test_fac_mcp_connection`
-
-Support / preview:
-- `erp_ai_assistant.api.assistant.classify_prompt`
-- `erp_ai_assistant.api.assistant.preview_host_session`
-- `erp_ai_assistant.api.assistant.get_host_capabilities`
+- `erp_ai_assistant.api.assistant.test_ai_provider_connection`
 
 MCP/FAC-style proxy:
 - `erp_ai_assistant.api.fac_proxy.handle_mcp`

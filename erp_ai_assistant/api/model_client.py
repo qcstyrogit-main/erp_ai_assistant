@@ -13,7 +13,6 @@ def get_provider_descriptor() -> dict[str, Any]:
     return {
         "provider": provider,
         "supports_tools": provider in {"openai", "openai_compatible", "anthropic"},
-        "supports_deterministic_router": True,
         "supports_internal_tool_registry": True,
         "supports_internal_resource_registry": True,
         "tool_count": tool_catalog.get("count", 0),

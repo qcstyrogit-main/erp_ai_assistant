@@ -2,6 +2,8 @@ import json
 import os
 import re
 import ast
+import html
+from urllib.parse import quote
 from typing import Any, Optional
 
 import frappe
@@ -62,6 +64,11 @@ CORE_DOC_TOOL_NAMES = {
     "run_workflow",
 }
 REPORT_TOOL_NAMES = {
+    "generate_report",
+    "report_list",
+    "report_requirements",
+}
+REPORT_DISCOVERY_TOOL_NAMES = {
     "generate_report",
     "report_list",
     "report_requirements",
@@ -236,6 +243,59 @@ def _provider_name() -> str:
     return get_active_provider()
 
 
+def _endpoint_host(base_url: str) -> str:
+    text = str(base_url or "").strip().lower()
+    if not text:
+        return ""
+    text = re.sub(r"^https?://", "", text)
+    return text.split("/", 1)[0]
+
+
+def _provider_compatibility_profile(
+    provider: str,
+    base_url: str,
+    path: str = "",
+    *,
+    model: str | None = None,
+) -> dict[str, Any]:
+    host = _endpoint_host(base_url)
+    normalized_model = str(model or "").strip().lower()
+
+    profile = {
+        "provider": provider,
+        "profile": provider,
+        "host": host,
+        "path": str(path or "").strip(),
+        "disable_tool_choice_by_default": False,
+        "disable_sampling_by_default": False,
+        "allow_textual_tool_fallback": True,
+    }
+
+    if provider == "openai":
+        profile["profile"] = "openai"
+        profile["allow_textual_tool_fallback"] = False
+        return profile
+
+    if provider == "anthropic":
+        profile["profile"] = "anthropic"
+        profile["allow_textual_tool_fallback"] = False
+        return profile
+
+    if "openrouter.ai" in host or normalized_model.startswith("openrouter/"):
+        profile["profile"] = "openrouter"
+        # OpenRouter routes across providers with varying tool_choice support.
+        profile["disable_tool_choice_by_default"] = True
+        return profile
+
+    if "integrate.api.nvidia.com" in host or "build.nvidia.com" in host or normalized_model.startswith("nvidia/"):
+        profile["profile"] = "nvidia"
+        return profile
+
+    profile["profile"] = "generic_openai_compatible"
+
+    return profile
+
+
 def _tool_choice_mode(base_url: str, messages_path: str) -> str:
     override = str(_cfg("ERP_AI_TOOL_CHOICE_MODE", "")).strip().lower()
     if override in {"anthropic", "openai"}:
@@ -277,12 +337,43 @@ def _should_force_tool_use(prompt: str, context: dict[str, Any]) -> bool:
     if context.get("doctype") and context.get("docname"):
         return True
 
-    data_intent_terms = (
+    read_verbs = (
         "show",
         "list",
         "find",
         "get",
-        "report",
+        "fetch",
+        "search",
+        "open",
+        "lookup",
+        "display",
+        "view",
+    )
+    mutate_verbs = (
+        "create",
+        "add",
+        "insert",
+        "update",
+        "edit",
+        "change",
+        "modify",
+        "set",
+        "rename",
+        "submit",
+        "cancel",
+        "delete",
+        "remove",
+        "approve",
+        "reject",
+    )
+    export_verbs = (
+        "export",
+        "download",
+        "save as",
+        "generate excel",
+        "generate pdf",
+    )
+    erp_nouns = (
         "sales",
         "customer",
         "employee",
@@ -295,8 +386,15 @@ def _should_force_tool_use(prompt: str, context: dict[str, Any]) -> bool:
         "payment",
         "order",
         "doctype",
+        "report",
+        "workflow",
+        "dashboard",
     )
-    return any(term in text for term in data_intent_terms)
+    has_erp_noun = any(term in text for term in erp_nouns)
+    has_action = any(re.search(rf"\b{re.escape(term)}\b", text) for term in read_verbs + mutate_verbs) or any(
+        term in text for term in export_verbs
+    )
+    return has_erp_noun and has_action
 
 
 def _has_destructive_intent(prompt: str) -> bool:
@@ -334,17 +432,142 @@ def _has_write_intent(prompt: str) -> bool:
     return any(term in text for term in write_terms)
 
 
-def _selected_tool_names_for_prompt(prompt: str, context: dict[str, Any], available_names: set[str]) -> set[str]:
+def _is_sample_data_request(prompt: str, context: Optional[dict[str, Any]] = None) -> bool:
+    text = (prompt or "").strip().lower()
+    if not text:
+        return False
+
+    strong_indicators = (
+        "sample data",
+        "sample records",
+        "dummy data",
+        "mock data",
+        "for testing",
+        "test data",
+        "fictional data",
+        "return the result in table format",
+        "return in table format",
+    )
+    if any(term in text for term in strong_indicators):
+        return True
+
+    if "realistic" in text and "create" in text and ("records" in text or "rows" in text):
+        return True
+
+    return False
+
+
+def _tokenize_match_text(value: Any) -> set[str]:
+    text = str(value or "").strip().lower()
+    if not text:
+        return set()
+    return {token for token in re.split(r"[^a-z0-9_]+", text.replace("-", "_")) if len(token) >= 2}
+
+
+def _tool_match_terms(name: str, spec: dict[str, Any]) -> set[str]:
+    terms = set()
+    terms.update(_tokenize_match_text(name.replace("_", " ")))
+    terms.update(_tokenize_match_text(spec.get("description")))
+
+    annotations = spec.get("annotations")
+    if isinstance(annotations, dict):
+        for value in annotations.values():
+            terms.update(_tokenize_match_text(value))
+
+    input_schema = spec.get("inputSchema")
+    if isinstance(input_schema, dict):
+        properties = input_schema.get("properties")
+        if isinstance(properties, dict):
+            for field_name, field_spec in properties.items():
+                terms.update(_tokenize_match_text(field_name))
+                if isinstance(field_spec, dict):
+                    terms.update(_tokenize_match_text(field_spec.get("title")))
+                    terms.update(_tokenize_match_text(field_spec.get("description")))
+
+    return terms
+
+
+def _tool_match_score(prompt: str, context: dict[str, Any], name: str, spec: dict[str, Any]) -> int:
+    prompt_text = str(prompt or "").strip().lower()
+    normalized_name = str(name or "").strip().lower().replace("_", " ")
+    prompt_terms = _tokenize_match_text(prompt_text)
+    tool_terms = _tool_match_terms(name, spec)
+    overlap = prompt_terms.intersection(tool_terms)
+
+    score = len(overlap) * 3
+    if normalized_name and normalized_name in prompt_text:
+        score += 12
+    if str(name or "").strip().lower() in prompt_text:
+        score += 8
+
+    if _has_active_document_context(context) and any(term in tool_terms for term in {"document", "doctype", "workflow"}):
+        score += 2
+
+    if _has_write_intent(prompt_text) and any(term in tool_terms for term in {"create", "update", "delete", "workflow", "submit", "cancel"}):
+        score += 4
+    if _has_destructive_intent(prompt_text) and any(term in tool_terms for term in {"delete", "remove", "purge", "cancel"}):
+        score += 4
+    if any(term in prompt_text for term in {"export", "excel", "xlsx", "csv", "pdf", "docx", "word", "download"}):
+        if any(term in tool_terms for term in {"list", "document", "report", "fetch", "export", "search"}):
+            score += 2
+
+    return score
+
+
+def _selected_tool_names_for_prompt(
+    prompt: str,
+    context: dict[str, Any],
+    tool_definitions: dict[str, dict[str, Any]],
+) -> set[str]:
+    available_names = set(tool_definitions)
     if not available_names:
         return set()
     if not _is_erp_intent(prompt, context):
         return set()
-    return set(available_names)
+    if _is_sample_data_request(prompt, context):
+        return set()
+
+    scored: list[tuple[int, str]] = []
+    for name, spec in tool_definitions.items():
+        if name not in available_names or not isinstance(spec, dict):
+            continue
+        score = _tool_match_score(prompt, context, name, spec)
+        scored.append((score, name))
+
+    scored.sort(key=lambda item: (-item[0], _tool_priority_key(item[1])))
+    positive = [(score, name) for score, name in scored if score > 0]
+    if not positive:
+        return available_names
+
+    top_score = positive[0][0]
+    cutoff = max(top_score - 5, 1)
+    selected = {name for score, name in positive if score >= cutoff}
+    if len(available_names) <= 18:
+        return available_names
+    if len(selected) < 8:
+        selected.update(name for _score, name in positive[:12])
+    specific_business_tools = {
+        "find_one_document",
+        "set_document_fields",
+        "create_report",
+        "get_report_definition",
+        "update_report",
+        "run_report",
+        "export_report",
+        "export_doctype_records",
+    }
+    selected.update(name for name in available_names if name in specific_business_tools)
+    return selected or available_names
 
 
 def _has_active_document_context(context: Optional[dict[str, Any]] = None) -> bool:
     current = context or {}
     return bool(current.get("doctype") and current.get("docname"))
+
+
+def _has_doctype_context(context: Optional[dict[str, Any]] = None) -> bool:
+    current = context or {}
+    return bool(current.get("doctype"))
 
 
 def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
@@ -353,6 +576,11 @@ def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
         return (
             f"Current context: doctype={current.get('doctype')}, "
             f"docname={current.get('docname')}, route={current.get('route')}."
+        )
+    if _has_doctype_context(current):
+        return (
+            f"Current context: doctype={current.get('doctype')}, "
+            f"no active document, route={current.get('route')}."
         )
     route = str(current.get("route") or "").strip()
     if route:
@@ -363,12 +591,11 @@ def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
 def _tool_catalog_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     try:
         tool_definitions = get_tool_definitions()
-        available_names = set(tool_definitions)
     except Exception:
         tool_definitions = {}
-        available_names = set()
 
-    selected_names = sorted(_selected_tool_names_for_prompt(prompt, context or {}, available_names))
+    available_names = set(tool_definitions)
+    selected_names = sorted(_selected_tool_names_for_prompt(prompt, context or {}, tool_definitions))
     if not selected_names:
         selected_names = sorted(available_names)
     if not selected_names:
@@ -378,22 +605,37 @@ def _tool_catalog_summary(prompt: str, context: Optional[dict[str, Any]] = None)
     suffix = " ..." if len(selected_names) > 24 else ""
     return (
         "Use only the FAC tools that are actually exposed in this session. "
+        "Select tools from the live FAC catalog based on the user's request, tool descriptions, and input schema. "
         "Do not invent or assume tools that are not present. "
-        f"Available FAC tools for this request: {preview}{suffix}."
+        f"Best-matching FAC tools for this request: {preview}{suffix}."
     )
 
 
 def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     current = context or {}
+    sample_data_mode = _is_sample_data_request(prompt, current)
     return (
         "You are an ERPNext AI assistant connected to a Frappe server. "
         "You are connected to Frappe Assistant Core (FAC), which exposes the tool catalog dynamically for this session. "
-        "If the user asks for ERP data, always call a tool. "
+        "Your final reply must read like a polished desktop assistant response: natural, direct, and user-facing. "
+        "Never expose raw tool calls, XML/tool markers, JSON payloads, function names, internal schemas, or chain-of-thought. "
+        "Do not narrate internal tool usage unless the user explicitly asks for technical details. "
+        "If the user asks for live ERP data or a real ERP mutation, call a tool. "
+        "If the user asks for sample data, dummy data, mock data, or testing data, do not call ERP tools. "
+        "For sample/testing data requests, generate fictional but realistic business data directly and clearly present it as sample data. "
+        "When the user requests table format for sample data, return a markdown table. "
         "Never guess ERP data. Never invent document names, fields, item codes, workflow actions, or server problems. "
         "Prefer tool calls over text explanations whenever live ERP data or mutations are involved. "
+        "Choose FAC tools from the live catalog by matching the user's request to the tool name, description, annotations, and input schema. "
+        "Prefer the most specific FAC tool that fits the request; only use broader tools when no more specific FAC tool is available. "
+        "If the user asks to create a report, prefer create_report when available. "
+        "Only fall back to create_document with doctype='Report' if create_report is not exposed by FAC. "
+        "When the user does not specify a report type, default the created report to Query Report and use the referenced doctype from the prompt. "
         "Try to complete the request directly from the user's prompt, current context, prior conversation, and tool results before asking for more input. "
         "Only ask for clarification when the action is blocked after you have already used the available context and tools. "
         "If FAC does not expose a needed mutation tool, do not pretend the action succeeded; explain the limitation briefly. "
+        "If the current context has a doctype but no active document, and the user asks to create a new record without naming a doctype, treat the current context doctype as the intended target. "
+        "Example: on Material Request List, 'create new record' means create a Material Request. "
         "When creating documents, extract customer, supplier, items, quantities, dates, and any explicit field values from the prompt. "
         "For exports and PDFs, call tools to produce the structured data or artifact payload; the host app handles the final file download UX. "
         "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
@@ -401,6 +643,7 @@ def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = Non
         "Use ERP concepts precisely: Sales Order, Quotation, Customer, Supplier, Employee, Item, Purchase Order, Sales Invoice, Delivery Note. "
         f"{_tool_catalog_summary(prompt, current)} "
         f"{_tool_access_summary(prompt, current)} "
+        f"{'Sample data mode is active for this request. Do not use FAC tools.' if sample_data_mode else ''} "
         f"Current context: doctype={current.get('doctype')}, docname={current.get('docname')}, route={current.get('route')}."
     )
 
@@ -412,6 +655,10 @@ def _llm_user_prompt(prompt: str) -> str:
         f"{cleaned}\n\n"
         "Respond by calling a tool when appropriate. "
         "Make a best-effort attempt to complete the request directly. "
+        "Use the live FAC catalog to choose the best-matching tool for this request. "
+        "Return the final answer in plain natural language for the end user. "
+        "Do not show raw tool output, JSON, tool names, or internal markers. "
+        "For sample/testing data requests, generate fictional realistic sample output directly. "
         "Ask a concise clarification question only if the task is truly blocked."
     ).strip()
 
@@ -438,6 +685,11 @@ def _prioritize_tool_specs(tool_specs: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _tool_access_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    if _is_sample_data_request(prompt, context or {}):
+        return (
+            "This request is for sample or testing data, not live ERP facts. "
+            "Answer directly without tools and do not search ERP records."
+        )
     if not _is_erp_intent(prompt, context or {}):
         return (
             "If the request is general and does not need ERP/Frappe data, answer directly without tools. "
@@ -445,7 +697,8 @@ def _tool_access_summary(prompt: str, context: Optional[dict[str, Any]] = None) 
         )
     return (
         "For ERP requests, rely on the FAC tools exposed in this session. "
-        "Use the live tool catalog rather than assuming any read, write, delete, or workflow capability exists."
+        "Use the live tool catalog rather than assuming any read, write, delete, or workflow capability exists. "
+        "Let the model see and choose among the relevant live FAC tools instead of forcing a narrow static subset."
     )
 
 
@@ -464,6 +717,10 @@ def _verification_prompt(tool_events: list[str]) -> str:
 
 def _progress_cache_key(conversation: str, user: str) -> str:
     return f"erp_ai_assistant:progress:{user}:{conversation}"
+
+
+def _result_cache_key(conversation: str, user: str) -> str:
+    return f"erp_ai_assistant:result:{user}:{conversation}"
 
 
 def _progress_update(
@@ -507,6 +764,22 @@ def _progress_update(
     )
 
 
+def _set_prompt_result(
+    conversation: str,
+    user: str,
+    payload: dict[str, Any],
+    *,
+    expires_in_sec: int = 900,
+) -> None:
+    if not conversation or not user:
+        return
+    frappe.cache().set_value(
+        _result_cache_key(conversation, user),
+        json.dumps(payload, default=str),
+        expires_in_sec=expires_in_sec,
+    )
+
+
 @frappe.whitelist()
 def get_prompt_progress(conversation: str) -> dict[str, Any]:
     if not conversation:
@@ -528,7 +801,26 @@ def get_prompt_progress(conversation: str) -> dict[str, Any]:
 
 
 @frappe.whitelist()
-def send_prompt(
+def get_prompt_result(conversation: str) -> dict[str, Any]:
+    if not conversation:
+        return {"status": "missing", "done": True}
+
+    raw_payload = frappe.cache().get_value(_result_cache_key(conversation, frappe.session.user))
+    if not raw_payload:
+        return {"status": "pending", "done": False}
+
+    try:
+        payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+    except Exception:
+        return {"status": "pending", "done": False}
+
+    if not isinstance(payload, dict):
+        return {"status": "pending", "done": False}
+    return payload
+
+
+def _execute_prompt(
+    *,
     prompt: str | None = None,
     conversation: str | None = None,
     doctype: str | None = None,
@@ -536,8 +828,12 @@ def send_prompt(
     route: str | None = None,
     model: str | None = None,
     images: str | list[dict[str, Any]] | None = None,
-):
-    """Process a user prompt for the ERP-native assistant drawer."""
+    user: str | None = None,
+) -> dict[str, Any]:
+    effective_user = str(user or frappe.session.user or "").strip()
+    if effective_user:
+        frappe.set_user(effective_user)
+
     prompt_text = (prompt or "").strip()
     had_image_payload = images not in (None, "", "[]", [])
     parsed_images = _parse_prompt_images(images)
@@ -584,7 +880,13 @@ def send_prompt(
             images=parsed_images,
         )
     except Exception as exc:
-        _progress_update(progress, stage="failed", done=True, error=str(exc) or "Unknown error")
+        error_text = str(exc) or "Unknown error"
+        _progress_update(progress, stage="failed", done=True, error=error_text)
+        _set_prompt_result(
+            conversation_name,
+            frappe.session.user,
+            {"status": "failed", "done": True, "error": error_text, "conversation": conversation_name},
+        )
         raise
 
     attachments = _build_message_attachments(
@@ -594,7 +896,12 @@ def send_prompt(
         prompt=prompt_text,
     )
     attachments = _merge_attachment_packages(attachments, response.get("attachments"))
-    reply_text = _finalize_reply_text(response["text"], prompt_text, attachments)
+    reply_text = _finalize_reply_text(
+        response["text"],
+        prompt_text,
+        attachments,
+        payload=response.get("payload"),
+    )
     message = add_message(
         conversation_name,
         "assistant",
@@ -608,7 +915,7 @@ def send_prompt(
         assistant_message.db_set("attachments_json", json.dumps(attachments, default=str), update_modified=False)
     _progress_update(progress, stage="completed", done=True, step="Response ready", partial_text="")
 
-    return {
+    result = {
         "conversation": conversation_name,
         "reply": reply_text,
         "tool_events": response.get("tool_events", []),
@@ -616,6 +923,99 @@ def send_prompt(
         "attachments": attachments,
         "context": context,
     }
+    _set_prompt_result(
+        conversation_name,
+        frappe.session.user,
+        {"status": "completed", "done": True, "conversation": conversation_name, "reply": reply_text},
+    )
+    return result
+
+
+def _run_enqueued_prompt(
+    prompt: str | None = None,
+    conversation: str | None = None,
+    doctype: str | None = None,
+    docname: str | None = None,
+    route: str | None = None,
+    model: str | None = None,
+    images: str | list[dict[str, Any]] | None = None,
+    user: str | None = None,
+) -> None:
+    _execute_prompt(
+        prompt=prompt,
+        conversation=conversation,
+        doctype=doctype,
+        docname=docname,
+        route=route,
+        model=model,
+        images=images,
+        user=user,
+    )
+
+
+@frappe.whitelist()
+def enqueue_prompt(
+    prompt: str | None = None,
+    conversation: str | None = None,
+    doctype: str | None = None,
+    docname: str | None = None,
+    route: str | None = None,
+    model: str | None = None,
+    images: str | list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    prompt_text = (prompt or "").strip()
+    parsed_images = _parse_prompt_images(images)
+    if not prompt_text and not parsed_images:
+        raise frappe.ValidationError(_("Prompt or image is required"))
+
+    conversation_name = conversation or create_conversation(title=_summarize_title(prompt_text or _("Image prompt")))["name"]
+    progress = {"conversation": conversation_name, "user": frappe.session.user, "model": _resolve_model_for_request(model, has_images=bool(parsed_images)), "steps": []}
+    _progress_update(progress, stage="queued", step="Queued request")
+    _set_prompt_result(
+        conversation_name,
+        frappe.session.user,
+        {"status": "pending", "done": False, "conversation": conversation_name},
+    )
+
+    frappe.enqueue(
+        "erp_ai_assistant.api.ai._run_enqueued_prompt",
+        queue="short",
+        timeout=int(max(_llm_request_timeout_seconds() * 3, 300)),
+        prompt=prompt,
+        conversation=conversation_name,
+        doctype=doctype,
+        docname=docname,
+        route=route,
+        model=model,
+        images=images,
+        user=frappe.session.user,
+    )
+    return {
+        "queued": True,
+        "conversation": conversation_name,
+    }
+
+
+@frappe.whitelist()
+def send_prompt(
+    prompt: str | None = None,
+    conversation: str | None = None,
+    doctype: str | None = None,
+    docname: str | None = None,
+    route: str | None = None,
+    model: str | None = None,
+    images: str | list[dict[str, Any]] | None = None,
+):
+    """Process a user prompt for the ERP-native assistant drawer."""
+    return _execute_prompt(
+        prompt=prompt,
+        conversation=conversation,
+        doctype=doctype,
+        docname=docname,
+        route=route,
+        model=model,
+        images=images,
+    )
 
 
 def _build_message_attachments(payload: Any, title: str, conversation: str, prompt: str) -> dict[str, Any]:
@@ -649,12 +1049,14 @@ def _merge_attachment_packages(*packages: Any) -> dict[str, Any]:
     return merged
 
 
-def _finalize_reply_text(text: str, prompt: str, attachments: dict[str, Any]) -> str:
+def _finalize_reply_text(text: str, prompt: str, attachments: dict[str, Any], payload: Any = None) -> str:
     attachment_rows = attachments.get("attachments") or []
     if attachment_rows and _requested_export_formats(prompt) and any(item.get("export_id") for item in attachment_rows):
         labels = ", ".join(str(item.get("label") or item.get("file_type") or "file").strip() for item in attachment_rows[:3])
-        return f"Prepared your export. Use the downloadable attachment below{f' ({labels})' if labels else ''}."
-    return text
+        base_text = f"Prepared your export. Use the downloadable attachment below{f' ({labels})' if labels else ''}."
+    else:
+        base_text = text
+    return _append_related_links(base_text, prompt, payload)
 
 
 def _requested_export_formats(prompt: str) -> list[str]:
@@ -696,9 +1098,99 @@ def _requested_export_formats(prompt: str) -> list[str]:
     return formats
 
 
+def _desk_form_link(doctype: Any, name: Any) -> str:
+    doctype_text = str(doctype or "").strip()
+    name_text = str(name or "").strip()
+    if not doctype_text or not name_text:
+        return ""
+    return f"/app/Form/{quote(doctype_text, safe='')}/{quote(name_text, safe='')}"
+
+
+def _desk_report_link(report_name: Any) -> str:
+    report_text = str(report_name or "").strip()
+    if not report_text:
+        return ""
+    return f"/app/query-report/{quote(report_text, safe='')}"
+
+
+def _infer_prompt_doctype(prompt: str) -> str | None:
+    alias = _match_known_doctype_alias(prompt)
+    if not alias:
+        return None
+    catalog = _known_doctype_catalog()
+    resolved = catalog.get(alias)
+    return resolved[0] if resolved else None
+
+
+def _extract_link_targets_from_payload(payload: Any, prompt: str) -> list[tuple[str, str, str]]:
+    targets: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_target(label: str, url: str, kind: str) -> None:
+        entry = (str(label or "").strip(), str(url or "").strip(), str(kind or "").strip())
+        if not entry[0] or not entry[1] or entry in seen:
+            return
+        seen.add(entry)
+        targets.append(entry)
+
+    def visit(value: Any, inferred_doctype: str | None = None) -> None:
+        if isinstance(value, dict):
+            report_name = str(value.get("report_name") or "").strip()
+            if report_name:
+                add_target(report_name, _desk_report_link(report_name), "report")
+
+            doctype = str(value.get("doctype") or inferred_doctype or "").strip()
+            docname = str(value.get("name") or value.get("docname") or "").strip()
+            if doctype and docname:
+                if doctype == "Report":
+                    add_target(f"Report {docname}", _desk_report_link(docname), "report")
+                else:
+                    add_target(f"{doctype} {docname}", _desk_form_link(doctype, docname), "document")
+
+            for key in ("data", "result", "reports", "message"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    visit(nested, inferred_doctype=doctype or inferred_doctype)
+            return
+
+        if isinstance(value, list):
+            effective_doctype = inferred_doctype or _infer_prompt_doctype(prompt)
+            for row in value[:12]:
+                if isinstance(row, dict):
+                    row_name = str(row.get("name") or row.get("docname") or "").strip()
+                    row_doctype = str(row.get("doctype") or effective_doctype or "").strip()
+                    if row_doctype and row_name:
+                        if row_doctype == "Report":
+                            add_target(f"Report {row_name}", _desk_report_link(row_name), "report")
+                        else:
+                            add_target(f"{row_doctype} {row_name}", _desk_form_link(row_doctype, row_name), "document")
+                    report_name = str(row.get("report_name") or "").strip()
+                    if report_name:
+                        add_target(report_name, _desk_report_link(report_name), "report")
+                elif effective_doctype and str(row or "").strip():
+                    row_name = str(row).strip()
+                    add_target(f"{effective_doctype} {row_name}", _desk_form_link(effective_doctype, row_name), "document")
+
+    visit(payload, inferred_doctype=_infer_prompt_doctype(prompt))
+    return targets[:8]
+
+
+def _append_related_links(text: str, prompt: str, payload: Any) -> str:
+    base = str(text or "").strip()
+    link_targets = _extract_link_targets_from_payload(payload, prompt)
+    if not link_targets:
+        return base
+
+    lines = [base] if base else []
+    lines.extend(["", "Open links:"])
+    for label, url, _kind in link_targets:
+        lines.append(f"- [{label}]({url})")
+    return "\n".join(lines).strip()
+
+
 def _is_erp_intent(prompt: str, context: dict[str, Any]) -> bool:
     text = (prompt or "").strip().lower()
-    if context.get("doctype") and context.get("docname"):
+    if context.get("doctype"):
         return True
     if not text:
         return False
@@ -1777,90 +2269,6 @@ def _provider_chat(
     return _anthropic_chat(prompt, context, history=history, model=model, progress=progress, images=images)
 
 
-def plan_prompt_with_model(
-    prompt: str,
-    context: dict[str, Any],
-    model: str | None = None,
-    host_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if not _llm_chat_configured():
-        raise RuntimeError("AI provider is not configured for model planning.")
-
-    provider = _provider_name()
-    if provider == "openai":
-        return _openai_plan_prompt(prompt, context, model=model, host_session=host_session)
-    if provider == "openai_compatible":
-        return _openai_compatible_plan_prompt(prompt, context, model=model, host_session=host_session)
-    return _anthropic_plan_prompt(prompt, context, model=model, host_session=host_session)
-
-
-def _planner_system_prompt(context: dict[str, Any], host_session: dict[str, Any] | None = None) -> str:
-    tool_definitions = get_tool_definitions()
-    resource_specs = list_resource_specs()
-    tool_names = ", ".join(sorted(tool_definitions.keys())[:18])
-    resource_names = ", ".join(str(row.get("name") or "").strip() for row in resource_specs[:12] if row.get("name"))
-    host_note = "A live host session bundle is included with current context, pending action state, and recommended resource payloads." if host_session else "No host session bundle is attached."
-    return (
-        "You are an intent planner for an ERPNext assistant. "
-        "You only classify prompts and decide whether deterministic ERP tools should run. "
-        "Never claim to execute anything. Never answer the user's task directly. "
-        "Return strict JSON only, with no markdown fences and no extra prose. "
-        "Allowed intents: answer, guide, read, create, update, workflow, export, erp_chat, general_chat, unknown. "
-        "Set should_route=true only when the deterministic ERP router should try first. "
-        "If the user is asking how/process/steps, choose guide, not create/update. "
-        "If the user is asking normal non-ERP conversation, choose general_chat. "
-        "If the user is asking about ERP data, documents, exports, or mutations, choose the closest ERP intent. "
-        "Confidence must be a number between 0 and 1. "
-        "normalized_prompt should remove filler words but preserve the user's meaning. "
-        "reason should be a short explanation. "
-        f"Available tool names include: {tool_names}. "
-        f"Available resource names include: {resource_names}. "
-        f"{host_note} "
-        f"{_context_summary(context)}"
-    )
-
-
-def _planner_user_prompt(prompt: str, context: dict[str, Any], host_session: dict[str, Any] | None = None) -> str:
-    tool_definitions = get_tool_definitions()
-    resource_specs = list_resource_specs()
-    return json.dumps(
-        {
-            "task": "classify_prompt",
-            "prompt": prompt,
-            "context": {
-                "doctype": context.get("doctype"),
-                "docname": context.get("docname"),
-                "route": context.get("route"),
-            },
-            "available_tools": [
-                {
-                    "name": name,
-                    "description": spec.get("description"),
-                    "category": (spec.get("annotations") or {}).get("category"),
-                }
-                for name, spec in tool_definitions.items()
-            ],
-            "available_resources": [
-                {
-                    "name": row.get("name"),
-                    "title": row.get("title"),
-                    "description": row.get("description"),
-                }
-                for row in resource_specs
-            ],
-            "host_session": host_session or {},
-            "response_schema": {
-                "intent": "one of: answer, guide, read, create, update, workflow, export, erp_chat, general_chat, unknown",
-                "confidence": "float between 0 and 1",
-                "should_route": "boolean",
-                "normalized_prompt": "string",
-                "reason": "short string",
-            },
-        },
-        default=str,
-    )
-
-
 def _parse_json_object_text(raw_text: Any) -> dict[str, Any]:
     if isinstance(raw_text, dict):
         return raw_text
@@ -1879,287 +2287,6 @@ def _parse_json_object_text(raw_text: Any) -> dict[str, Any]:
         if isinstance(parsed, dict):
             return parsed
     raise RuntimeError(f"Planner returned invalid JSON: {text[:240]}")
-
-
-def _openai_plan_prompt(
-    prompt: str,
-    context: dict[str, Any],
-    model: str | None = None,
-    host_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    api_key = _cfg("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OpenAI provider is selected but OPENAI_API_KEY is not configured.")
-
-    selected_model = _resolve_model(model)
-    timeout_seconds = _llm_request_timeout_seconds()
-    temperature = _llm_temperature()
-    top_p = _llm_top_p()
-    base_url = str(_cfg("OPENAI_BASE_URL", "https://api.openai.com")).rstrip("/")
-    responses_path = str(_cfg("OPENAI_RESPONSES_PATH", DEFAULT_OPENAI_RESPONSES_PATH) or DEFAULT_OPENAI_RESPONSES_PATH)
-    if not responses_path.startswith("/"):
-        responses_path = f"/{responses_path}"
-    endpoint = f"{base_url}{responses_path}"
-    headers = {
-        "content-type": "application/json",
-        "authorization": f"Bearer {api_key}",
-    }
-    request_payload: dict[str, Any] = {
-        "model": selected_model,
-        "instructions": _planner_system_prompt(context, host_session=host_session),
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": _planner_user_prompt(prompt, context, host_session=host_session)}],
-            }
-        ],
-    }
-    if _openai_supports_sampling_controls(selected_model):
-        request_payload["temperature"] = temperature
-        request_payload["top_p"] = top_p
-    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
-    if response.status_code >= 400:
-        raise RuntimeError(f"AI endpoint rejected planner request ({endpoint}): {_extract_error_detail(response)}")
-    response.raise_for_status()
-    body = _parse_backend_json(response, endpoint)
-    return _parse_json_object_text(_openai_output_text(body))
-
-
-def _openai_compatible_plan_prompt(
-    prompt: str,
-    context: dict[str, Any],
-    model: str | None = None,
-    host_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    api_key = _cfg("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OpenAI-compatible provider is selected but OPENAI_API_KEY is not configured.")
-
-    selected_model = _resolve_model(model)
-    timeout_seconds = _llm_request_timeout_seconds()
-    temperature = _llm_temperature()
-    top_p = _llm_top_p()
-    base_url = str(_cfg("OPENAI_BASE_URL", "https://integrate.api.nvidia.com")).rstrip("/")
-    path = str(_cfg("OPENAI_RESPONSES_PATH", "/v1/chat/completions") or "/v1/chat/completions")
-    if not path.startswith("/"):
-        path = f"/{path}"
-    endpoint = f"{base_url}{path}"
-    headers = {
-        "content-type": "application/json",
-        "authorization": f"Bearer {api_key}",
-    }
-    request_payload: dict[str, Any] = {
-        "model": selected_model,
-        "messages": [
-            {"role": "system", "content": _planner_system_prompt(context, host_session=host_session)},
-            {"role": "user", "content": _planner_user_prompt(prompt, context, host_session=host_session)},
-        ],
-        "stream": False,
-    }
-    if _openai_compatible_supports_sampling_controls(selected_model):
-        request_payload["temperature"] = temperature
-        request_payload["top_p"] = top_p
-    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
-    if response.status_code >= 400:
-        raise RuntimeError(f"AI endpoint rejected planner request ({endpoint}): {_extract_error_detail(response)}")
-    response.raise_for_status()
-    body = _parse_backend_json(response, endpoint)
-    choice = ((body.get("choices") or [{}])[0]) if isinstance(body.get("choices"), list) else {}
-    message = choice.get("message") or {}
-    return _parse_json_object_text(message.get("content"))
-
-
-def _anthropic_plan_prompt(
-    prompt: str,
-    context: dict[str, Any],
-    model: str | None = None,
-    host_session: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    api_key = _cfg("ANTHROPIC_API_KEY")
-    auth_token = _cfg("ANTHROPIC_AUTH_TOKEN")
-    if not api_key and not auth_token:
-        raise RuntimeError("Anthropic provider is selected but authentication is not configured.")
-
-    selected_model = _resolve_model(model)
-    timeout_seconds = _llm_request_timeout_seconds()
-    max_tokens = min(max(300, _llm_request_max_tokens()), 800)
-    temperature = _llm_temperature()
-    top_p = _llm_top_p()
-    base_url = str(_cfg("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).rstrip("/")
-    messages_path = str(_cfg("ANTHROPIC_MESSAGES_PATH", "/v1/messages") or "/v1/messages")
-    if not messages_path.startswith("/"):
-        messages_path = f"/{messages_path}"
-    endpoint = f"{base_url}{messages_path}"
-    headers = {"content-type": "application/json"}
-    if api_key:
-        headers["x-api-key"] = api_key
-    else:
-        headers["authorization"] = f"Bearer {auth_token}"
-    anthropic_version = _cfg("ANTHROPIC_VERSION", "2023-06-01")
-    if anthropic_version:
-        headers["anthropic-version"] = anthropic_version
-    beta_param = _normalize_beta_param(_cfg("ANTHROPIC_BETA"))
-    if beta_param:
-        headers["anthropic-beta"] = beta_param
-    request_payload = {
-        "model": selected_model,
-        "max_tokens": max_tokens,
-        "stream": False,
-        "temperature": temperature,
-        "top_p": top_p,
-        "system": _planner_system_prompt(context, host_session=host_session),
-        "messages": [{"role": "user", "content": _planner_user_prompt(prompt, context, host_session=host_session)}],
-    }
-    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
-    if response.status_code >= 400:
-        raise RuntimeError(f"AI endpoint rejected planner request ({endpoint}): {_extract_error_detail(response)}")
-    response.raise_for_status()
-    body = _parse_backend_json(response, endpoint)
-    text_chunks = [
-        block.get("text", "")
-        for block in (body.get("content") or [])
-        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
-    ]
-    return _parse_json_object_text("\n".join(text_chunks).strip())
-
-
-def parse_prompt_with_model(prompt: str, model: str | None = None) -> str:
-    if not _llm_chat_configured():
-        raise RuntimeError("AI provider is not configured for fallback parsing.")
-
-    provider = _provider_name()
-    if provider == "openai":
-        return _openai_parse_prompt(prompt, model=model)
-    if provider == "openai_compatible":
-        return _openai_compatible_parse_prompt(prompt, model=model)
-    return _anthropic_parse_prompt(prompt, model=model)
-
-
-def _parser_system_prompt() -> str:
-    return (
-        "You are a strict ERPNext JSON parser. "
-        "Return exactly one valid JSON object with no markdown fences, no commentary, and no surrounding prose. "
-        "Never invent document names, record identifiers, item codes, workflow actions, or ERP field values. "
-        "If details are missing or ambiguous, set needs_clarification=true instead of guessing."
-    )
-
-
-def _openai_parse_prompt(prompt: str, model: str | None = None) -> str:
-    api_key = _cfg("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OpenAI provider is selected but OPENAI_API_KEY is not configured.")
-
-    selected_model = _resolve_model(model)
-    timeout_seconds = _llm_request_timeout_seconds()
-    temperature = 0
-    base_url = str(_cfg("OPENAI_BASE_URL", "https://api.openai.com")).rstrip("/")
-    responses_path = str(_cfg("OPENAI_RESPONSES_PATH", DEFAULT_OPENAI_RESPONSES_PATH) or DEFAULT_OPENAI_RESPONSES_PATH)
-    if not responses_path.startswith("/"):
-        responses_path = f"/{responses_path}"
-    endpoint = f"{base_url}{responses_path}"
-    headers = {
-        "content-type": "application/json",
-        "authorization": f"Bearer {api_key}",
-    }
-    request_payload: dict[str, Any] = {
-        "model": selected_model,
-        "instructions": _parser_system_prompt(),
-        "input": [
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt}],
-            }
-        ],
-    }
-    if _openai_supports_sampling_controls(selected_model):
-        request_payload["temperature"] = temperature
-    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
-    if response.status_code >= 400:
-        raise RuntimeError(f"AI endpoint rejected parser request ({endpoint}): {_extract_error_detail(response)}")
-    response.raise_for_status()
-    body = _parse_backend_json(response, endpoint)
-    return _openai_output_text(body)
-
-
-def _openai_compatible_parse_prompt(prompt: str, model: str | None = None) -> str:
-    api_key = _cfg("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OpenAI-compatible provider is selected but OPENAI_API_KEY is not configured.")
-
-    selected_model = _resolve_model(model)
-    timeout_seconds = _llm_request_timeout_seconds()
-    base_url = str(_cfg("OPENAI_BASE_URL", "https://integrate.api.nvidia.com")).rstrip("/")
-    path = str(_cfg("OPENAI_RESPONSES_PATH", "/v1/chat/completions") or "/v1/chat/completions")
-    if not path.startswith("/"):
-        path = f"/{path}"
-    endpoint = f"{base_url}{path}"
-    headers = {
-        "content-type": "application/json",
-        "authorization": f"Bearer {api_key}",
-    }
-    request_payload: dict[str, Any] = {
-        "model": selected_model,
-        "messages": [
-            {"role": "system", "content": _parser_system_prompt()},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "temperature": 0,
-    }
-    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
-    if response.status_code >= 400:
-        raise RuntimeError(f"AI endpoint rejected parser request ({endpoint}): {_extract_error_detail(response)}")
-    response.raise_for_status()
-    body = _parse_backend_json(response, endpoint)
-    choice = ((body.get("choices") or [{}])[0]) if isinstance(body.get("choices"), list) else {}
-    message = choice.get("message") or {}
-    return str(message.get("content") or "")
-
-
-def _anthropic_parse_prompt(prompt: str, model: str | None = None) -> str:
-    api_key = _cfg("ANTHROPIC_API_KEY")
-    auth_token = _cfg("ANTHROPIC_AUTH_TOKEN")
-    if not api_key and not auth_token:
-        raise RuntimeError("Anthropic provider is selected but authentication is not configured.")
-
-    selected_model = _resolve_model(model)
-    timeout_seconds = _llm_request_timeout_seconds()
-    max_tokens = min(max(300, _llm_request_max_tokens()), 800)
-    base_url = str(_cfg("ANTHROPIC_BASE_URL", "https://api.anthropic.com")).rstrip("/")
-    messages_path = str(_cfg("ANTHROPIC_MESSAGES_PATH", "/v1/messages") or "/v1/messages")
-    if not messages_path.startswith("/"):
-        messages_path = f"/{messages_path}"
-    endpoint = f"{base_url}{messages_path}"
-    headers = {"content-type": "application/json"}
-    if api_key:
-        headers["x-api-key"] = api_key
-    else:
-        headers["authorization"] = f"Bearer {auth_token}"
-    anthropic_version = _cfg("ANTHROPIC_VERSION", "2023-06-01")
-    if anthropic_version:
-        headers["anthropic-version"] = anthropic_version
-    beta_param = _normalize_beta_param(_cfg("ANTHROPIC_BETA"))
-    if beta_param:
-        headers["anthropic-beta"] = beta_param
-    request_payload = {
-        "model": selected_model,
-        "max_tokens": max_tokens,
-        "stream": False,
-        "temperature": 0,
-        "system": _parser_system_prompt(),
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    response = requests.post(endpoint, headers=headers, json=request_payload, timeout=timeout_seconds)
-    if response.status_code >= 400:
-        raise RuntimeError(f"AI endpoint rejected parser request ({endpoint}): {_extract_error_detail(response)}")
-    response.raise_for_status()
-    body = _parse_backend_json(response, endpoint)
-    text_chunks = [
-        block.get("text", "")
-        for block in (body.get("content") or [])
-        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
-    ]
-    return "\n".join(text_chunks).strip()
 
 
 def _openai_chat(
@@ -2186,6 +2313,7 @@ def _openai_chat(
     if not responses_path.startswith("/"):
         responses_path = f"/{responses_path}"
     endpoint = f"{base_url}{responses_path}"
+    compat_profile = _provider_compatibility_profile("openai", base_url, responses_path, model=model)
 
     headers = {
         "content-type": "application/json",
@@ -2215,7 +2343,7 @@ def _openai_chat(
         }
         if tools_enabled:
             request_payload["tools"] = tool_specs
-        if _openai_supports_sampling_controls(model):
+        if not compat_profile.get("disable_sampling_by_default") and _openai_supports_sampling_controls(model):
             request_payload["temperature"] = temperature
             request_payload["top_p"] = top_p
         if previous_response_id:
@@ -2310,6 +2438,7 @@ def _openai_chat(
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input)
+                _validate_tool_result(tool_name, tool_result)
                 last_tool_name = tool_name
                 rendered_payload = tool_result
                 tool_events.append(f"{tool_name} {tool_input}")
@@ -2369,6 +2498,7 @@ def _openai_compatible_chat(
     if not path.startswith("/"):
         path = f"/{path}"
     endpoint = f"{base_url}{path}"
+    compat_profile = _provider_compatibility_profile("openai_compatible", base_url, path, model=model)
 
     headers = {
         "content-type": "application/json",
@@ -2383,11 +2513,12 @@ def _openai_compatible_chat(
     rendered_payload = None
     had_tool_calls = False
     verification_requested = False
-    disable_tool_choice = False
+    disable_tool_choice = bool(compat_profile.get("disable_tool_choice_by_default"))
     tools_enabled = bool(tool_specs)
     plain_text_retry_requested = False
     seen_tool_signatures: set[str] = set()
     last_tool_name: str | None = None
+    disable_sampling_controls = bool(compat_profile.get("disable_sampling_by_default"))
 
     for _round in range(max_tool_rounds):
         _progress_update(progress, stage="thinking", step="Thinking")
@@ -2401,7 +2532,7 @@ def _openai_compatible_chat(
             tool_choice = None if disable_tool_choice else _tool_choice_payload(force_tool_use, prompt, context, mode="openai")
             if tool_choice is not None:
                 request_payload["tool_choice"] = tool_choice
-        if _openai_compatible_supports_sampling_controls(model):
+        if not disable_sampling_controls and _openai_compatible_supports_sampling_controls(model):
             request_payload["temperature"] = temperature
             request_payload["top_p"] = top_p
 
@@ -2435,6 +2566,14 @@ def _openai_compatible_chat(
                     step="Compatible API rejected tool_choice schema; retrying with safer tool_choice",
                 )
                 continue
+            if _is_sampling_parameter_error(error_detail):
+                disable_sampling_controls = True
+                _progress_update(
+                    progress,
+                    stage="working",
+                    step="Compatible API rejected sampling controls; retrying without temperature/top_p",
+                )
+                continue
             if tools_enabled and _is_degraded_function_error(error_detail):
                 tools_enabled = False
                 force_tool_use = False
@@ -2451,7 +2590,7 @@ def _openai_compatible_chat(
         message = choice.get("message") or {}
         tool_calls = message.get("tool_calls") or []
         text_body = str(message.get("content") or "").strip()
-        if not tool_calls and text_body:
+        if not tool_calls and text_body and compat_profile.get("allow_textual_tool_fallback"):
             textual_tool_call = _extract_textual_tool_call(text_body)
             if textual_tool_call is not None:
                 tool_calls = [textual_tool_call]
@@ -2519,6 +2658,7 @@ def _openai_compatible_chat(
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input)
+                _validate_tool_result(tool_name, tool_result)
                 last_tool_name = tool_name
                 rendered_payload = tool_result
                 tool_events.append(f"{tool_name} {tool_input}")
@@ -2575,6 +2715,7 @@ def _anthropic_chat(
     messages_path = str(_cfg("ANTHROPIC_MESSAGES_PATH", "/v1/messages"))
     if not messages_path.startswith("/"):
         messages_path = f"/{messages_path}"
+    compat_profile = _provider_compatibility_profile("anthropic", base_url, messages_path, model=model)
     tool_choice_mode = _tool_choice_mode(base_url, messages_path)
 
     beta_param = _normalize_beta_param(_cfg("ANTHROPIC_BETA"))
@@ -2587,12 +2728,12 @@ def _anthropic_chat(
     elif auth_token:
         headers["authorization"] = f"Bearer {auth_token}"
     anthropic_version = _cfg("ANTHROPIC_VERSION", "2023-06-01")
-    if anthropic_version and tool_choice_mode == "anthropic":
+    if anthropic_version and compat_profile.get("profile") == "anthropic" and tool_choice_mode == "anthropic":
         headers["anthropic-version"] = anthropic_version
-    if beta_param and tool_choice_mode == "anthropic":
+    if beta_param and compat_profile.get("profile") == "anthropic" and tool_choice_mode == "anthropic":
         headers["anthropic-beta"] = beta_param
     tool_definitions = get_tool_definitions()
-    allowed_names = _selected_tool_names_for_prompt(prompt, context, set(tool_definitions))
+    allowed_names = _selected_tool_names_for_prompt(prompt, context, tool_definitions)
     tool_specs = [
         {
             "name": name,
@@ -2744,6 +2885,7 @@ def _anthropic_chat(
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input)
+                _validate_tool_result(tool_name, tool_result)
                 tool_events.append(f"{tool_name} {tool_input}")
                 rendered_payload = tool_result
                 tool_results.append(
@@ -2797,6 +2939,11 @@ def _is_degraded_function_error(detail: str) -> bool:
 
 def _is_tool_choice_schema_error(detail: str) -> bool:
     text = str(detail or "").lower()
+    if (
+        "tool_choice" in text
+        and "no endpoints found that support the provided 'tool_choice' value" in text
+    ):
+        return True
     required_fragments = (
         "tool_choice",
         "input should be 'auto', 'required' or 'none'",
@@ -2814,9 +2961,26 @@ def _is_tool_choice_function_none_error(detail: str) -> bool:
     )
 
 
+def _is_sampling_parameter_error(detail: str) -> bool:
+    text = str(detail or "").lower()
+    if not text:
+        return False
+    unsupported_markers = (
+        "temperature",
+        "top_p",
+        "unsupported parameter",
+        "extra inputs are not permitted",
+        "unknown field",
+        "unknown parameter",
+    )
+    return any(marker in text for marker in unsupported_markers) and (
+        "temperature" in text or "top_p" in text
+    )
+
+
 def _openai_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     tool_definitions = get_tool_definitions()
-    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, set(tool_definitions))
+    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, tool_definitions)
     specs = [
         {
             "type": "function",
@@ -2834,7 +2998,7 @@ def _openai_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) ->
 
 def _openai_compatible_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
     tool_definitions = get_tool_definitions()
-    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, set(tool_definitions))
+    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, tool_definitions)
     return [
         {
             "type": "function",
@@ -2966,11 +3130,73 @@ def _parse_openai_tool_arguments(arguments: Any) -> dict[str, Any]:
 
 def _extract_textual_tool_call(raw_text: Any) -> dict[str, Any] | None:
     text = str(raw_text or "").strip()
-    if not text or "{" not in text:
+    if not text:
+        return None
+
+    unescaped_text = html.unescape(text)
+
+    xml_tool_match = re.search(
+        r"<tool_call>\s*<function=(?P<name>[\w\.\-]+)>\s*(?P<body>[\s\S]*?)\s*</function>\s*</tool_call>",
+        unescaped_text,
+        re.IGNORECASE,
+    )
+    if xml_tool_match:
+        raw_name = str(xml_tool_match.group("name") or "").strip()
+        tool_name = raw_name.split(".")[-1] if raw_name else ""
+        normalized_name = TOOL_NAME_MAP.get(raw_name, TOOL_NAME_MAP.get(tool_name, tool_name))
+        arguments: dict[str, Any] = {}
+        body = str(xml_tool_match.group("body") or "")
+        for param_match in re.finditer(
+            r"<parameter=(?P<key>[\w\.\-]+)>\s*(?P<value>[\s\S]*?)\s*</parameter>",
+            body,
+            re.IGNORECASE,
+        ):
+            key = str(param_match.group("key") or "").strip()
+            raw_value = str(param_match.group("value") or "").strip()
+            if not key:
+                continue
+            parsed_value: Any = raw_value
+            if raw_value.startswith("{") or raw_value.startswith("["):
+                try:
+                    parsed_value = json.loads(raw_value)
+                except Exception:
+                    parsed_value = raw_value
+            arguments[key] = parsed_value
+        if normalized_name:
+            return {
+                "id": f"textual-{normalized_name}",
+                "type": "function",
+                "function": {
+                    "name": normalized_name,
+                    "arguments": json.dumps(arguments, default=str),
+                },
+            }
+
+    inline_tool_match = re.search(
+        r"<\|tool_call_begin\|>\s*(?P<name>[\w\.\-]+)(?::\d+)?\s*<\|tool_call_argument_begin\|>\s*(?P<args>\{[\s\S]*?\})\s*<\|tool_call_end\|>",
+        unescaped_text,
+        re.IGNORECASE,
+    )
+    if inline_tool_match:
+        raw_name = str(inline_tool_match.group("name") or "").strip()
+        tool_name = raw_name.split(".")[-1] if raw_name else ""
+        normalized_name = TOOL_NAME_MAP.get(raw_name, TOOL_NAME_MAP.get(tool_name, tool_name))
+        arguments = _parse_openai_tool_arguments(inline_tool_match.group("args"))
+        if normalized_name:
+            return {
+                "id": f"textual-{normalized_name}",
+                "type": "function",
+                "function": {
+                    "name": normalized_name,
+                    "arguments": json.dumps(arguments, default=str),
+                },
+            }
+
+    if "{" not in unescaped_text:
         return None
 
     try:
-        payload = _parse_json_object_text(text)
+        payload = _parse_json_object_text(unescaped_text)
     except Exception:
         return None
 
@@ -3473,6 +3699,58 @@ def _run_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
 
 def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
     return f"{str(tool_name or '').strip()}::{json.dumps(arguments or {}, sort_keys=True, default=str)}"
+
+
+def _document_name_from_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    name = str(payload.get("name") or payload.get("docname") or "").strip()
+    if name:
+        return name
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return str(data.get("name") or data.get("docname") or "").strip()
+    result = payload.get("result")
+    if isinstance(result, dict):
+        return str(result.get("name") or result.get("docname") or "").strip()
+    return ""
+
+
+def _validate_tool_result(tool_name: str, payload: Any) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    if payload.get("success") is False:
+        message = str(payload.get("error") or payload.get("message") or "Tool returned success=false.").strip()
+        raise RuntimeError(message)
+
+    normalized = str(tool_name or "").strip().lower()
+    if normalized == "create_document":
+        if not _document_name_from_payload(payload):
+            raise RuntimeError("FAC did not confirm the created document name.")
+    elif normalized == "create_report":
+        report_name = str(payload.get("name") or "").strip()
+        report_type = str(payload.get("report_type") or "").strip()
+        if not report_name:
+            raise RuntimeError("FAC did not confirm the created report name.")
+        if not report_type:
+            raise RuntimeError("FAC did not confirm the created report type.")
+        if report_type == "Query Report" and not bool(payload.get("has_query")):
+            raise RuntimeError("FAC created the report record but did not confirm a query definition.")
+        if report_type == "Script Report" and not bool(payload.get("has_script")):
+            raise RuntimeError("FAC created the report record but did not confirm a script definition.")
+    elif normalized == "update_report":
+        report_name = str(payload.get("name") or "").strip()
+        updated_parts = payload.get("updated_parts")
+        if not report_name:
+            raise RuntimeError("FAC did not confirm the updated report name.")
+        if not isinstance(updated_parts, list) or not updated_parts:
+            raise RuntimeError("FAC did not confirm which report parts were updated.")
+    elif normalized in {"export_report", "export_doctype_records"}:
+        file_url = str(payload.get("file_url") or "").strip()
+        file_name = str(payload.get("file_name") or "").strip()
+        if not file_url or not file_name:
+            raise RuntimeError("FAC did not return a downloadable export file.")
 
 
 def _render_provider_tool_output(tool_name: str | None, payload: Any) -> str:

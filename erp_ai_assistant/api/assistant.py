@@ -27,8 +27,6 @@ from .erp_tools import get_doctype_fields as get_doctype_fields_tool
 from .erp_tools import describe_erp_schema as describe_erp_schema_tool
 from .file_tools import export_doctype_list_excel as export_doctype_list_excel_tool
 from .fac_client import test_fac_connection as test_fac_connection_internal
-from .host_runtime import get_host_capabilities as get_host_capabilities_internal, build_host_session
-from .planner import classify_prompt as classify_prompt_tool
 from .resource_registry import get_resource_catalog_summary, list_resource_specs, read_resource
 from .tool_registry import get_tool_catalog_summary, list_tool_specs
 
@@ -114,35 +112,8 @@ def _build_tool_event_payload(result: dict[str, Any]) -> list[dict[str, Any] | s
     return events
 
 
-def _planner_event(planner_result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "type": "planner",
-        "intent": planner_result.get("intent"),
-        "confidence": planner_result.get("confidence"),
-        "source": planner_result.get("source"),
-        "route_target": planner_result.get("route_target"),
-        "recommended_tools": planner_result.get("tool_names") or [],
-        "recommended_resources": planner_result.get("resource_names") or [],
-        "reason": planner_result.get("reason"),
-    }
-
-
-def _host_event(host_session: dict[str, Any]) -> dict[str, Any]:
-    planner = host_session.get("planner") or {}
-    resources = host_session.get("recommended_resources") or {}
-    return {
-        "type": "host",
-        "route_target": host_session.get("route_target"),
-        "pending_action": bool(host_session.get("pending_action")),
-        "recommended_tools": [str(row.get("name") or "").strip() for row in (host_session.get("recommended_tools") or []) if row.get("name")],
-        "recommended_resources": list(resources.keys())[:6],
-        "planner_intent": planner.get("intent"),
-    }
-
-
 def _should_override_pending_action(
     prompt_text: str,
-    planner_result: dict[str, Any],
     pending_action: dict[str, Any] | None,
 ) -> bool:
     if not isinstance(pending_action, dict) or not pending_action:
@@ -160,21 +131,7 @@ def _should_override_pending_action(
     )
     if any(text.startswith(marker) for marker in override_markers):
         return True
-    intent = str(planner_result.get("intent") or "").strip().lower()
-    if intent in {"export", "workflow", "read", "guide", "answer", "general_chat"}:
-        return True
     return False
-
-
-def _should_defer_routed_result_to_llm(result: dict[str, Any] | None) -> bool:
-    if not isinstance(result, dict) or not result:
-        return False
-    if not result.get("matched"):
-        return False
-    if result.get("ok"):
-        return False
-    result_type = str(result.get("type") or "").strip().lower()
-    return result_type in {"clarification", "router"}
 
 
 @frappe.whitelist()
@@ -272,34 +229,168 @@ def export_doctype_list_excel(
 
 
 @frappe.whitelist()
-def classify_prompt(prompt: str, context: dict[str, Any] | str | None = None) -> dict[str, Any]:
-    return classify_prompt_tool(prompt=prompt, context=context)
-
-
-@frappe.whitelist()
-def get_host_capabilities() -> dict[str, Any]:
-    return get_host_capabilities_internal()
-
-
-@frappe.whitelist()
 def test_fac_mcp_connection() -> dict[str, Any]:
     return test_fac_connection_internal()
 
 
 @frappe.whitelist()
-def preview_host_session(
-    prompt: str,
-    conversation: str | None = None,
-    doctype: str | None = None,
-    docname: str | None = None,
-    route: str | None = None,
-) -> dict[str, Any]:
-    context = build_request_context(doctype=doctype, docname=docname, route=route, user=frappe.session.user)
-    return {
-        "ok": True,
-        "type": "host_session",
-        "session": build_host_session(prompt, context, conversation=conversation),
+def test_ai_provider_connection(model: str | None = None) -> dict[str, Any]:
+    provider = ai_api._provider_name()
+    selected_model = ai_api._resolve_model(model)
+
+    if provider in {"openai", "openai_compatible"}:
+        api_key = str(ai_api._cfg("OPENAI_API_KEY", "") or "").strip()
+        base_url = str(
+            ai_api._cfg(
+                "OPENAI_BASE_URL",
+                "https://api.openai.com" if provider == "openai" else "https://integrate.api.nvidia.com",
+            )
+            or ""
+        ).rstrip("/")
+        path = str(
+            ai_api._cfg(
+                "OPENAI_RESPONSES_PATH",
+                ai_api.DEFAULT_OPENAI_RESPONSES_PATH if provider == "openai" else "/v1/chat/completions",
+            )
+            or ""
+        )
+        if not path.startswith("/"):
+            path = f"/{path}"
+        endpoint = f"{base_url}{path}"
+        compat_profile = ai_api._provider_compatibility_profile(provider, base_url, path, model=selected_model)
+        if not api_key:
+            return {
+                "ok": False,
+                "provider": provider,
+                "profile": compat_profile.get("profile"),
+                "model": selected_model,
+                "endpoint": endpoint,
+                "has_api_key": False,
+                "message": "OPENAI_API_KEY is not configured.",
+            }
+
+        headers = {
+            "content-type": "application/json",
+            "authorization": f"Bearer {api_key}",
+        }
+        payload = {
+            "model": selected_model,
+            "messages": [{"role": "user", "content": "Reply with OK only."}],
+            "stream": False,
+        }
+        if provider == "openai":
+            payload = {
+                "model": selected_model,
+                "instructions": "Reply with OK only.",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "Ping"}]}],
+            }
+        try:
+            response = ai_api.requests.post(
+                endpoint,
+                headers=headers,
+                json=payload,
+                timeout=ai_api._llm_request_timeout_seconds(),
+            )
+            detail = ai_api._extract_error_detail(response) if response.status_code >= 400 else ""
+            response.raise_for_status()
+            body = ai_api._parse_backend_json(response, endpoint)
+            text = ai_api._openai_output_text(body) if provider == "openai" else str((((body.get("choices") or [{}])[0]).get("message") or {}).get("content") or "").strip()
+            return {
+                "ok": True,
+                "provider": provider,
+                "profile": compat_profile.get("profile"),
+                "model": selected_model,
+                "endpoint": endpoint,
+                "has_api_key": True,
+                "message": "AI provider connection succeeded.",
+                "preview": text[:200],
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "provider": provider,
+                "profile": compat_profile.get("profile"),
+                "model": selected_model,
+                "endpoint": endpoint,
+                "has_api_key": True,
+                "message": str(exc) or "AI provider connection failed.",
+                "detail": detail if 'detail' in locals() else "",
+            }
+
+    api_key = str(ai_api._cfg("ANTHROPIC_API_KEY", "") or "").strip()
+    auth_token = str(ai_api._cfg("ANTHROPIC_AUTH_TOKEN", "") or "").strip()
+    base_url = str(ai_api._cfg("ANTHROPIC_BASE_URL", "https://api.anthropic.com") or "").rstrip("/")
+    path = str(ai_api._cfg("ANTHROPIC_MESSAGES_PATH", "/v1/messages") or "/v1/messages")
+    if not path.startswith("/"):
+        path = f"/{path}"
+    endpoint = f"{base_url}{path}"
+    compat_profile = ai_api._provider_compatibility_profile(provider, base_url, path, model=selected_model)
+    if not api_key and not auth_token:
+        return {
+            "ok": False,
+            "provider": provider,
+            "profile": compat_profile.get("profile"),
+            "model": selected_model,
+            "endpoint": endpoint,
+            "has_api_key": False,
+            "message": "Anthropic authentication is not configured.",
+        }
+
+    headers = {"content-type": "application/json"}
+    if api_key:
+        headers["x-api-key"] = api_key
+    else:
+        headers["authorization"] = f"Bearer {auth_token}"
+    anthropic_version = ai_api._cfg("ANTHROPIC_VERSION", "2023-06-01")
+    if anthropic_version:
+        headers["anthropic-version"] = anthropic_version
+    beta_param = ai_api._normalize_beta_param(ai_api._cfg("ANTHROPIC_BETA"))
+    if beta_param:
+        headers["anthropic-beta"] = beta_param
+
+    payload = {
+        "model": selected_model,
+        "max_tokens": 32,
+        "stream": False,
+        "system": "Reply with OK only.",
+        "messages": [{"role": "user", "content": "Ping"}],
     }
+    try:
+        response = ai_api.requests.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+            timeout=ai_api._llm_request_timeout_seconds(),
+        )
+        detail = ai_api._extract_error_detail(response) if response.status_code >= 400 else ""
+        response.raise_for_status()
+        body = ai_api._parse_backend_json(response, endpoint)
+        text_chunks = [
+            block.get("text", "")
+            for block in (body.get("content") or [])
+            if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+        ]
+        return {
+            "ok": True,
+            "provider": provider,
+            "profile": compat_profile.get("profile"),
+            "model": selected_model,
+            "endpoint": endpoint,
+            "has_api_key": True,
+            "message": "AI provider connection succeeded.",
+            "preview": "\n".join(text_chunks).strip()[:200],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "provider": provider,
+            "profile": compat_profile.get("profile"),
+            "model": selected_model,
+            "endpoint": endpoint,
+            "has_api_key": True,
+            "message": str(exc) or "AI provider connection failed.",
+            "detail": detail if 'detail' in locals() else "",
+        }
 
 
 @frappe.whitelist()
@@ -372,7 +463,7 @@ def handle_prompt(
     parsed_images = ai_api._parse_prompt_images(images)
 
     if parsed_images:
-        return ai_api.send_prompt(
+        return ai_api.enqueue_prompt(
             prompt=prompt,
             conversation=conversation,
             doctype=doctype,
@@ -384,14 +475,6 @@ def handle_prompt(
 
     conversation_name = conversation or None
     context = build_request_context(doctype=doctype, docname=docname, route=route, user=frappe.session.user)
-    planner_result = {
-        "intent": "unknown",
-        "confidence": 0.0,
-        "should_route": False,
-        "normalized_prompt": prompt_text,
-        "route_target": "provider_chat",
-        "source": "fac_tools_first",
-    }
     resumed = None
     pending_action = get_pending_action(conversation_name) if conversation_name and prompt_text else None
     if conversation_name and prompt_text:
@@ -399,7 +482,7 @@ def handle_prompt(
         if lowered in {"cancel", "cancel that", "never mind", "forget it", "stop"}:
             clear_pending_action(conversation_name)
             pending_action = None
-        elif _should_override_pending_action(prompt_text, planner_result, pending_action):
+        elif _should_override_pending_action(prompt_text, pending_action):
             clear_pending_action(conversation_name)
             pending_action = None
         else:
@@ -408,12 +491,9 @@ def handle_prompt(
                 resumed["matched"] = True
                 resumed["action"] = str(resumed.get("action") or "continue_pending_action").strip()
 
-    host_turn = {"matched": False, "result": {"matched": False}, "session": {"planner": planner_result, "route_target": "provider_chat"}}
     routed = resumed or {"matched": False}
-    if _should_defer_routed_result_to_llm(routed):
-        routed = {"matched": False}
     if not routed.get("matched"):
-        return ai_api.send_prompt(
+        return ai_api.enqueue_prompt(
             prompt=prompt,
             conversation=conversation,
             doctype=doctype,
@@ -440,7 +520,7 @@ def handle_prompt(
         conversation_name,
         "assistant",
         reply_text,
-        tool_events=json.dumps([_planner_event(planner_result), _host_event(host_turn.get("session") or {})] + _build_tool_event_payload(routed), default=str),
+        tool_events=json.dumps(_build_tool_event_payload(routed), default=str),
         attachments_json=json.dumps(attachments, default=str),
     )
     if routed.get("pending_action"):
@@ -450,10 +530,9 @@ def handle_prompt(
     return {
         "conversation": conversation_name,
         "reply": reply_text,
-        "tool_events": [_planner_event(planner_result), _host_event(host_turn.get("session") or {})] + _build_tool_event_payload(routed),
+        "tool_events": _build_tool_event_payload(routed),
         "payload": routed,
         "attachments": attachments,
         "context": context,
-        "host_session": host_turn.get("session"),
         "message_name": assistant_message.get("name"),
     }

@@ -1,4 +1,12 @@
 (function () {
+  function shouldShowToolActivity() {
+    try {
+      return window.localStorage?.getItem("erp_ai_assistant_debug_tools") === "1";
+    } catch (error) {
+      return false;
+    }
+  }
+
   function safeHtml(value) {
     return String(value || "")
       .replace(/&/g, "&amp;")
@@ -54,13 +62,13 @@
     const tokens = [];
     let value = String(text || "");
 
-    value = value.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+|data:image\/[^\s)]+)\)/g, (_, alt, url) => {
+    value = value.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/)[^\s)]+|data:image\/[^\s)]+)\)/g, (_, alt, url) => {
       const token = `__ERP_WEB_INLINE_${tokens.length}__`;
       tokens.push(renderInlineImage(url, alt));
       return token;
     });
 
-    value = value.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => {
+    value = value.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, (_, label, url) => {
       const token = `__ERP_WEB_INLINE_${tokens.length}__`;
       tokens.push(renderAnchor(url, label));
       return token;
@@ -310,6 +318,7 @@
   }
 
   function renderToolEvents(raw) {
+    if (!shouldShowToolActivity()) return "";
     const events = parseToolEvents(raw);
     if (!events.length) return "";
     const textEvents = events.filter((item) => typeof item === "string" && String(item || "").trim());
@@ -526,17 +535,16 @@
               )
               : undefined,
           },
-          callback: () => {
-            this.stopProgressPolling();
-            this.loadConversation(conversationName);
-            this.loadHistory();
+          callback: (response) => {
+            const payload = response?.message || {};
+            if (payload.queued) {
+              return;
+            }
+            this.finishPromptRun(conversationName);
           },
           error: (err) => {
-            this.stopProgressPolling();
+            this.finishPromptRun(null, { keepMessages: true });
             this.renderSystemMessage(err.message || "Request failed");
-          },
-          always: () => {
-            this.stopProgressPolling();
           },
         });
       });
@@ -699,6 +707,15 @@
             const progress = response?.message || {};
             const steps = Array.isArray(progress.steps) ? progress.steps : [];
             this.showProgress(steps, progress.partial_text || "");
+            if (progress.done) {
+              this.stopProgressPolling();
+              if (progress.error) {
+                this.finishPromptRun(null, { keepMessages: true });
+                this.renderSystemMessage(progress.error || "Request failed");
+                return;
+              }
+              this.finishPromptRun(conversationName);
+            }
           },
           always: () => {
             this.progressPollPending = false;
@@ -762,6 +779,19 @@
 
     hideProgress() {
       this.el.messages.querySelector(".erp-web-assistant__msg.is-progress")?.remove();
+    }
+
+    finishPromptRun(conversationName, options) {
+      const settings = options || {};
+      this.stopProgressPolling();
+      if (conversationName) {
+        this.loadConversation(conversationName);
+        this.loadHistory();
+        return;
+      }
+      if (!settings.keepMessages) {
+        this.loadHistory();
+      }
     }
   }
 

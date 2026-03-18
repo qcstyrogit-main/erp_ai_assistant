@@ -1,39 +1,56 @@
 {
-  "doctype": "DocType",
-  "name": "AI Conversation",
-  "module": "ERP AI Assistant",
-  "custom": 0,
-  "istable": 0,
-  "track_changes": 1,
-  "autoname": "hash",
-  "fields": [
-    {
-      "fieldname": "title",
-      "fieldtype": "Data",
-      "label": "Title",
-      "reqd": 1
-    },
-    {
-      "fieldname": "status",
-      "fieldtype": "Select",
-      "label": "Status",
-      "options": "Open\nArchived",
-      "default": "Open"
-    },
-    {
-      "fieldname": "is_pinned",
-      "fieldtype": "Check",
-      "label": "Pinned",
-      "default": "0"
-    }
-  ],
-  "permissions": [
-    {
-      "role": "System Manager",
-      "read": 1,
-      "write": 1,
-      "create": 1,
-      "delete": 1
-    }
-  ]
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-03-10 09:44:10.672074",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "title",
+  "status",
+  "is_pinned"
+ ],
+ "fields": [
+  {
+   "fieldname": "title",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Title",
+   "length": 999,
+   "reqd": 1
+  },
+  {
+   "default": "Open",
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Open\nArchived"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_pinned",
+   "fieldtype": "Check",
+   "label": "Pinned"
+  }
+ ],
+ "links": [],
+ "modified": "2026-03-18 14:45:28.962618",
+ "modified_by": "Administrator",
+ "module": "ERP AI Assistant",
+ "name": "AI Conversation",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
 }
