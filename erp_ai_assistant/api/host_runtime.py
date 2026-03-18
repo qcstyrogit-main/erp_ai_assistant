@@ -5,7 +5,6 @@ from .context_resolver import normalize_context_payload
 from .planner import classify_prompt_internal
 from .resource_registry import get_resource_catalog_summary, read_resource
 from .tool_registry import get_tool_catalog_summary, list_tool_specs
-from .tool_router import route_prompt_pipeline
 
 
 def _resource_arguments(name: str, context: dict[str, Any], conversation: str | None = None) -> dict[str, Any]:
@@ -69,34 +68,6 @@ def build_host_session(
         "recommended_resources": resources,
         "route_target": str(plan.get("route_target") or "").strip() or "provider_chat",
     }
-
-
-def execute_host_turn(
-    prompt: str,
-    context: dict[str, Any] | str | None = None,
-    *,
-    conversation: str | None = None,
-    planner_result: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    session = build_host_session(
-        prompt,
-        context,
-        conversation=conversation,
-        planner_result=planner_result,
-    )
-    should_route = bool(session["pending_action"]) or session["route_target"] == "deterministic_router"
-    routed = route_prompt_pipeline(
-        prompt,
-        context=session["context"],
-        planner_result=session["planner"],
-    ) if should_route else {"matched": False}
-    return {
-        "matched": bool((routed or {}).get("matched")),
-        "result": routed,
-        "session": session,
-    }
-
-
 def get_host_capabilities() -> dict[str, Any]:
     return {
         "ok": True,

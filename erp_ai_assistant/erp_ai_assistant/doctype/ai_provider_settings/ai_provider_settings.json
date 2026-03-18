@@ -121,6 +121,31 @@
       "description": "Array of MCP tool specs. Leave empty unless OpenAI MCP is enabled."
     },
     {
+      "fieldname": "fac_mcp_section",
+      "fieldtype": "Section Break",
+      "label": "FAC MCP Server"
+    },
+    {
+      "fieldname": "fac_mcp_url",
+      "fieldtype": "Data",
+      "label": "FAC MCP URL",
+      "default": "http://qc-styro.local:8000/api/method/frappe_assistant_core.api.fac_endpoint.handle_mcp",
+      "description": "Remote FAC/MCP endpoint used by ERP AI Assistant to discover and execute ERP tools."
+    },
+    {
+      "fieldname": "fac_mcp_authorization",
+      "fieldtype": "Password",
+      "label": "FAC MCP Authorization",
+      "description": "Optional Authorization header value sent to the FAC MCP endpoint, for example: Bearer <token>."
+    },
+    {
+      "fieldname": "fac_mcp_timeout",
+      "fieldtype": "Float",
+      "label": "FAC MCP Timeout (Seconds)",
+      "default": "30",
+      "description": "HTTP timeout in seconds for FAC MCP requests."
+    },
+    {
       "fieldname": "anthropic_section",
       "fieldtype": "Section Break",
       "label": "Anthropic",

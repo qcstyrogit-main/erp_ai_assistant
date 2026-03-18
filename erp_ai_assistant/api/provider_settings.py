@@ -10,6 +10,7 @@ PASSWORD_FIELDS = {
     "openai_api_key",
     "anthropic_api_key",
     "anthropic_auth_token",
+    "fac_mcp_authorization",
 }
 
 SETTING_KEY_MAP = {
@@ -28,6 +29,9 @@ SETTING_KEY_MAP = {
     "ERP_AI_OPENAI_RESPONSES_PATH": "openai_responses_path",
     "ERP_AI_OPENAI_MCP_ENABLED": "enable_openai_mcp",
     "ERP_AI_OPENAI_MCP_SERVERS": "openai_mcp_servers_json",
+    "ERP_AI_FAC_MCP_URL": "fac_mcp_url",
+    "ERP_AI_FAC_MCP_AUTHORIZATION": "fac_mcp_authorization",
+    "ERP_AI_FAC_MCP_TIMEOUT": "fac_mcp_timeout",
     "ANTHROPIC_API_KEY": "anthropic_api_key",
     "ERP_AI_ANTHROPIC_API_KEY": "anthropic_api_key",
     "ANTHROPIC_AUTH_TOKEN": "anthropic_auth_token",

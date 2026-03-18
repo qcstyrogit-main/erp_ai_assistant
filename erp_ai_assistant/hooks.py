@@ -27,6 +27,7 @@ add_to_apps_screen = [
 
 doctype_js = {
     "AI Conversation": "public/js/ai_conversation.js",
+    "AI Provider Settings": "public/js/ai_provider_settings.js",
 }
 
 permission_query_conditions = {}

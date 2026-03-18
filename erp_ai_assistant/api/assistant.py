@@ -26,13 +26,11 @@ from .erp_tools import update_erp_document as update_erp_document_tool
 from .erp_tools import get_doctype_fields as get_doctype_fields_tool
 from .erp_tools import describe_erp_schema as describe_erp_schema_tool
 from .file_tools import export_doctype_list_excel as export_doctype_list_excel_tool
-from .file_tools import export_employee_list_excel as export_employee_list_excel_tool
-from .file_tools import generate_document_pdf as generate_document_pdf_tool
-from .host_runtime import execute_host_turn, get_host_capabilities as get_host_capabilities_internal, build_host_session
+from .fac_client import test_fac_connection as test_fac_connection_internal
+from .host_runtime import get_host_capabilities as get_host_capabilities_internal, build_host_session
 from .planner import classify_prompt as classify_prompt_tool
 from .resource_registry import get_resource_catalog_summary, list_resource_specs, read_resource
 from .tool_registry import get_tool_catalog_summary, list_tool_specs
-from .tool_router import route_prompt_pipeline
 
 
 def _build_router_attachment_package(result: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +166,17 @@ def _should_override_pending_action(
     return False
 
 
+def _should_defer_routed_result_to_llm(result: dict[str, Any] | None) -> bool:
+    if not isinstance(result, dict) or not result:
+        return False
+    if not result.get("matched"):
+        return False
+    if result.get("ok"):
+        return False
+    result_type = str(result.get("type") or "").strip().lower()
+    return result_type in {"clarification", "router"}
+
+
 @frappe.whitelist()
 def ping_assistant() -> dict[str, Any]:
     return ping_assistant_tool()
@@ -273,6 +282,11 @@ def get_host_capabilities() -> dict[str, Any]:
 
 
 @frappe.whitelist()
+def test_fac_mcp_connection() -> dict[str, Any]:
+    return test_fac_connection_internal()
+
+
+@frappe.whitelist()
 def preview_host_session(
     prompt: str,
     conversation: str | None = None,
@@ -370,11 +384,13 @@ def handle_prompt(
 
     conversation_name = conversation or None
     context = build_request_context(doctype=doctype, docname=docname, route=route, user=frappe.session.user)
-    planner_result = classify_prompt_tool(prompt_text, context=context) if prompt_text else {
+    planner_result = {
         "intent": "unknown",
         "confidence": 0.0,
         "should_route": False,
         "normalized_prompt": prompt_text,
+        "route_target": "provider_chat",
+        "source": "fac_tools_first",
     }
     resumed = None
     pending_action = get_pending_action(conversation_name) if conversation_name and prompt_text else None
@@ -392,40 +408,10 @@ def handle_prompt(
                 resumed["matched"] = True
                 resumed["action"] = str(resumed.get("action") or "continue_pending_action").strip()
 
-    host_turn = execute_host_turn(
-        prompt_text,
-        context=context,
-        conversation=conversation_name,
-        planner_result=planner_result,
-    ) if prompt_text else {"matched": False, "result": {"matched": False}, "session": {"planner": planner_result, "route_target": "provider_chat"}}
-    host_result = host_turn.get("result") or {"matched": False}
-    routed = resumed or (host_result if host_turn.get("matched") else {"matched": False})
-    if not routed.get("matched") and isinstance(pending_action, dict) and pending_action:
-        missing_fields = pending_action.get("missing_fields") or []
-        missing_child_rows = pending_action.get("missing_child_rows") or []
-        if missing_fields:
-            labels = ", ".join(str(row.get("label") or row.get("fieldname") or "").strip() for row in missing_fields[:4])
-            routed = {
-                "ok": False,
-                "matched": True,
-                "type": "router",
-                "action": "continue_pending_action",
-                "message": f"I still need: {labels}. You can reply with just the value if only one field is missing, or use `field value` format.",
-                "pending_action": pending_action,
-                "error_type": "missing_fields",
-                "missing_fields": missing_fields,
-            }
-        elif missing_child_rows:
-            routed = {
-                "ok": False,
-                "matched": True,
-                "type": "router",
-                "action": "continue_pending_action",
-                "message": "I still need the incomplete child row fields. Reply like `items row 1 qty 2 rate 100`.",
-                "pending_action": pending_action,
-                "error_type": "missing_child_rows",
-                "missing_child_rows": missing_child_rows,
-            }
+    host_turn = {"matched": False, "result": {"matched": False}, "session": {"planner": planner_result, "route_target": "provider_chat"}}
+    routed = resumed or {"matched": False}
+    if _should_defer_routed_result_to_llm(routed):
+        routed = {"matched": False}
     if not routed.get("matched"):
         return ai_api.send_prompt(
             prompt=prompt,

@@ -1,70 +1,49 @@
 # ERP AI Assistant
 
-Installable Frappe/ERPNext app that adds a Claude Desktop-style assistant inside ERPNext.
-
-It includes:
-- a Desk floating assistant bubble
-- a Desk workspace entry
-- a web assistant page
-- conversation and message DocTypes
-- natural-language ERP routing
-- internal tool and resource registries
-- Excel/PDF export support
-- optional provider-backed chat and planning
+Installable Frappe/ERPNext app that adds an assistant UI inside ERPNext and runs it in a FAC-native way.
 
 ## What It Is
 
-This app is no longer just a chat frontend.
+This app is now designed to work with Frappe Assistant Core (FAC) as the primary tool backend.
 
-It now behaves like a small assistant host inside ERPNext:
-- user prompt enters the assistant UI
-- planner classifies the request
-- parser/router resolves ERP intent and context
-- tool registry exposes safe ERP/file actions
-- resource registry exposes ERP context and metadata
-- deterministic ERP execution runs when appropriate
-- provider-backed chat can handle general conversation or broader planning
+Current runtime behavior:
+- assistant prompt goes to the configured model provider
+- FAC provides the live tool catalog for the session
+- FAC executes tools directly
+- same-site FAC registry is the primary path
+- remote MCP is optional fallback only
 
-That makes the app much closer to a Claude Desktop-style architecture:
-- discoverable tools
-- discoverable resources
-- planner-driven routing
-- safe execution inside ERPNext
+This means the assistant should use the tools FAC actually exposes, not a static hardcoded tool list.
 
 ## Main Capabilities
 
-- Chat in Desk and web
-- General chat when an AI provider is configured
-- Deterministic ERP read/list/search/count prompts
-- Draft document creation for common ERP transactions
-- Generic metadata-aware create/update flows
-- Workflow actions like submit/cancel/approve
-- Excel exports with user-requested fields
-- Human-readable Excel column labels
-- PDF generation for ERP documents
-- Pending-action continuation in chat
-- Tool catalog and resource catalog inspection
+- Desk floating assistant bubble
+- Desk workspace entry
+- website assistant page
+- conversation and message DocTypes
+- provider-backed chat with FAC tool calling
+- FAC connection test from `AI Provider Settings`
+- optional remote MCP configuration
+- export/file artifact support when FAC or app tools expose it
 
-## Current Assistant Flow
+## FAC-Native Flow
 
-The current backend shape is:
+Normal assistant execution is now:
 
 `User Prompt`
--> `Normalizer`
--> `Planner`
--> `Parser`
--> `Context Resolver`
--> `Clarification / Pending Action Logic`
--> `Tool Router`
--> `ERP Tools / File Tools`
--> `Structured Assistant Response`
+-> `Provider Chat`
+-> `FAC Tool Discovery`
+-> `FAC Tool Execution`
+-> `Assistant Response`
 
-There are now two important internal registries:
+Important notes:
+- the assistant is FAC-native at runtime
+- it uses the local FAC registry first when FAC is installed on the same site
+- it does not rely on the old deterministic parser/router as the normal prompt path
+- actual assistant capability depends on the tools FAC exposes
 
-- `tool_registry.py`
-  Exposes assistant actions like create, update, export, schema lookup, workflow, report execution, and generic document tools.
-- `resource_registry.py`
-  Exposes assistant-readable context like current document, doctype schema, available doctypes, current page context, and pending assistant action.
+Example:
+- if FAC does not expose `update_document`, the assistant should not pretend it can update documents
 
 ## App Name
 
@@ -89,8 +68,40 @@ If the app is already present in your bench, skip `get-app`.
 
 - Desk bubble loads automatically from `hooks.py`
 - Desk workspace route: `/app/assistant-workspace`
-- Website route: `/assistant`
-- Configure provider credentials in `AI Provider Settings`
+- website route: `/assistant`
+- configure provider credentials in `AI Provider Settings`
+
+## AI Provider Settings
+
+Open `AI Provider Settings` and configure:
+- provider
+- model
+- provider base URL / path if using OpenAI-compatible APIs
+
+FAC-related fields:
+- `FAC MCP URL`
+- `FAC MCP Authorization`
+- `FAC MCP Timeout (Seconds)`
+
+Important:
+- if FAC is installed on the same ERP site, the assistant will prefer the local FAC registry
+- manual FAC MCP authorization is not required for the local same-site path
+- remote MCP settings are mainly for fallback or external FAC servers
+
+## Test FAC Connection
+
+`AI Provider Settings` includes a `Test MCP Connection` button.
+
+What it verifies:
+- whether local FAC registry is available
+- whether remote MCP fallback is reachable
+- current tool count
+- currently exposed tool names
+
+Expected good result for same-site FAC:
+- connected
+- mode is effectively local FAC registry
+- no manual authorization required
 
 ## Example Prompts
 
@@ -101,22 +112,30 @@ Read and search:
 - `list available tools`
 - `list available resources`
 
-Create and update:
+Create and workflow:
 - `create customer with customer name Aqua Flask`
 - `create new employee with name Juan Dela Cruz`
-- `update employee Macdenver Magbojos birthday to April 30, 1993`
 - `create sales order for customer ABC with items ITEM-001 qty 2`
+- `submit sales order SO-0001`
+- `cancel sales invoice SINV-0001`
+- `approve leave application HR-LAP-0001`
 
 Exports:
 - `export employee list to excel`
 - `export employee list to excel with fields employee id, employee name, department`
-- `export sales invoices for customer ANICA to excel with fields sales invoice id, customer, posting date, grand total`
 - `generate pdf for sales invoice SINV-0001`
 
-Workflow:
-- `submit sales order SO-0001`
-- `cancel sales invoice SINV-0001`
-- `approve leave application HR-LAP-0001`
+## Important Limitation
+
+The assistant can only do what FAC exposes.
+
+If your FAC tool catalog does not expose a tool such as `update_document`, then prompts like:
+
+`Update employee Macdenver Conti Magbojos birthday to April 30, 1993`
+
+may still not complete as a real update.
+
+That is a FAC capability issue, not an ERP AI Assistant connection issue.
 
 ## Public API Endpoints
 
@@ -129,25 +148,12 @@ Assistant:
 - `erp_ai_assistant.api.assistant.list_available_resources`
 - `erp_ai_assistant.api.assistant.get_resource_catalog`
 - `erp_ai_assistant.api.assistant.read_available_resource`
+- `erp_ai_assistant.api.assistant.test_fac_mcp_connection`
 
-Router / planner:
-- `erp_ai_assistant.api.router.route_prompt`
+Support / preview:
 - `erp_ai_assistant.api.assistant.classify_prompt`
-
-ERP actions:
-- `erp_ai_assistant.api.assistant.create_sales_order`
-- `erp_ai_assistant.api.assistant.create_quotation`
-- `erp_ai_assistant.api.assistant.create_purchase_order`
-- `erp_ai_assistant.api.assistant.create_erp_document`
-- `erp_ai_assistant.api.assistant.update_erp_document`
-- `erp_ai_assistant.api.assistant.submit_erp_document`
-- `erp_ai_assistant.api.assistant.cancel_erp_document`
-- `erp_ai_assistant.api.assistant.run_workflow_action`
-
-Files:
-- `erp_ai_assistant.api.assistant.export_doctype_list_excel`
-- `erp_ai_assistant.api.file_tools.export_employee_list_excel`
-- `erp_ai_assistant.api.file_tools.generate_document_pdf`
+- `erp_ai_assistant.api.assistant.preview_host_session`
+- `erp_ai_assistant.api.assistant.get_host_capabilities`
 
 MCP/FAC-style proxy:
 - `erp_ai_assistant.api.fac_proxy.handle_mcp`
@@ -157,16 +163,6 @@ Supported MCP-style operations:
 - `tools/call`
 - `resources/list`
 - `resources/read`
-
-## Provider Setup
-
-Open `AI Provider Settings` in Desk and configure one of:
-- `OpenAI`
-- `OpenAI Compatible`
-- `Anthropic`
-
-General chat and model-backed planning depend on provider configuration.
-Deterministic ERP routing still works even when no provider is configured.
 
 ## Environment Variable / Site Config Fallbacks
 
@@ -187,29 +183,27 @@ The app also reads these when provider settings are not filled:
 - `ANTHROPIC_VISION_MODEL`
 - `ERP_AI_OPENAI_MCP_ENABLED`
 - `ERP_AI_OPENAI_MCP_SERVERS`
+- `ERP_AI_FAC_MCP_URL`
+- `ERP_AI_FAC_MCP_AUTHORIZATION`
+- `ERP_AI_FAC_MCP_TIMEOUT`
 
 ## Important Files
 
 - `erp_ai_assistant/hooks.py`
 - `erp_ai_assistant/api/assistant.py`
 - `erp_ai_assistant/api/ai.py`
-- `erp_ai_assistant/api/planner.py`
-- `erp_ai_assistant/api/router.py`
-- `erp_ai_assistant/api/tool_registry.py`
+- `erp_ai_assistant/api/fac_client.py`
+- `erp_ai_assistant/api/fac_proxy.py`
+- `erp_ai_assistant/api/provider_settings.py`
 - `erp_ai_assistant/api/resource_registry.py`
-- `erp_ai_assistant/api/file_tools.py`
 - `erp_ai_assistant/public/js/assistant_bubble.js`
 - `erp_ai_assistant/public/js/web_assistant.js`
+- `erp_ai_assistant/public/js/ai_provider_settings.js`
 
 ## Notes
 
-- This app is closer to Claude Desktop in architecture, not by copying the desktop wrapper app, but by using:
-  - planner
-  - tool registry
-  - resource registry
-  - host-style routing and execution
-- It is still a hybrid assistant, not a perfect "any prompt always works" system.
-- The strongest current path is:
-  - planner-guided ERP execution
-  - deterministic tool execution
-  - provider-backed fallback chat
+- runtime is FAC-native
+- same-site FAC local registry is preferred over remote MCP
+- remote MCP is optional fallback
+- provider quality still matters for tool selection and reasoning
+- final business capability depends on FAC’s exposed tools, not on static assistant assumptions

@@ -13,12 +13,16 @@ from .export import add_message_attachment_urls, create_message_artifacts
 from .fac_client import dispatch_tool, get_tool_definitions
 from .provider_settings import get_active_provider, get_provider_setting, get_remote_mcp_servers
 from .resource_registry import list_resource_specs
-from .router import route_prompt_internal
 
 
 TOOL_NAME_MAP = {
     "get_list": "list_documents",
     "get_report": "generate_report",
+    "frappe.get_list": "get_list",
+    "frappe.client.get_list": "get_list",
+    "frappe.get_doc": "get_document",
+    "frappe.client.get": "get_document",
+    "frappe.get_report": "get_report",
 }
 
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4000
@@ -330,44 +334,12 @@ def _has_write_intent(prompt: str) -> bool:
     return any(term in text for term in write_terms)
 
 
-def _allowed_tool_names(prompt: str, available_names: Optional[set[str]] = None) -> set[str]:
-    universe = set(available_names or set()) or set(READ_TOOL_NAMES | WRITE_TOOL_NAMES | DELETE_TOOL_NAMES)
-    allowed = {name for name in universe if name not in WRITE_TOOL_NAMES and name not in DELETE_TOOL_NAMES}
-    if _has_destructive_intent(prompt):
-        allowed.update(name for name in universe if name in WRITE_TOOL_NAMES or name in DELETE_TOOL_NAMES)
-        return allowed
-    if _has_write_intent(prompt):
-        allowed.update(name for name in universe if name in WRITE_TOOL_NAMES)
-    return allowed
-
-
 def _selected_tool_names_for_prompt(prompt: str, context: dict[str, Any], available_names: set[str]) -> set[str]:
-    allowed = _allowed_tool_names(prompt, available_names)
-    text = (prompt or "").strip().lower()
-    if not allowed:
+    if not available_names:
         return set()
-
     if not _is_erp_intent(prompt, context):
         return set()
-
-    document_tools = allowed & CORE_DOC_TOOL_NAMES
-    report_tools = allowed & REPORT_TOOL_NAMES
-    analysis_tools = allowed & ANALYSIS_TOOL_NAMES
-
-    if any(term in text for term in ("chart", "dashboard", "visual", "analyze", "analysis", "python", "sql", "query")):
-        selected = document_tools | report_tools | analysis_tools
-        return selected or allowed
-
-    if "report" in text or "filter" in text or "requirement" in text:
-        selected = document_tools | report_tools
-        return selected or allowed
-
-    if _has_write_intent(prompt) or _has_destructive_intent(prompt):
-        selected = document_tools
-        return selected or allowed
-
-    selected = document_tools | report_tools
-    return selected or allowed
+    return set(available_names)
 
 
 def _has_active_document_context(context: Optional[dict[str, Any]] = None) -> bool:
@@ -388,20 +360,46 @@ def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
     return "Current context: no active document. Treat this as a general workspace chat unless the user asks for ERP data."
 
 
+def _tool_catalog_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    try:
+        tool_definitions = get_tool_definitions()
+        available_names = set(tool_definitions)
+    except Exception:
+        tool_definitions = {}
+        available_names = set()
+
+    selected_names = sorted(_selected_tool_names_for_prompt(prompt, context or {}, available_names))
+    if not selected_names:
+        selected_names = sorted(available_names)
+    if not selected_names:
+        return "No FAC tools are currently available. Answer directly unless tool access becomes available."
+
+    preview = ", ".join(selected_names[:24])
+    suffix = " ..." if len(selected_names) > 24 else ""
+    return (
+        "Use only the FAC tools that are actually exposed in this session. "
+        "Do not invent or assume tools that are not present. "
+        f"Available FAC tools for this request: {preview}{suffix}."
+    )
+
+
 def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     current = context or {}
     return (
         "You are an ERPNext AI assistant connected to a Frappe server. "
-        "You have access to tools that can read ERP documents, list records, create records, update records, run reports, generate PDFs, and export Excel. "
+        "You are connected to Frappe Assistant Core (FAC), which exposes the tool catalog dynamically for this session. "
         "If the user asks for ERP data, always call a tool. "
         "Never guess ERP data. Never invent document names, fields, item codes, workflow actions, or server problems. "
         "Prefer tool calls over text explanations whenever live ERP data or mutations are involved. "
-        "If information is missing, ask a clarification question instead of guessing. "
+        "Try to complete the request directly from the user's prompt, current context, prior conversation, and tool results before asking for more input. "
+        "Only ask for clarification when the action is blocked after you have already used the available context and tools. "
+        "If FAC does not expose a needed mutation tool, do not pretend the action succeeded; explain the limitation briefly. "
         "When creating documents, extract customer, supplier, items, quantities, dates, and any explicit field values from the prompt. "
         "For exports and PDFs, call tools to produce the structured data or artifact payload; the host app handles the final file download UX. "
         "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
         "If a tool call fails, report the exact returned error text only. "
         "Use ERP concepts precisely: Sales Order, Quotation, Customer, Supplier, Employee, Item, Purchase Order, Sales Invoice, Delivery Note. "
+        f"{_tool_catalog_summary(prompt, current)} "
         f"{_tool_access_summary(prompt, current)} "
         f"Current context: doctype={current.get('doctype')}, docname={current.get('docname')}, route={current.get('route')}."
     )
@@ -413,7 +411,8 @@ def _llm_user_prompt(prompt: str) -> str:
         "User request:\n"
         f"{cleaned}\n\n"
         "Respond by calling a tool when appropriate. "
-        "If required ERP details are missing, ask a concise clarification question."
+        "Make a best-effort attempt to complete the request directly. "
+        "Ask a concise clarification question only if the task is truly blocked."
     ).strip()
 
 
@@ -444,11 +443,10 @@ def _tool_access_summary(prompt: str, context: Optional[dict[str, Any]] = None) 
             "If the request is general and does not need ERP/Frappe data, answer directly without tools. "
             "Only use ERP tools when the user asks about live ERP data, reports, workflows, or record changes."
         )
-    if _has_destructive_intent(prompt):
-        return "You may use read, create, update, and delete ERP tools when the request explicitly requires it."
-    if _has_write_intent(prompt):
-        return "You may use read, create, and update ERP tools when the request explicitly requires it. Delete tools are unavailable."
-    return "You may use read-only ERP tools for this request. Create, update, and delete tools are unavailable unless the user explicitly asks for a record change."
+    return (
+        "For ERP requests, rely on the FAC tools exposed in this session. "
+        "Use the live tool catalog rather than assuming any read, write, delete, or workflow capability exists."
+    )
 
 
 def _verification_prompt(tool_events: list[str]) -> str:
@@ -698,31 +696,6 @@ def _requested_export_formats(prompt: str) -> list[str]:
     return formats
 
 
-def _should_execute_plan_before_llm(prompt: str, plan: dict[str, Any] | list[dict[str, Any]]) -> bool:
-    first_step = plan[0] if isinstance(plan, list) and plan else plan
-    tool = str((first_step or {}).get("tool") or "").strip()
-    text = (prompt or "").strip().lower()
-    if tool in {"get_document", "get_list", "get_report", "report_list", "report_requirements"}:
-        return True
-    if tool in {"update_document", "create_document", "delete_document"}:
-        return True
-    strong_terms = (
-        "show",
-        "list",
-        "get",
-        "find",
-        "export",
-        "download",
-        "create excel",
-        "create pdf",
-        "create word",
-        "report",
-        "requirements",
-        "filters",
-    )
-    return any(term in text for term in strong_terms)
-
-
 def _is_erp_intent(prompt: str, context: dict[str, Any]) -> bool:
     text = (prompt or "").strip().lower()
     if context.get("doctype") and context.get("docname"):
@@ -849,23 +822,7 @@ def _generate_response(
     progress: Optional[dict[str, Any]] = None,
     images: Optional[list[dict[str, str]]] = None,
 ) -> dict[str, Any]:
-    deterministic_result = _deterministic_router_response(prompt, context)
-    if deterministic_result is not None:
-        _progress_update(progress, stage="working", step="Preparing response")
-        return deterministic_result
-
-    direct_plan = _plan_prompt_steps(prompt, context)
     requested_formats = _requested_export_formats(prompt)
-
-    if direct_plan and (requested_formats or _should_execute_plan_before_llm(prompt, direct_plan)):
-        result, tool_events = _execute_plan_steps(direct_plan, progress=progress)
-        final_step = direct_plan[-1]
-        _progress_update(progress, stage="working", step="Preparing response")
-        return {
-            "text": _render_tool_output(final_step["tool"], result, final_step.get("heading")),
-            "tool_events": tool_events,
-            "payload": result,
-        }
 
     if requested_formats and conversation:
         follow_up_payload = _rerun_last_exportable_tool(conversation, progress=progress)
@@ -913,12 +870,6 @@ def _generate_response(
                     }
             return response
         except Exception as exc:
-            fallback = _deterministic_router_response(prompt, context)
-            if fallback is not None:
-                fallback_events = list(fallback.get("tool_events") or [])
-                fallback_events.append("provider fallback deterministic")
-                fallback["tool_events"] = fallback_events
-                return fallback
             _progress_update(progress, stage="failed", done=True, error=str(exc) or "Unknown error")
             frappe.log_error(frappe.get_traceback(), "ERP AI Assistant Chat Error")
             return {
@@ -931,85 +882,13 @@ def _generate_response(
                 "payload": None,
             }
 
-    if direct_plan:
-        result, tool_events = _execute_plan_steps(direct_plan, progress=progress)
-        final_step = direct_plan[-1]
-        _progress_update(progress, stage="working", step="Preparing response")
-        return {
-            "text": _render_tool_output(final_step["tool"], result, final_step.get("heading")),
-            "tool_events": tool_events,
-            "payload": result,
-        }
-
     guidance = (
-        "AI provider is not configured for open-ended chat yet. "
-        "You can still use ERP-native prompts like 'Show me list of customers' or 'Summarize this record'."
+        "AI provider is not configured for FAC-native chat yet. "
+        "Configure the provider so the assistant can call FAC tools dynamically."
     )
     if _has_active_document_context(context):
         guidance += f" Current context: {context['doctype']} / {context['docname']}."
     return {"text": guidance, "tool_events": [], "payload": None}
-
-
-def _deterministic_router_response(prompt: str, context: dict[str, Any]) -> dict[str, Any] | None:
-    if not str(prompt or "").strip():
-        return None
-    planner_result = None
-    try:
-        from .planner import classify_prompt_internal
-
-        planner_result = classify_prompt_internal(prompt, context or {})
-    except Exception:
-        planner_result = None
-    routed = route_prompt_internal(prompt, context=context or {}, planner_result=planner_result)
-    if not routed.get("matched"):
-        return None
-
-    result_type = str(routed.get("type") or "").strip().lower()
-    if routed.get("ok"):
-        if result_type == "answer":
-            return {
-                "text": str(routed.get("answer") or routed.get("message") or "Completed."),
-                "tool_events": ["router deterministic"],
-                "payload": routed.get("data"),
-            }
-        if result_type == "document":
-            doc_link = str(routed.get("url") or "").strip()
-            doc_label = f"{routed.get('doctype')} {routed.get('name')}".strip()
-            link_text = f"\n\nOpen document: [{doc_label}]({doc_link})" if doc_link else ""
-            return {
-                "text": f"{str(routed.get('message') or 'Document created successfully.')}{link_text}",
-                "tool_events": ["router deterministic", f"document {routed.get('doctype')} {routed.get('name')}"],
-                "payload": routed,
-            }
-        if result_type == "file":
-            file_name = str(routed.get("file_name") or "download").strip()
-            file_url = str(routed.get("file_url") or "").strip()
-            text = f"{str(routed.get('message') or 'File generated successfully.')}\n\nFile: {file_name}"
-            if file_url:
-                text += f"\nDownload: {file_url}"
-            return {
-                "text": text,
-                "tool_events": ["router deterministic", f"file {file_name}"],
-                "payload": routed.get("data"),
-                "attachments": {
-                    "attachments": [
-                        {
-                            "id": f"file-{file_name}",
-                            "label": "File",
-                            "filename": file_name,
-                            "file_type": file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "file",
-                            "file_url": file_url,
-                        }
-                    ] if file_url else [],
-                    "exports": {},
-                },
-            }
-
-    return {
-        "text": str(routed.get("message") or "Request could not be completed."),
-        "tool_events": ["router deterministic"],
-        "payload": routed,
-    }
 
 
 def _llm_chat_configured() -> bool:
@@ -2572,6 +2451,11 @@ def _openai_compatible_chat(
         message = choice.get("message") or {}
         tool_calls = message.get("tool_calls") or []
         text_body = str(message.get("content") or "").strip()
+        if not tool_calls and text_body:
+            textual_tool_call = _extract_textual_tool_call(text_body)
+            if textual_tool_call is not None:
+                tool_calls = [textual_tool_call]
+                text_body = ""
 
         if tool_calls and not tools_enabled:
             if text_body:
@@ -3078,6 +2962,52 @@ def _parse_openai_tool_arguments(arguments: Any) -> dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _extract_textual_tool_call(raw_text: Any) -> dict[str, Any] | None:
+    text = str(raw_text or "").strip()
+    if not text or "{" not in text:
+        return None
+
+    try:
+        payload = _parse_json_object_text(text)
+    except Exception:
+        return None
+
+    tool_name = str(payload.get("tool") or payload.get("name") or "").strip()
+    args_payload: Any = None
+    if tool_name:
+        args_payload = (
+            payload.get("args")
+            if "args" in payload
+            else payload.get("arguments")
+            if "arguments" in payload
+            else payload.get("input")
+            if "input" in payload
+            else payload.get("parameters")
+        )
+    else:
+        function_payload = payload.get("function")
+        if isinstance(function_payload, dict):
+            tool_name = str(function_payload.get("name") or "").strip()
+            args_payload = function_payload.get("arguments")
+
+    if not tool_name:
+        return None
+
+    normalized_name = TOOL_NAME_MAP.get(tool_name, tool_name)
+    arguments = _parse_openai_tool_arguments(args_payload)
+    if not arguments and isinstance(args_payload, dict):
+        arguments = args_payload
+
+    return {
+        "id": f"textual-{normalized_name}",
+        "type": "function",
+        "function": {
+            "name": normalized_name,
+            "arguments": json.dumps(arguments, default=str),
+        },
+    }
 
 
 def _openai_supports_sampling_controls(model: str | None) -> bool:
