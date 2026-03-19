@@ -342,6 +342,7 @@
         active: null,
         isDraft: false,
       };
+      this.awaitingQueueAck = {};
       this.modelStorageKey = "erp_ai_assistant_selected_model";
       this.progressPollTimer = null;
       this.progressPollPending = false;
@@ -517,7 +518,7 @@
       this.clearPendingImages();
 
       this.ensureConversation((conversationName) => {
-        this.startProgressPolling(conversationName);
+        this.awaitingQueueAck[conversationName] = true;
         frappe.call({
           method: "erp_ai_assistant.api.assistant.handle_prompt",
           args: {
@@ -538,11 +539,14 @@
           callback: (response) => {
             const payload = response?.message || {};
             if (payload.queued) {
+              this.awaitingQueueAck[conversationName] = false;
+              this.startProgressPolling(conversationName);
               return;
             }
             this.finishPromptRun(conversationName);
           },
           error: (err) => {
+            delete this.awaitingQueueAck[conversationName];
             this.finishPromptRun(null, { keepMessages: true });
             this.renderSystemMessage(err.message || "Request failed");
           },
@@ -706,6 +710,10 @@
           callback: (response) => {
             const progress = response?.message || {};
             const steps = Array.isArray(progress.steps) ? progress.steps : [];
+            const stage = String(progress.stage || "").trim().toLowerCase();
+            if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) {
+              return;
+            }
             this.showProgress(steps, progress.partial_text || "");
             if (progress.done) {
               this.stopProgressPolling();
@@ -785,6 +793,7 @@
       const settings = options || {};
       this.stopProgressPolling();
       if (conversationName) {
+        delete this.awaitingQueueAck[conversationName];
         this.loadConversation(conversationName);
         this.loadHistory();
         return;

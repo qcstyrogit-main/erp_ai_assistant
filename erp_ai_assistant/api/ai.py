@@ -38,6 +38,7 @@ DEFAULT_VERIFY_PASS = True
 DEFAULT_ANTHROPIC_VISION_MODEL = ""
 DEFAULT_OPENAI_MODEL = "gpt-5"
 DEFAULT_OPENAI_RESPONSES_PATH = "/v1/responses"
+DEFAULT_CONVERSATION_HISTORY_LIMIT = 12
 READ_TOOL_NAMES = {
     "get_document",
     "list_documents",
@@ -67,6 +68,35 @@ REPORT_TOOL_NAMES = {
     "generate_report",
     "report_list",
     "report_requirements",
+}
+FAC_PREFERRED_TOOL_NAMES = {
+    "get_document",
+    "list_documents",
+    "create_document",
+    "update_document",
+    "delete_document",
+    "get_doctype_info",
+    "search_documents",
+    "search_doctype",
+    "search_link",
+    "submit_document",
+    "run_workflow",
+    "generate_report",
+    "report_list",
+    "report_requirements",
+}
+LEGACY_INTERNAL_TOOL_NAMES = {
+    "get_erp_document",
+    "list_erp_documents",
+    "create_erp_document",
+    "update_erp_document",
+    "get_doctype_fields",
+    "describe_erp_schema",
+    "search_erp_documents",
+    "submit_erp_document",
+    "cancel_erp_document",
+    "run_workflow_action",
+    "answer_erp_query",
 }
 REPORT_DISCOVERY_TOOL_NAMES = {
     "generate_report",
@@ -234,6 +264,15 @@ def _llm_verify_pass_enabled() -> bool:
     return _cfg_bool(key, DEFAULT_VERIFY_PASS)
 
 
+def _conversation_history_limit() -> int:
+    return _cfg_int(
+        "ERP_AI_CONVERSATION_HISTORY_LIMIT",
+        DEFAULT_CONVERSATION_HISTORY_LIMIT,
+        minimum=4,
+        maximum=40,
+    )
+
+
 def _provider_name() -> str:
     configured = str(_cfg("ERP_AI_PROVIDER", "")).strip().lower()
     if configured in {"openai", "openai compatible", "openai_compatible", "anthropic"}:
@@ -332,6 +371,8 @@ def _should_force_tool_use(prompt: str, context: dict[str, Any]) -> bool:
     text = (prompt or "").strip().lower()
     if not text:
         return False
+    if _is_instructional_request(prompt) or _is_sample_data_request(prompt, context):
+        return False
 
     # If we're in a document context, factual actions should be tool-grounded.
     if context.get("doctype") and context.get("docname"):
@@ -415,6 +456,8 @@ def _has_write_intent(prompt: str) -> bool:
     text = (prompt or "").strip().lower()
     if not text:
         return False
+    if _is_instructional_request(text):
+        return False
     write_terms = (
         "create",
         "add",
@@ -430,6 +473,27 @@ def _has_write_intent(prompt: str) -> bool:
         "cancel",
     )
     return any(term in text for term in write_terms)
+
+
+def _is_instructional_request(prompt: str) -> bool:
+    text = (prompt or "").strip().lower()
+    if not text:
+        return False
+    instructional_prefixes = (
+        "how to ",
+        "how do i ",
+        "how can i ",
+        "what is ",
+        "what are ",
+        "explain ",
+        "show me how ",
+        "guide me ",
+        "teach me ",
+        "help me understand ",
+    )
+    if any(text.startswith(prefix) for prefix in instructional_prefixes):
+        return True
+    return bool(re.search(r"\b(steps|procedure|process|workflow|guide)\b", text) and "?" in text)
 
 
 def _is_sample_data_request(prompt: str, context: Optional[dict[str, Any]] = None) -> bool:
@@ -455,6 +519,135 @@ def _is_sample_data_request(prompt: str, context: Optional[dict[str, Any]] = Non
         return True
 
     return False
+
+
+def _is_bulk_operation_request(prompt: str, context: Optional[dict[str, Any]] = None) -> bool:
+    text = (prompt or "").strip().lower()
+    if not text:
+        return False
+
+    explicit_bulk_terms = (
+        "bulk ",
+        "mass ",
+        "batch ",
+        "all records",
+        "all documents",
+        "update all",
+        "create 100",
+        "update 100",
+        "import ",
+    )
+    if any(term in text for term in explicit_bulk_terms):
+        return True
+
+    quantity_match = re.search(r"\b(create|update|insert|modify)\s+(\d{2,})\b", text)
+    if quantity_match:
+        return True
+
+    if any(term in text for term in {"all ", "every "}) and _has_write_intent(text):
+        return True
+
+    return False
+
+
+def _needs_multi_step_plan(prompt: str, context: Optional[dict[str, Any]] = None) -> bool:
+    text = (prompt or "").strip().lower()
+    if not text:
+        return False
+    if _is_bulk_operation_request(prompt, context):
+        return True
+    multi_step_terms = (
+        "check",
+        "compare",
+        "confirm",
+        "then",
+        "before",
+        "after",
+        "if available",
+        "availability",
+        "inventory",
+        "balance",
+        "validate",
+        "verify",
+        "analyze",
+        "summary",
+    )
+    if sum(1 for term in multi_step_terms if term in text) >= 2:
+        return True
+    if _has_write_intent(prompt) and any(term in text for term in ("check", "confirm", "verify", "availability")):
+        return True
+    return False
+
+
+def _resolved_prompt_doctype(prompt: str, context: Optional[dict[str, Any]] = None) -> str | None:
+    current = context or {}
+    explicit = str(current.get("doctype") or "").strip()
+    if explicit:
+        return explicit
+
+    inferred = _infer_prompt_doctype(prompt)
+    if inferred:
+        return inferred
+
+    text = str(prompt or "").strip()
+    if not text:
+        return None
+
+    patterns = (
+        r"\bdoctype\s+([A-Z][A-Za-z0-9_/& -]{2,60})",
+        r"\b(?:create|new|add|insert|update|edit|modify|show|open|list|find|search|submit|cancel|approve|reject)\s+(?:a\s+|an\s+|the\s+)?([A-Z][A-Za-z0-9_/& -]{2,60})",
+    )
+    stop_terms = (
+        " with ",
+        " for ",
+        " from ",
+        " in ",
+        " on ",
+        " by ",
+        " where ",
+        " that ",
+        " which ",
+        " using ",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = str(match.group(1) or "").strip(" .,:;!?")
+        lowered = candidate.lower()
+        for stop_term in stop_terms:
+            if stop_term in lowered:
+                candidate = candidate[: lowered.index(stop_term)].strip(" .,:;!?")
+                lowered = candidate.lower()
+        if candidate and len(candidate.split()) <= 6:
+            return candidate
+    return None
+
+
+def _resolved_erp_intent(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    text = str(prompt or "").strip().lower()
+    current = context or {}
+    if _is_sample_data_request(prompt, current):
+        return "sample"
+    if _is_instructional_request(prompt):
+        return "read"
+    if _is_bulk_operation_request(prompt, current):
+        return "bulk"
+    if any(term in text for term in {"submit", "approve", "reject", "cancel", "reopen", "workflow"}):
+        return "workflow"
+    if any(term in text for term in {"export", "download", "xlsx", "csv", "pdf", "docx", "word"}):
+        return "export"
+    if any(term in text for term in {"report", "dashboard", "chart"}):
+        return "report"
+    if any(re.search(rf"\b{re.escape(term)}\b", text) for term in ("create", "add", "insert", "new")):
+        return "create"
+    if any(re.search(rf"\b{re.escape(term)}\b", text) for term in ("update", "edit", "change", "modify", "set", "rename")):
+        return "update"
+    if _has_destructive_intent(prompt):
+        return "delete"
+    if _has_active_document_context(current):
+        return "read"
+    return "read"
 
 
 def _tokenize_match_text(value: Any) -> set[str]:
@@ -490,6 +683,8 @@ def _tool_match_terms(name: str, spec: dict[str, Any]) -> set[str]:
 def _tool_match_score(prompt: str, context: dict[str, Any], name: str, spec: dict[str, Any]) -> int:
     prompt_text = str(prompt or "").strip().lower()
     normalized_name = str(name or "").strip().lower().replace("_", " ")
+    intent = _resolved_erp_intent(prompt, context)
+    target_doctype = str(_resolved_prompt_doctype(prompt, context) or "").strip().lower()
     prompt_terms = _tokenize_match_text(prompt_text)
     tool_terms = _tool_match_terms(name, spec)
     overlap = prompt_terms.intersection(tool_terms)
@@ -503,8 +698,32 @@ def _tool_match_score(prompt: str, context: dict[str, Any], name: str, spec: dic
     if _has_active_document_context(context) and any(term in tool_terms for term in {"document", "doctype", "workflow"}):
         score += 2
 
+    if target_doctype and any(term in tool_terms for term in _tokenize_match_text(target_doctype)):
+        score += 4
+
     if _has_write_intent(prompt_text) and any(term in tool_terms for term in {"create", "update", "delete", "workflow", "submit", "cancel"}):
         score += 4
+    if _has_write_intent(prompt_text) and _has_doctype_context(context):
+        if name in {"create_document", "get_doctype_info"}:
+            score += 8
+    if intent == "create" and name in {"get_doctype_info", "create_document", "search_link"}:
+        score += 8
+    if intent == "update" and name in {"get_document", "list_documents", "update_document"}:
+        score += 8
+    if intent == "update" and _has_active_document_context(context) and name == "get_doctype_info":
+        score -= 2
+    if intent == "workflow" and name in {"get_document", "list_documents", "submit_document", "run_workflow"}:
+        score += 8
+    if intent == "report" and name in {"report_list", "report_requirements", "generate_report"}:
+        score += 8
+    if intent == "export" and name in {"export_report", "export_doctype_records", "generate_report", "list_documents", "get_document"}:
+        score += 8
+    if intent == "bulk" and name in {"get_doctype_info", "list_documents", "search_documents", "export_doctype_records"}:
+        score += 6
+    if "create" in prompt_text and name == "get_doctype_info":
+        score += 3
+    if "create" in prompt_text and name == "search_link":
+        score += 2
     if _has_destructive_intent(prompt_text) and any(term in tool_terms for term in {"delete", "remove", "purge", "cancel"}):
         score += 4
     if any(term in prompt_text for term in {"export", "excel", "xlsx", "csv", "pdf", "docx", "word", "download"}):
@@ -512,52 +731,6 @@ def _tool_match_score(prompt: str, context: dict[str, Any], name: str, spec: dic
             score += 2
 
     return score
-
-
-def _selected_tool_names_for_prompt(
-    prompt: str,
-    context: dict[str, Any],
-    tool_definitions: dict[str, dict[str, Any]],
-) -> set[str]:
-    available_names = set(tool_definitions)
-    if not available_names:
-        return set()
-    if not _is_erp_intent(prompt, context):
-        return set()
-    if _is_sample_data_request(prompt, context):
-        return set()
-
-    scored: list[tuple[int, str]] = []
-    for name, spec in tool_definitions.items():
-        if name not in available_names or not isinstance(spec, dict):
-            continue
-        score = _tool_match_score(prompt, context, name, spec)
-        scored.append((score, name))
-
-    scored.sort(key=lambda item: (-item[0], _tool_priority_key(item[1])))
-    positive = [(score, name) for score, name in scored if score > 0]
-    if not positive:
-        return available_names
-
-    top_score = positive[0][0]
-    cutoff = max(top_score - 5, 1)
-    selected = {name for score, name in positive if score >= cutoff}
-    if len(available_names) <= 18:
-        return available_names
-    if len(selected) < 8:
-        selected.update(name for _score, name in positive[:12])
-    specific_business_tools = {
-        "find_one_document",
-        "set_document_fields",
-        "create_report",
-        "get_report_definition",
-        "update_report",
-        "run_report",
-        "export_report",
-        "export_doctype_records",
-    }
-    selected.update(name for name in available_names if name in specific_business_tools)
-    return selected or available_names
 
 
 def _has_active_document_context(context: Optional[dict[str, Any]] = None) -> bool:
@@ -572,6 +745,7 @@ def _has_doctype_context(context: Optional[dict[str, Any]] = None) -> bool:
 
 def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
     current = context or {}
+    target_doctype = _resolved_prompt_doctype("", current)
     if _has_active_document_context(current):
         return (
             f"Current context: doctype={current.get('doctype')}, "
@@ -584,94 +758,195 @@ def _context_summary(context: Optional[dict[str, Any]] = None) -> str:
         )
     route = str(current.get("route") or "").strip()
     if route:
+        if target_doctype:
+            return f"Current context: target doctype={target_doctype}. Current route={route}."
         return f"Current context: no active document. Current route={route}."
     return "Current context: no active document. Treat this as a general workspace chat unless the user asks for ERP data."
 
 
 def _tool_catalog_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     try:
-        tool_definitions = get_tool_definitions()
+        tool_definitions = get_tool_definitions(user=(context or {}).get("user"))
     except Exception:
         tool_definitions = {}
 
     available_names = set(tool_definitions)
-    selected_names = sorted(_selected_tool_names_for_prompt(prompt, context or {}, tool_definitions))
-    if not selected_names:
-        selected_names = sorted(available_names)
-    if not selected_names:
+    if not available_names:
         return "No FAC tools are currently available. Answer directly unless tool access becomes available."
 
-    preview = ", ".join(selected_names[:24])
-    suffix = " ..." if len(selected_names) > 24 else ""
+    selected_names = [
+        name
+        for name, _score in sorted(
+            ((name, _tool_match_score(prompt, context or {}, name, spec)) for name, spec in tool_definitions.items()),
+            key=lambda item: (-item[1], _tool_priority_key(item[0])),
+        )
+    ]
+    preview = []
+    for name in selected_names[:12]:
+        description = str((tool_definitions.get(name) or {}).get("description") or "").strip()
+        if description:
+            preview.append(f"{name}: {description}")
+        else:
+            preview.append(name)
+    suffix = " ..." if len(selected_names) > 8 else ""
+    intent = _resolved_erp_intent(prompt, context or {})
+    target_doctype = _resolved_prompt_doctype(prompt, context or {})
     return (
         "Use only the FAC tools that are actually exposed in this session. "
+        "Route the request by target doctype first, then by user intent. "
         "Select tools from the live FAC catalog based on the user's request, tool descriptions, and input schema. "
         "Do not invent or assume tools that are not present. "
-        f"Best-matching FAC tools for this request: {preview}{suffix}."
+        f"{f'Target doctype for this request: {target_doctype}. ' if target_doctype else ''}"
+        f"Resolved intent for this request: {intent}. "
+        f"Best-matching FAC tools for this request: {'; '.join(preview)}{suffix}."
+    )
+
+
+def _system_identity_rules() -> str:
+    return (
+        "You are an ERPNext AI assistant connected to Frappe Assistant Core (FAC). "
+        "FAC exposes the live tool catalog for this session. "
+        "Stay tightly aligned to the latest user request. "
+        "Treat standard and custom DocTypes uniformly. "
+        "If image blocks are present, analyze them directly. "
+    )
+
+
+def _system_tool_use_rules() -> str:
+    return (
+        "Tool-use rules: "
+        "1. If the user's request requires live ERP data, document lookup, workflow actions, reports, or record changes, call the appropriate FAC tool. "
+        "2. Never guess ERP data, document names, field values, workflow states, or tool results. "
+        "3. Always prefer FAC tool results over your own knowledge for ERP-related requests. "
+        "4. If required parameters are missing, ask only for the minimum missing information needed to continue. "
+        "5. After receiving tool output, summarize the result clearly in user-facing language. "
+        "6. Do not expose internal tool logic, raw payloads, schemas, JSON, XML, hidden reasoning, or tool names unless the user asks for technical details. "
+        "7. If the request is instructional only, answer directly without calling tools unless live ERP verification is necessary. "
+        "8. If no suitable FAC tool is available, say so briefly and do not pretend the action succeeded. "
+        "9. Stop calling tools as soon as the request is completed or the available tool results are sufficient to answer. "
+        "10. For bulk actions, prefer a bulk-safe FAC workflow if available; otherwise explain the limitation briefly. "
+        "For complex or multi-step ERP requests, first form a short internal plan, then execute the required FAC tools, then provide the final answer. "
+        "Keep that plan internal unless the user explicitly asks to see it. "
+    )
+
+
+def _system_erp_fac_rules() -> str:
+    return (
+        "ERP/FAC rules: "
+        "Use the exact live FAC tool names and argument shapes for this session. "
+        "When the current context has a doctype but no active document, and the user asks to create a new record without naming a doctype, treat the current context doctype as the target. "
+        "For DocType creation, prefer get_doctype_info before create_document when metadata is needed. "
+        "For updates, identify the exact target document before update_document. "
     )
 
 
 def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     current = context or {}
     sample_data_mode = _is_sample_data_request(prompt, current)
-    return (
-        "You are an ERPNext AI assistant connected to a Frappe server. "
-        "You are connected to Frappe Assistant Core (FAC), which exposes the tool catalog dynamically for this session. "
-        "Your final reply must read like a polished desktop assistant response: natural, direct, and user-facing. "
-        "Never expose raw tool calls, XML/tool markers, JSON payloads, function names, internal schemas, or chain-of-thought. "
-        "Do not narrate internal tool usage unless the user explicitly asks for technical details. "
-        "If the user asks for live ERP data or a real ERP mutation, call a tool. "
-        "If the user asks for sample data, dummy data, mock data, or testing data, do not call ERP tools. "
-        "For sample/testing data requests, generate fictional but realistic business data directly and clearly present it as sample data. "
-        "When the user requests table format for sample data, return a markdown table. "
-        "Never guess ERP data. Never invent document names, fields, item codes, workflow actions, or server problems. "
-        "Prefer tool calls over text explanations whenever live ERP data or mutations are involved. "
-        "Choose FAC tools from the live catalog by matching the user's request to the tool name, description, annotations, and input schema. "
-        "Prefer the most specific FAC tool that fits the request; only use broader tools when no more specific FAC tool is available. "
-        "If the user asks to create a report, prefer create_report when available. "
-        "Only fall back to create_document with doctype='Report' if create_report is not exposed by FAC. "
-        "When the user does not specify a report type, default the created report to Query Report and use the referenced doctype from the prompt. "
-        "Try to complete the request directly from the user's prompt, current context, prior conversation, and tool results before asking for more input. "
-        "Only ask for clarification when the action is blocked after you have already used the available context and tools. "
-        "If FAC does not expose a needed mutation tool, do not pretend the action succeeded; explain the limitation briefly. "
-        "If the current context has a doctype but no active document, and the user asks to create a new record without naming a doctype, treat the current context doctype as the intended target. "
-        "Example: on Material Request List, 'create new record' means create a Material Request. "
-        "When creating documents, extract customer, supplier, items, quantities, dates, and any explicit field values from the prompt. "
-        "For exports and PDFs, call tools to produce the structured data or artifact payload; the host app handles the final file download UX. "
-        "If image blocks are present in a user message, analyze those images directly and do not claim you cannot view images. "
-        "If a tool call fails, report the exact returned error text only. "
-        "Use ERP concepts precisely: Sales Order, Quotation, Customer, Supplier, Employee, Item, Purchase Order, Sales Invoice, Delivery Note. "
-        f"{_tool_catalog_summary(prompt, current)} "
-        f"{_tool_access_summary(prompt, current)} "
-        f"{'Sample data mode is active for this request. Do not use FAC tools.' if sample_data_mode else ''} "
-        f"Current context: doctype={current.get('doctype')}, docname={current.get('docname')}, route={current.get('route')}."
-    )
+    bulk_mode = _is_bulk_operation_request(prompt, current)
+    multi_step_plan_mode = _needs_multi_step_plan(prompt, current)
+    target_doctype = _resolved_prompt_doctype(prompt, current)
+    intent = _resolved_erp_intent(prompt, current)
+    lines = [
+        _system_identity_rules(),
+        _system_tool_use_rules(),
+        _system_erp_fac_rules(),
+        _tool_catalog_summary(prompt, current),
+        _tool_access_summary(prompt, current),
+    ]
+    if sample_data_mode:
+        lines.append("Sample data mode is active for this request. Do not use FAC tools.")
+    if bulk_mode:
+        lines.append("Bulk-operation mode is active for this request. Prefer bulk-safe FAC workflows and avoid many repetitive mutation calls.")
+    if multi_step_plan_mode:
+        lines.append("Multi-step planning mode is active for this request. Internally follow PLAN -> TOOLS -> ANSWER.")
+    if target_doctype:
+        lines.append(f"Resolved target doctype: {target_doctype}.")
+    lines.append(f"Resolved intent: {intent}.")
+    lines.append(f"Current context: doctype={current.get('doctype')}, docname={current.get('docname')}, route={current.get('route')}.")
+    return " ".join(line.strip() for line in lines if str(line or "").strip())
 
 
-def _llm_user_prompt(prompt: str) -> str:
+def _request_focus_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    current = context or {}
+    lines = ["Resolve the user's latest request exactly as written."]
+    target_doctype = _resolved_prompt_doctype(prompt, current)
+    if target_doctype:
+        lines.append(f"Target doctype: {target_doctype}.")
+    if _has_active_document_context(current):
+        lines.append(
+            f"Active ERP record: {current.get('doctype')} {current.get('docname')}."
+        )
+    elif _has_doctype_context(current):
+        lines.append(
+            f"Active ERP list or doctype context: {current.get('doctype')}."
+        )
+    route = str(current.get("route") or "").strip()
+    if route:
+        lines.append(f"Current route: {route}.")
+    if _has_write_intent(prompt):
+        lines.append("This is a write/mutation request. Prefer completing the action in ERP over giving advice.")
+    elif _is_erp_intent(prompt, current):
+        lines.append("This is a live ERP request. Ground the answer in FAC tools and their results.")
+    lines.append(f"Resolved intent: {_resolved_erp_intent(prompt, current)}.")
+    if _is_bulk_operation_request(prompt, current):
+        lines.append("This is a bulk operation request. Prefer batched execution or clearly state the bulk-tool limitation.")
+    if _needs_multi_step_plan(prompt, current):
+        lines.append("This request is multi-step. Internally do PLAN -> TOOLS -> ANSWER and keep the plan hidden unless the user asks for it.")
+    return " ".join(lines)
+
+
+def _llm_user_prompt(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     cleaned = str(prompt or "").strip()
     return (
+        f"{_request_focus_summary(cleaned, context)}\n\n"
         "User request:\n"
         f"{cleaned}\n\n"
-        "Respond by calling a tool when appropriate. "
-        "Make a best-effort attempt to complete the request directly. "
-        "Use the live FAC catalog to choose the best-matching tool for this request. "
-        "Return the final answer in plain natural language for the end user. "
-        "Do not show raw tool output, JSON, tool names, or internal markers. "
-        "For sample/testing data requests, generate fictional realistic sample output directly. "
-        "Ask a concise clarification question only if the task is truly blocked."
+        "Use the live FAC tool catalog when the request needs live ERP data or actions. "
+        "For complex requests, first make a short hidden plan, then call tools, then answer. "
+        "If the request is instructional only, answer directly unless live verification is necessary. "
+        "Ask only for the minimum missing information if the request is blocked. "
+        "Summarize tool results clearly for the user. "
+        "Do not reveal internal reasoning, raw tool output, JSON, XML, or hidden tags such as <think>. "
+        "For sample/testing data requests, generate fictional realistic sample output directly."
     ).strip()
 
 
 def _tool_priority_key(name: str) -> tuple[int, str]:
     lowered = str(name or "").strip().lower()
+    if lowered in FAC_PREFERRED_TOOL_NAMES:
+        return (-1, lowered)
     if lowered in CORE_DOC_TOOL_NAMES:
         return (0, lowered)
     if lowered in REPORT_TOOL_NAMES:
         return (1, lowered)
+    if lowered in LEGACY_INTERNAL_TOOL_NAMES:
+        return (4, lowered)
     if "erp" in lowered:
-        return (2, lowered)
+        return (5, lowered)
     return (3, lowered)
+
+
+def _prefer_fac_core_tools(names: set[str]) -> set[str]:
+    available = {str(name or "").strip() for name in names if str(name or "").strip()}
+    if not available:
+        return set()
+
+    preferred_pairs = (
+        ("get_document", "get_erp_document"),
+        ("list_documents", "list_erp_documents"),
+        ("create_document", "create_erp_document"),
+        ("update_document", "update_erp_document"),
+        ("get_doctype_info", "get_doctype_fields"),
+        ("get_doctype_info", "describe_erp_schema"),
+        ("search_documents", "search_erp_documents"),
+        ("submit_document", "submit_erp_document"),
+        ("run_workflow", "run_workflow_action"),
+    )
+    for preferred, legacy in preferred_pairs:
+        if preferred in available and legacy in available:
+            available.discard(legacy)
+    return available
 
 
 def _prioritize_tool_specs(tool_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -713,6 +988,35 @@ def _verification_prompt(tool_events: list[str]) -> str:
         "Recent tool activity:\n"
         f"{recent_lines}"
     )
+
+
+def _no_tools_available_response(prompt: str, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    current = context or {}
+    target = str(current.get("doctype") or "").strip()
+    if _has_active_document_context(current):
+        target = f"{current.get('doctype')} {current.get('docname')}".strip()
+    elif target:
+        target = f"{target} record"
+    request_hint = f" for {target}" if target else ""
+    return {
+        "text": (
+            "I could not complete that ERP request because no FAC tools are available in this session"
+            f"{request_hint}. Configure or expose the required ERP create/read/update tools, then retry."
+        ),
+        "tool_events": [],
+        "payload": None,
+    }
+
+
+def _stray_tool_call_response() -> dict[str, Any]:
+    return {
+        "text": (
+            "I could not complete that ERP request because the current AI provider kept returning tool-call output "
+            "even when no callable tools were available for this session. No ERP record was created."
+        ),
+        "tool_events": [],
+        "payload": None,
+    }
 
 
 def _progress_cache_key(conversation: str, user: str) -> str:
@@ -854,6 +1158,7 @@ def _execute_prompt(
         attachments_json=json.dumps(user_attachments, default=str) if user_attachments.get("attachments") else None,
     )
     _set_conversation_title_from_prompt(conversation_name, prompt_text or user_content)
+    frappe.db.commit()
 
     context = {
         "doctype": doctype,
@@ -913,6 +1218,7 @@ def _execute_prompt(
     if attachments.get("attachments"):
         assistant_message = frappe.get_doc("AI Message", message["name"])
         assistant_message.db_set("attachments_json", json.dumps(attachments, default=str), update_modified=False)
+    frappe.db.commit()
     _progress_update(progress, stage="completed", done=True, step="Response ready", partial_text="")
 
     result = {
@@ -1055,8 +1361,28 @@ def _finalize_reply_text(text: str, prompt: str, attachments: dict[str, Any], pa
         labels = ", ".join(str(item.get("label") or item.get("file_type") or "file").strip() for item in attachment_rows[:3])
         base_text = f"Prepared your export. Use the downloadable attachment below{f' ({labels})' if labels else ''}."
     else:
-        base_text = text
+        base_text = _sanitize_assistant_reply(text)
     return _append_related_links(base_text, prompt, payload)
+
+
+def _sanitize_assistant_reply(text: Any) -> str:
+    cleaned = html.unescape(str(text or "").strip())
+    if not cleaned:
+        return ""
+
+    # Remove leaked reasoning or planning tags from providers that expose hidden traces.
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<analysis>[\s\S]*?</analysis>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<reasoning>[\s\S]*?</reasoning>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<tool_call>[\s\S]*?</tool_call>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<next_steps>[\s\S]*?</next_steps>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*(okay|alright|let me think|thinking)[\s\S]*?(?=\n\s*\n)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        return "I'm ready to continue. Please resend the request in one line."
+
+    return cleaned
 
 
 def _requested_export_formats(prompt: str) -> list[str]:
@@ -1114,12 +1440,39 @@ def _desk_report_link(report_name: Any) -> str:
 
 
 def _infer_prompt_doctype(prompt: str) -> str | None:
-    alias = _match_known_doctype_alias(prompt)
-    if not alias:
+    text = str(prompt or "").strip()
+    if not text:
         return None
-    catalog = _known_doctype_catalog()
-    resolved = catalog.get(alias)
-    return resolved[0] if resolved else None
+
+    patterns = (
+        r"\bdoctype\s+([A-Z][A-Za-z0-9_/& -]{2,60})",
+        r"\b(?:create|new|add|insert|update|edit|modify|show|open|list|find|search|submit|cancel|approve|reject)\s+(?:a\s+|an\s+|the\s+)?([A-Z][A-Za-z0-9_/& -]{2,60})",
+    )
+    stop_terms = (
+        " with ",
+        " for ",
+        " from ",
+        " in ",
+        " on ",
+        " by ",
+        " where ",
+        " that ",
+        " which ",
+        " using ",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        candidate = str(match.group(1) or "").strip(" .,:;!?")
+        lowered = candidate.lower()
+        for stop_term in stop_terms:
+            if stop_term in lowered:
+                candidate = candidate[: lowered.index(stop_term)].strip(" .,:;!?")
+                lowered = candidate.lower()
+        if candidate and len(candidate.split()) <= 6:
+            return candidate
+    return None
 
 
 def _extract_link_targets_from_payload(payload: Any, prompt: str) -> list[tuple[str, str, str]]:
@@ -1190,7 +1543,9 @@ def _append_related_links(text: str, prompt: str, payload: Any) -> str:
 
 def _is_erp_intent(prompt: str, context: dict[str, Any]) -> bool:
     text = (prompt or "").strip().lower()
-    if context.get("doctype"):
+    if _is_instructional_request(prompt) or _is_sample_data_request(prompt, context):
+        return False
+    if _resolved_prompt_doctype(prompt, context):
         return True
     if not text:
         return False
@@ -1383,6 +1738,35 @@ def _generate_response(
     return {"text": guidance, "tool_events": [], "payload": None}
 
 
+def _tool_round_limit_response(
+    last_tool_name: str | None,
+    rendered_payload: Any,
+    rendered_feedback: Optional[dict[str, Any]],
+    tool_events: list[str],
+    max_tool_rounds: int,
+) -> dict[str, Any]:
+    if rendered_feedback is not None:
+        return {
+            "text": _render_provider_tool_output(last_tool_name, rendered_feedback),
+            "tool_events": tool_events,
+            "payload": rendered_payload,
+        }
+    if rendered_payload is not None:
+        return {
+            "text": _render_provider_tool_output(last_tool_name, rendered_payload),
+            "tool_events": tool_events,
+            "payload": rendered_payload,
+        }
+    return {
+        "text": (
+            f"I could not finish that request cleanly because the AI loop hit the configured tool-call limit ({max_tool_rounds}). "
+            "Please retry with a slightly narrower prompt."
+        ),
+        "tool_events": tool_events,
+        "payload": None,
+    }
+
+
 def _llm_chat_configured() -> bool:
     provider = _provider_name()
     if provider in {"openai", "openai_compatible"}:
@@ -1420,13 +1804,14 @@ def _set_conversation_title_from_prompt(conversation_name: str, prompt: str) -> 
     doc.save(ignore_permissions=True)
 
 
-def _conversation_history_for_llm(conversation_name: str, limit: int = 24) -> list[dict[str, Any]]:
+def _conversation_history_for_llm(conversation_name: str, limit: int | None = None) -> list[dict[str, Any]]:
+    effective_limit = limit if isinstance(limit, int) and limit > 0 else _conversation_history_limit()
     messages = frappe.get_all(
         "AI Message",
         filters={"conversation": conversation_name},
         fields=["role", "content", "attachments_json"],
         order_by="creation desc",
-        limit_page_length=max(1, limit),
+        limit_page_length=max(1, effective_limit),
     )
     history: list[dict[str, Any]] = []
     for row in reversed(messages):
@@ -1466,6 +1851,7 @@ def _rerun_last_exportable_tool(
         if not event:
             continue
         tool_name, arguments = event
+        arguments = _prepare_export_tool_arguments(tool_name, arguments)
         _progress_update(progress, stage="working", step=f"Reusing previous result: {tool_name}")
         return _run_tool(tool_name, arguments)
     return None
@@ -1497,6 +1883,100 @@ def _last_exportable_tool_event(raw: Any) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def _is_minimal_export_field_request(fields: Any) -> bool:
+    if not isinstance(fields, list):
+        return True
+    normalized = [str(item or "").strip() for item in fields if str(item or "").strip()]
+    if not normalized:
+        return True
+    return set(normalized).issubset({"name", "creation", "modified"})
+
+
+def _default_export_fields_for_doctype(doctype: str, *, max_fields: int = 24) -> list[str]:
+    doctype_name = str(doctype or "").strip()
+    if not doctype_name:
+        return ["name", "creation", "modified"]
+    try:
+        meta = frappe.get_meta(doctype_name)
+    except Exception:
+        return ["name", "creation", "modified"]
+
+    excluded_fieldtypes = {
+        "Section Break",
+        "Column Break",
+        "Tab Break",
+        "Fold",
+        "HTML",
+        "Button",
+        "Table",
+        "Table MultiSelect",
+        "Attach Image",
+        "Signature",
+        "Image",
+        "Geolocation",
+        "Code",
+        "Text Editor",
+    }
+    preferred = ["name"]
+    title_field = str(getattr(meta, "title_field", "") or "").strip()
+    if title_field:
+        preferred.append(title_field)
+    search_fields = str(getattr(meta, "search_fields", "") or "").strip()
+    if search_fields:
+        preferred.extend([item.strip() for item in search_fields.split(",") if item.strip()])
+    preferred.extend(["status", "docstatus", "company", "customer", "supplier", "posting_date", "transaction_date"])
+
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    def _push(fieldname: str) -> None:
+        value = str(fieldname or "").strip()
+        if not value or value in seen:
+            return
+        selected.append(value)
+        seen.add(value)
+
+    for fieldname in preferred:
+        _push(fieldname)
+
+    for field in getattr(meta, "fields", []) or []:
+        fieldname = str(getattr(field, "fieldname", "") or "").strip()
+        fieldtype = str(getattr(field, "fieldtype", "") or "").strip()
+        hidden = int(bool(getattr(field, "hidden", 0)))
+        if not fieldname or hidden or fieldtype in excluded_fieldtypes:
+            continue
+        _push(fieldname)
+        if len(selected) >= max_fields:
+            break
+
+    for fallback in ("creation", "modified"):
+        _push(fallback)
+
+    return selected[:max_fields] or ["name", "creation", "modified"]
+
+
+def _prepare_export_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(arguments, dict):
+        return arguments
+    normalized_tool = str(TOOL_NAME_MAP.get(tool_name, tool_name) or "").strip()
+    if normalized_tool not in {"get_list", "list_documents", "export_doctype_records"}:
+        return arguments
+
+    prepared = dict(arguments)
+    doctype = str(prepared.get("doctype") or "").strip()
+    if not doctype:
+        return prepared
+
+    fields = prepared.get("fields")
+    if fields is None and normalized_tool == "export_doctype_records":
+        fields = prepared.get("columns")
+    if _is_minimal_export_field_request(fields):
+        prepared["fields"] = _default_export_fields_for_doctype(doctype)
+    if normalized_tool == "export_doctype_records" and not prepared.get("columns"):
+        prepared["columns"] = prepared.get("fields")
+    return prepared
+
+
 def _parse_tool_event(text: str) -> tuple[str, dict[str, Any]]:
     raw = str(text or "").strip()
     if not raw:
@@ -1511,655 +1991,6 @@ def _parse_tool_event(text: str) -> tuple[str, dict[str, Any]]:
     except Exception:
         pass
     return tool_name.strip(), {}
-
-
-def _plan_prompt(prompt: str, context: dict[str, Any]) -> Optional[dict[str, Any]]:
-    steps = _plan_prompt_steps(prompt, context)
-    return steps[0] if steps else None
-
-
-def _plan_prompt_steps(prompt: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    raw_text = _normalize_planner_prompt(prompt)
-    text = raw_text.lower()
-    export_terms = ("create", "export", "download", "save", "generate")
-    export_format_terms = ("excel", "xlsx", "spreadsheet", "csv", "pdf", "word", "docx", "file", "document")
-    is_export_request = any(term in text for term in export_terms) and any(term in text for term in export_format_terms)
-    list_doctypes = _known_doctype_catalog()
-
-    if context.get("doctype") and context.get("docname"):
-        if re.match(r"^(summarize|show|explain)( this| current)?( record| document)?$", text):
-            return [{
-                "tool": "get_document",
-                "arguments": {"doctype": context["doctype"], "name": context["docname"]},
-                "heading": f"{context['doctype']} {context['docname']}",
-            }]
-
-        if is_export_request and re.match(
-            r"^(create|export|download|save|generate)( me)?( this| current)?( record| document)?( as| to| in)?( excel| xlsx| spreadsheet| csv| pdf| word| docx| file| document)?$",
-            text,
-            re.IGNORECASE,
-        ):
-            return [{
-                "tool": "get_document",
-                "arguments": {"doctype": context["doctype"], "name": context["docname"]},
-                "heading": f"{context['doctype']} {context['docname']}",
-            }]
-
-        if text.startswith("update this ") and " set " in text:
-            updates = _parse_field_assignments(raw_text.split(" set ", 1)[1])
-            if updates:
-                return [{
-                    "tool": "update_document",
-                    "arguments": {
-                        "doctype": context["doctype"],
-                        "name": context["docname"],
-                        "document": updates,
-                    },
-                "heading": f"Updated {context['doctype']} {context['docname']}",
-                }]
-        context_workflow_plan = _plan_context_workflow_action(raw_text, context)
-        if context_workflow_plan:
-            return context_workflow_plan
-
-    export_list_match = re.match(
-        r"^(create|export|download|save|generate)( me)?( the)?( list of)? (?P<label>employees?|customers?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)( .+)?$",
-        text,
-        re.IGNORECASE,
-    )
-    export_list_alt_match = re.match(
-        r"^(create|export|download|save|generate)( me)?( an?|the)?( excel|xlsx|spreadsheet|csv|pdf|word|docx)?( file| document)?( of| for)? (?P<label>employees?|customers?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)$",
-        text,
-        re.IGNORECASE,
-    )
-    export_list_target = export_list_match or export_list_alt_match
-    if is_export_request:
-        doctype_key = None
-        if export_list_target:
-            doctype_key = str(export_list_target.group("label") or "").strip().lower().rstrip("s")
-        if not doctype_key:
-            doctype_key = _match_known_doctype_alias(text, plural_only=True)
-        if doctype_key in list_doctypes:
-            doctype, fields = list_doctypes[doctype_key]
-            filters = _doctype_year_filters(doctype, raw_text)
-            return [{
-                "tool": "get_list",
-                "arguments": {
-                    "doctype": doctype,
-                    "fields": fields,
-                    "filters": filters,
-                    "limit_page_length": 200,
-                    "order_by": "modified desc",
-                },
-                "heading": f"{doctype} list",
-            }]
-
-    generic_report_list_match = re.match(
-        r"^(show|list|get|find|fetch|display|retrieve|pull)( me)?( the)? (?P<module>accounts|selling|stock|hr|crm|buying)? ?reports?$",
-        text,
-        re.IGNORECASE,
-    )
-    if generic_report_list_match:
-        module = _normalize_report_module(generic_report_list_match.group("module"))
-        return [{
-            "tool": "report_list",
-            "arguments": {"module": module} if module else {},
-            "heading": "Available reports",
-        }]
-
-    report_requirements_match = re.match(
-        r"^(show|get|list|find|fetch|what are)( me)?( the)?( filters| requirements| filter requirements| report requirements)( for)? (?P<name>.+)$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if report_requirements_match:
-        report_name = _normalize_name(report_requirements_match.group("name"))
-        if report_name:
-            return [
-                {
-                    "tool": "report_list",
-                    "arguments": {},
-                    "heading": "Available reports",
-                },
-                {
-                    "tool": "report_requirements",
-                    "arguments": {"report_name": report_name},
-                    "heading": report_name,
-                },
-            ]
-
-    report_match = re.match(
-        r"^(create|export|download|save)( me)?( the)?( report)? (?P<name>.+?)( (as|to|in) (excel|xlsx|spreadsheet|csv|pdf|word|docx|file|document))$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if report_match:
-        report_name = _normalize_name(report_match.group("name"))
-        report_name = re.sub(r"^(report)\s+", "", report_name, flags=re.IGNORECASE).strip()
-        if report_name:
-            return [
-                {
-                    "tool": "report_list",
-                    "arguments": {},
-                    "heading": "Available reports",
-                },
-                {
-                    "tool": "report_requirements",
-                    "arguments": {"report_name": report_name},
-                    "heading": report_name,
-                },
-                {
-                    "tool": "get_report",
-                    "arguments": {"report_name": report_name, "filters": _report_prompt_filters(raw_text)},
-                    "heading": report_name,
-                },
-            ]
-
-    report_run_match = re.match(
-        r"^(show|run|get|generate|open|display)( me)?( the)? (?P<name>.+?) report( for .+)?$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if report_run_match:
-        report_name = _normalize_name(report_run_match.group("name"))
-        if report_name:
-            return [
-                {
-                    "tool": "report_list",
-                    "arguments": {},
-                    "heading": "Available reports",
-                },
-                {
-                    "tool": "report_requirements",
-                    "arguments": {"report_name": report_name},
-                    "heading": report_name,
-                },
-                {
-                    "tool": "get_report",
-                    "arguments": {"report_name": report_name, "filters": _report_prompt_filters(raw_text)},
-                    "heading": report_name,
-                },
-            ]
-
-    generic_list_match = re.match(
-        r"^(show|list|get|find|fetch|display|retrieve|pull)( me)?( the)?( list of)? (?P<label>customers?|employees?|items?|sales orders?|sales invoices?|purchase orders?|purchase invoices?|suppliers?|quotations?|leads?|opportunities?)$",
-        text,
-        re.IGNORECASE,
-    )
-    if generic_list_match:
-        doctype_key = str(generic_list_match.group("label") or "").strip().lower().rstrip("s")
-        if doctype_key in list_doctypes:
-            doctype, fields = list_doctypes[doctype_key]
-            return [{
-                "tool": "get_list",
-                "arguments": {
-                    "doctype": doctype,
-                    "fields": fields,
-                    "limit_page_length": 20,
-                    "order_by": "modified desc",
-                },
-                "heading": f"{doctype} list",
-            }]
-
-    named_doc_patterns = {
-        key: value[0] for key, value in list_doctypes.items()
-    }
-    create_resolution_plan = _plan_named_create(raw_text, named_doc_patterns)
-    if create_resolution_plan:
-        return create_resolution_plan
-
-    update_resolution_plan = _plan_named_update(raw_text, named_doc_patterns)
-    if update_resolution_plan:
-        return update_resolution_plan
-
-    delete_resolution_plan = _plan_named_delete(raw_text, named_doc_patterns)
-    if delete_resolution_plan:
-        return delete_resolution_plan
-
-    named_workflow_plan = _plan_named_workflow_action(raw_text, named_doc_patterns)
-    if named_workflow_plan:
-        return named_workflow_plan
-
-    named_doc_match = re.match(
-        r"^(show|get|find|fetch|display|retrieve|pull)( me)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+)$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if named_doc_match:
-        doctype_key = str(named_doc_match.group("label") or "").strip().lower()
-        doctype = named_doc_patterns.get(doctype_key)
-        if doctype:
-            return [{
-                "tool": "get_document",
-                "arguments": {"doctype": doctype, "name": _normalize_name(named_doc_match.group("name"))},
-                "heading": f"{doctype} {_normalize_name(named_doc_match.group('name'))}",
-            }]
-
-    export_named_doc_match = re.match(
-        r"^(create|export|download|save|generate)( me)?( the)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+?)( (as|to|in) (excel|xlsx|spreadsheet|csv|pdf|word|docx|file|document))$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    export_named_doc_alt_match = re.match(
-        r"^(create|export|download|save|generate)( me)?( an?|the)?( excel|xlsx|spreadsheet|csv|pdf|word|docx)?( file| document)?( of| for)? (?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity) (?P<name>.+)$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    export_named_doc_target = export_named_doc_match or export_named_doc_alt_match
-    if export_named_doc_target:
-        doctype_key = str(export_named_doc_target.group("label") or "").strip().lower()
-        doctype = named_doc_patterns.get(doctype_key)
-        if doctype:
-            return [{
-                "tool": "get_document",
-                "arguments": {"doctype": doctype, "name": _normalize_name(export_named_doc_target.group("name"))},
-                "heading": f"{doctype} {_normalize_name(export_named_doc_target.group('name'))}",
-            }]
-
-    if is_export_request:
-        for alias, doctype_key in _known_doctype_aliases().items():
-            if alias == doctype_key:
-                pattern = rf"\b{re.escape(alias)}\b\s+(?P<name>.+)$"
-                match = re.search(pattern, raw_text, re.IGNORECASE)
-                if match and doctype_key in named_doc_patterns:
-                    doctype = named_doc_patterns[doctype_key]
-                    return [{
-                        "tool": "get_document",
-                        "arguments": {"doctype": doctype, "name": _normalize_name(match.group('name'))},
-                        "heading": f"{doctype} {_normalize_name(match.group('name'))}",
-                    }]
-
-    return []
-
-
-def _plan_named_update(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
-    match = re.match(
-        r"^(update|change|modify|set)\s+(?:(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)\s+)?(?P<target>.+?)\s+(?P<field>[a-zA-Z][\w\s]*?)\s+(?:to|as)\s+(?P<value>.+)$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if not match:
-        return []
-
-    label = str(match.group("label") or "").strip().lower()
-    field_label = _normalize_name(match.group("field"))
-    target = _normalize_name(match.group("target"))
-    if not label:
-        split = _split_named_update_target_and_field(_normalize_name(f"{target} {field_label}"))
-        if split:
-            target, field_label = split
-    value = _coerce_value(match.group("value"))
-    doctype_key = label or _infer_update_doctype(field_label)
-    doctype = named_doc_patterns.get(doctype_key or "")
-    display_field = _doctype_display_field(doctype)
-    if not doctype or not display_field or not target:
-        return []
-
-    updates = _parse_field_assignments(f"{field_label}: {match.group('value')}")
-    if not updates:
-        updates = {_normalize_field_key(field_label): value}
-
-    preferred_field = next(iter(updates.keys()), field_label)
-    preferred_value = updates.get(preferred_field, value)
-
-    return [
-        {
-            "tool": "update_erp_document",
-            "arguments": {
-                "doctype": doctype,
-                "record": target,
-                "field": preferred_field,
-                "value": preferred_value,
-            },
-            "heading": f"Updated {doctype} {target}",
-        }
-    ]
-
-
-def _plan_named_create(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
-    lowered = str(raw_text or "").strip().lower()
-    if lowered.startswith("how to ") or lowered.startswith("how do i ") or lowered.startswith("how can i "):
-        return []
-    match = re.match(
-        r"^(create|new|add)\s+(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)(?:\s+(?:with|set))?\s+(?P<data>.+)$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if not match:
-        return []
-    doctype = named_doc_patterns.get(str(match.group("label") or "").strip().lower())
-    payload = _parse_create_fields(match.group("data"))
-    if not doctype or not payload:
-        return []
-    return [
-        {
-            "tool": "create_document",
-            "arguments": {
-                "doctype": doctype,
-                "document": payload,
-            },
-            "heading": f"Created {doctype}",
-        }
-    ]
-
-
-def _plan_named_delete(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
-    match = re.match(
-        r"^(delete|remove|erase|trash|purge)\s+(?:(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)\s+)?(?P<target>.+)$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if not match:
-        return []
-
-    label = str(match.group("label") or "").strip().lower()
-    target = _normalize_name(match.group("target"))
-    doctype = named_doc_patterns.get(label or "")
-    display_field = _doctype_display_field(doctype)
-    if not doctype or not target:
-        return []
-
-    if display_field == "name":
-        return [
-            {
-                "tool": "delete_document",
-                "arguments": {"doctype": doctype, "name": target},
-                "heading": f"Deleted {doctype} {target}",
-            }
-        ]
-
-    return [
-        {
-            "tool": "get_list",
-            "arguments": {
-                "doctype": doctype,
-                "fields": ["name", display_field],
-                "filters": [[display_field, "=", target]],
-                "limit_page_length": 1,
-                "order_by": "modified desc",
-            },
-            "heading": f"Lookup {doctype}",
-        },
-        {
-            "tool": "delete_document",
-            "arguments": {"doctype": doctype, "name_from_previous_result": True},
-            "heading": f"Deleted {doctype} {target}",
-        },
-    ]
-
-
-def _plan_named_workflow_action(raw_text: str, named_doc_patterns: dict[str, str]) -> list[dict[str, Any]]:
-    match = re.match(
-        r"^(?P<action>submit|approve|reject|cancel|reopen)\s+(?:(?P<label>customer|employee|item|sales order|sales invoice|purchase order|purchase invoice|supplier|quotation|lead|opportunity)\s+)?(?P<target>.+)$",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if not match:
-        return []
-    action = str(match.group("action") or "").strip().lower()
-    doctype = named_doc_patterns.get(str(match.group("label") or "").strip().lower())
-    target = _normalize_name(match.group("target"))
-    if not doctype or not target:
-        return []
-    display_field = _doctype_display_field(doctype)
-    if action == "submit":
-        tool_name = "submit_document"
-    else:
-        tool_name = "run_workflow"
-    if display_field == "name":
-        arguments = {"doctype": doctype, "name": target}
-        if tool_name == "run_workflow":
-            arguments["action"] = action.title()
-        return [{"tool": tool_name, "arguments": arguments, "heading": f"{action.title()} {doctype} {target}"}]
-    arguments = {
-        "doctype": doctype,
-        "fields": ["name", display_field],
-        "filters": [[display_field, "=", target]],
-        "limit_page_length": 1,
-        "order_by": "modified desc",
-    }
-    final_arguments = {"doctype": doctype, "name_from_previous_result": True}
-    if tool_name == "run_workflow":
-        final_arguments["action"] = action.title()
-    return [
-        {"tool": "get_list", "arguments": arguments, "heading": f"Lookup {doctype}"},
-        {"tool": tool_name, "arguments": final_arguments, "heading": f"{action.title()} {doctype} {target}"},
-    ]
-
-
-def _plan_context_workflow_action(raw_text: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    match = re.match(r"^(submit|approve|reject|cancel|reopen)( this| current)?( record| document)?$", raw_text, re.IGNORECASE)
-    if not match or not context.get("doctype") or not context.get("docname"):
-        return []
-    action = str(match.group(1) or "").strip().lower()
-    if action == "submit":
-        return [{
-            "tool": "submit_document",
-            "arguments": {"doctype": context["doctype"], "name": context["docname"]},
-            "heading": f"Submitted {context['doctype']} {context['docname']}",
-        }]
-    return [{
-        "tool": "run_workflow",
-        "arguments": {"doctype": context["doctype"], "name": context["docname"], "action": action.title()},
-        "heading": f"{action.title()} {context['doctype']} {context['docname']}",
-    }]
-
-
-def _normalize_planner_prompt(prompt: str) -> str:
-    text = _normalize_name(prompt)
-    if not text:
-        return text
-    filler_patterns = [
-        r"^(can you|could you|would you|will you)\s+",
-        r"^(please|kindly)\s+",
-        r"^(can you help me\??|help me)\s*",
-        r"^(i want you to|i want to)\s+",
-    ]
-    normalized = text
-    changed = True
-    while changed:
-        changed = False
-        for pattern in filler_patterns:
-            updated = re.sub(pattern, "", normalized, flags=re.IGNORECASE).strip()
-            if updated != normalized:
-                normalized = updated
-                changed = True
-    normalized = re.sub(r"^[,:;\-]\s*", "", normalized).strip()
-    return normalized or text
-
-
-def _parse_create_fields(text: str) -> dict[str, Any]:
-    parsed = _parse_field_assignments(text)
-    if parsed:
-        return parsed
-    chunks = [item.strip() for item in re.split(r",|\band\b", str(text or ""), flags=re.IGNORECASE) if item.strip()]
-    values: dict[str, Any] = {}
-    for chunk in chunks:
-        token_match = re.match(r"^(?P<key>[a-zA-Z][\w\s]+?)\s+(?P<value>.+)$", chunk)
-        if not token_match:
-            continue
-        key = _normalize_field_key(token_match.group("key"))
-        values[key] = _coerce_value(token_match.group("value"))
-    return values
-
-
-def _report_prompt_filters(prompt: str) -> dict[str, Any]:
-    text = str(prompt or "")
-    year_match = re.search(r"\b(20\d{2})\b", text)
-    if not year_match:
-        return {}
-    year = int(year_match.group(1))
-    return {
-        "from_date": f"{year}-01-01",
-        "to_date": f"{year}-12-31",
-    }
-
-
-def _infer_update_doctype(field_label: str) -> str:
-    normalized = _normalize_field_key(field_label)
-    if normalized in {
-        "salary",
-        "basic_salary",
-        "designation",
-        "department",
-        "date_of_birth",
-        "birthday",
-        "birth_date",
-        "dob",
-        "company_email",
-        "email_id",
-        "mobile_no",
-    }:
-        return "employee"
-    return ""
-
-
-def _split_named_update_target_and_field(text: str) -> tuple[str, str] | None:
-    phrase = _normalize_name(text)
-    lowered = phrase.lower()
-    alias_map = {
-        "date of birth": "date_of_birth",
-        "birth date": "date_of_birth",
-        "birthday": "date_of_birth",
-        "dob": "date_of_birth",
-        "designation": "designation",
-        "department": "department",
-        "salary": "salary",
-        "basic salary": "basic_salary",
-        "company email": "company_email",
-        "email": "email_id",
-        "mobile": "mobile_no",
-        "phone": "phone",
-        "status": "status",
-        "territory": "territory",
-    }
-    for alias in sorted(alias_map.keys(), key=len, reverse=True):
-        if lowered == alias:
-            return "", alias_map[alias]
-        if lowered.endswith(f" {alias}"):
-            target = phrase[: len(phrase) - len(alias)].strip(" ,-")
-            if target:
-                return target, alias_map[alias]
-    return None
-
-
-def _doctype_display_field(doctype: str | None) -> str:
-    mapping = {
-        "Employee": "employee_name",
-        "Customer": "customer_name",
-        "Item": "item_name",
-        "Supplier": "supplier_name",
-        "Lead": "lead_name",
-    }
-    return mapping.get(str(doctype or "").strip(), "name")
-
-
-def _known_doctype_catalog() -> dict[str, tuple[str, list[str]]]:
-    return {
-        "employee": ("Employee", ["name", "employee_name", "designation", "department", "company_email", "status"]),
-        "customer": ("Customer", ["name", "customer_name", "territory", "customer_group"]),
-        "item": ("Item", ["name", "item_name", "item_code", "stock_uom"]),
-        "sales order": ("Sales Order", ["name", "customer", "transaction_date", "status", "grand_total"]),
-        "sales invoice": ("Sales Invoice", ["name", "customer", "posting_date", "status", "grand_total"]),
-        "purchase order": ("Purchase Order", ["name", "supplier", "transaction_date", "status", "grand_total"]),
-        "purchase invoice": ("Purchase Invoice", ["name", "supplier", "posting_date", "status", "grand_total"]),
-        "supplier": ("Supplier", ["name", "supplier_name", "supplier_group", "supplier_type"]),
-        "quotation": ("Quotation", ["name", "party_name", "transaction_date", "status", "grand_total"]),
-        "lead": ("Lead", ["name", "lead_name", "company_name", "status", "email_id"]),
-        "opportunity": ("Opportunity", ["name", "party_name", "opportunity_type", "status", "opportunity_from"]),
-    }
-
-
-def _known_doctype_aliases() -> dict[str, str]:
-    return {
-        "employee": "employee",
-        "employees": "employee",
-        "customer": "customer",
-        "customers": "customer",
-        "item": "item",
-        "items": "item",
-        "sales order": "sales order",
-        "sales orders": "sales order",
-        "sales invoice": "sales invoice",
-        "sales invoices": "sales invoice",
-        "purchase order": "purchase order",
-        "purchase orders": "purchase order",
-        "purchase invoice": "purchase invoice",
-        "purchase invoices": "purchase invoice",
-        "supplier": "supplier",
-        "suppliers": "supplier",
-        "quotation": "quotation",
-        "quotations": "quotation",
-        "lead": "lead",
-        "leads": "lead",
-        "opportunity": "opportunity",
-        "opportunities": "opportunity",
-    }
-
-
-def _match_known_doctype_alias(text: str, *, plural_only: bool = False) -> str | None:
-    normalized = str(text or "").strip().lower()
-    aliases = _known_doctype_aliases()
-    for alias in sorted(aliases.keys(), key=len, reverse=True):
-        if plural_only and alias == aliases[alias]:
-            continue
-        if re.search(rf"\b{re.escape(alias)}\b", normalized):
-            return aliases[alias]
-    return None
-
-
-def _doctype_year_filters(doctype: str, prompt: str) -> list[list[Any]]:
-    year_match = re.search(r"\b(20\d{2})\b", str(prompt or ""))
-    if not year_match:
-        return []
-    date_field_map = {
-        "Sales Order": "transaction_date",
-        "Sales Invoice": "posting_date",
-        "Purchase Order": "transaction_date",
-        "Purchase Invoice": "posting_date",
-        "Quotation": "transaction_date",
-    }
-    date_field = date_field_map.get(str(doctype or "").strip())
-    if not date_field:
-        return []
-    year = int(year_match.group(1))
-    return [
-        [date_field, ">=", f"{year}-01-01"],
-        [date_field, "<=", f"{year}-12-31"],
-    ]
-
-
-def _execute_plan_steps(
-    steps: list[dict[str, Any]],
-    *,
-    progress: Optional[dict[str, Any]] = None,
-) -> tuple[Any, list[str]]:
-    tool_events: list[str] = []
-    latest_result: Any = None
-    for step in steps:
-        tool_name = str(step.get("tool") or "").strip()
-        arguments = dict(step.get("arguments") or {})
-        heading = str(step.get("heading") or tool_name or "tool").strip()
-        if not tool_name:
-            continue
-        if arguments.pop("name_from_previous_result", False):
-            resolved_name = _extract_name_from_tool_result(latest_result)
-            if not resolved_name:
-                raise RuntimeError("Could not resolve the target document from the previous lookup result.")
-            arguments["name"] = resolved_name
-        _progress_update(progress, stage="working", step=f"Running tool: {tool_name}")
-        latest_result = _run_tool(tool_name, arguments)
-        tool_events.append(f"{tool_name} {arguments}")
-        if tool_name == "report_list":
-            report_name = str((steps[-1].get("arguments") or {}).get("report_name") or "").strip()
-            if report_name and not _report_exists_in_payload(latest_result, report_name):
-                raise RuntimeError(f"Report not found: {report_name}")
-        if tool_name == "report_requirements" and steps[-1].get("tool") == "get_report":
-            final_filters = _default_report_filters(latest_result)
-            if final_filters:
-                steps[-1].setdefault("arguments", {})
-                steps[-1]["arguments"]["filters"] = final_filters
-        _progress_update(progress, stage="working", step=f"Prepared {heading}")
-    return latest_result, tool_events
 
 
 def _extract_name_from_tool_result(payload: Any) -> str:
@@ -2324,12 +2155,15 @@ def _openai_chat(
 
     tool_specs = _prioritize_tool_specs(_openai_tool_specs(prompt, context))
     previous_response_id: str | None = None
-    pending_input: Any = _build_openai_input(history, prompt, images)
+    pending_input: Any = _build_openai_input(history, prompt, context, images)
     tool_events: list[str] = []
     rendered_payload = None
+    rendered_feedback = None
     had_tool_calls = False
     verification_requested = False
     tools_enabled = bool(tool_specs)
+    if _is_erp_intent(prompt, context) and not tool_specs:
+        return _no_tools_available_response(prompt, context)
     plain_text_retry_requested = False
     seen_tool_signatures: set[str] = set()
     last_tool_name: str | None = None
@@ -2395,7 +2229,8 @@ def _openai_chat(
                 _progress_update(progress, stage="working", step="Provider returned stray tool calls; retrying text-only")
                 pending_input = "Answer the user's last message directly in plain text. Do not call tools."
                 continue
-            raise RuntimeError("Provider returned tool calls even though no tools were offered.")
+            _progress_update(progress, stage="failed", done=True, error="No callable tools were available for this provider response.")
+            return _stray_tool_call_response()
 
         if not function_calls:
             if had_tool_calls and verify_pass_enabled and not verification_requested and previous_response_id:
@@ -2437,8 +2272,9 @@ def _openai_chat(
             seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
-                tool_result = _run_tool(tool_name, tool_input)
+                tool_result = _run_tool(tool_name, tool_input, user=context.get("user"))
                 _validate_tool_result(tool_name, tool_result)
+                tool_feedback = _tool_result_feedback_payload(tool_name, tool_result)
                 last_tool_name = tool_name
                 rendered_payload = tool_result
                 tool_events.append(f"{tool_name} {tool_input}")
@@ -2446,7 +2282,7 @@ def _openai_chat(
                     {
                         "type": "function_call_output",
                         "call_id": tool_call.get("call_id"),
-                        "output": json.dumps(tool_result, default=str),
+                        "output": json.dumps(tool_feedback, default=str),
                     }
                 )
             except Exception as exc:
@@ -2456,22 +2292,21 @@ def _openai_chat(
                     "tool": tool_name,
                     "input": tool_input,
                 }
+                tool_feedback = _tool_result_feedback_payload(tool_name, error_payload)
                 tool_events.append(f"{tool_name} {tool_input} (error)")
                 _progress_update(progress, stage="working", step=f"Tool failed: {_humanize_tool_name(tool_name)}")
                 pending_results.append(
                     {
                         "type": "function_call_output",
                         "call_id": tool_call.get("call_id"),
-                        "output": json.dumps(error_payload, default=str),
+                        "output": json.dumps(tool_feedback, default=str),
                     }
                 )
 
         pending_input = pending_results
 
-    raise RuntimeError(
-        f"AI assistant exceeded configured tool-call rounds ({max_tool_rounds}). "
-        "Try a narrower prompt or increase ERP_AI_ANTHROPIC_MAX_TOOL_ROUNDS."
-    )
+    _progress_update(progress, stage="working", step="Preparing response")
+    return _tool_round_limit_response(last_tool_name, rendered_payload, rendered_feedback, tool_events, max_tool_rounds)
 
 
 def _openai_compatible_chat(
@@ -2507,14 +2342,17 @@ def _openai_compatible_chat(
 
     system = _erp_tool_system_prompt(prompt, context)
 
-    messages = _build_openai_compatible_messages(history, prompt, images)
+    messages = _build_openai_compatible_messages(history, prompt, context, images)
     tool_specs = _prioritize_tool_specs(_openai_compatible_tool_specs(prompt, context))
     tool_events: list[str] = []
     rendered_payload = None
+    rendered_feedback = None
     had_tool_calls = False
     verification_requested = False
     disable_tool_choice = bool(compat_profile.get("disable_tool_choice_by_default"))
     tools_enabled = bool(tool_specs)
+    if _is_erp_intent(prompt, context) and not tool_specs:
+        return _no_tools_available_response(prompt, context)
     plain_text_retry_requested = False
     seen_tool_signatures: set[str] = set()
     last_tool_name: str | None = None
@@ -2609,7 +2447,8 @@ def _openai_compatible_chat(
                 _progress_update(progress, stage="working", step="Provider returned stray tool calls; retrying text-only")
                 messages.append({"role": "user", "content": "Answer directly in plain text. Do not call tools."})
                 continue
-            raise RuntimeError("Provider returned tool calls even though no tools were offered.")
+            _progress_update(progress, stage="failed", done=True, error="No callable tools were available for this provider response.")
+            return _stray_tool_call_response()
 
         if not tool_calls:
             if had_tool_calls and verify_pass_enabled and not verification_requested:
@@ -2637,7 +2476,7 @@ def _openai_compatible_chat(
             if rendered_payload is not None:
                 _progress_update(progress, stage="working", step="Preparing response")
                 return {
-                    "text": _render_provider_tool_output(last_tool_name, rendered_payload),
+                    "text": _render_provider_tool_output(last_tool_name, rendered_feedback or rendered_payload),
                     "tool_events": tool_events,
                     "payload": rendered_payload,
                 }
@@ -2657,16 +2496,18 @@ def _openai_compatible_chat(
             seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
-                tool_result = _run_tool(tool_name, tool_input)
+                tool_result = _run_tool(tool_name, tool_input, user=context.get("user"))
                 _validate_tool_result(tool_name, tool_result)
+                tool_feedback = _tool_result_feedback_payload(tool_name, tool_result)
                 last_tool_name = tool_name
                 rendered_payload = tool_result
+                rendered_feedback = tool_feedback
                 tool_events.append(f"{tool_name} {tool_input}")
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.get("id"),
-                        "content": json.dumps(tool_result, default=str),
+                        "content": json.dumps(tool_feedback, default=str),
                     }
                 )
             except Exception as exc:
@@ -2676,20 +2517,20 @@ def _openai_compatible_chat(
                     "tool": tool_name,
                     "input": tool_input,
                 }
+                tool_feedback = _tool_result_feedback_payload(tool_name, error_payload)
+                rendered_feedback = tool_feedback
                 tool_events.append(f"{tool_name} {tool_input} (error)")
                 _progress_update(progress, stage="working", step=f"Tool failed: {_humanize_tool_name(tool_name)}")
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": tool_call.get("id"),
-                        "content": json.dumps(error_payload, default=str),
+                        "content": json.dumps(tool_feedback, default=str),
                     }
                 )
 
-    raise RuntimeError(
-        f"AI assistant exceeded configured tool-call rounds ({max_tool_rounds}). "
-        "Try a narrower prompt or increase ERP_AI_ANTHROPIC_MAX_TOOL_ROUNDS."
-    )
+    _progress_update(progress, stage="working", step="Preparing response")
+    return _tool_round_limit_response(last_tool_name, rendered_payload, rendered_feedback, tool_events, max_tool_rounds)
 
 
 def _anthropic_chat(
@@ -2732,8 +2573,7 @@ def _anthropic_chat(
         headers["anthropic-version"] = anthropic_version
     if beta_param and compat_profile.get("profile") == "anthropic" and tool_choice_mode == "anthropic":
         headers["anthropic-beta"] = beta_param
-    tool_definitions = get_tool_definitions()
-    allowed_names = _selected_tool_names_for_prompt(prompt, context, tool_definitions)
+    tool_definitions = get_tool_definitions(user=context.get("user"))
     tool_specs = [
         {
             "name": name,
@@ -2741,7 +2581,6 @@ def _anthropic_chat(
             "input_schema": spec["inputSchema"],
         }
         for name, spec in tool_definitions.items()
-        if name in allowed_names
     ]
     tool_specs = _prioritize_tool_specs(tool_specs)
     if images:
@@ -2753,14 +2592,20 @@ def _anthropic_chat(
         )
 
     system = _erp_tool_system_prompt(prompt, context)
-    messages: list[dict[str, Any]] = _build_messages_with_images(history, prompt, images)
+    messages: list[dict[str, Any]] = _build_messages_with_images(history, prompt, context, images)
     tool_events: list[str] = []
     rendered_payload = None
+    rendered_feedback = None
     had_tool_calls = False
     verification_requested = False
-    tools_enabled = True
+    tools_enabled = bool(tool_specs)
+    if _is_erp_intent(prompt, context) and not tool_specs:
+        return _no_tools_available_response(prompt, context)
     tool_choice_fallback_applied = False
     disable_tool_choice = False
+    seen_tool_signatures: set[str] = set()
+    plain_text_retry_requested = False
+    last_tool_name: str | None = None
 
     for _round in range(max_tool_rounds):
         _progress_update(progress, stage="thinking", step="Thinking")
@@ -2877,22 +2722,50 @@ def _anthropic_chat(
                 "payload": rendered_payload,
             }
 
+        current_signatures = [
+            _tool_call_signature(str(tool_use.get("name") or "").strip(), tool_use.get("input", {}))
+            for tool_use in tool_uses
+        ]
+        if current_signatures and all(signature in seen_tool_signatures for signature in current_signatures):
+            if rendered_payload is not None:
+                _progress_update(progress, stage="working", step="Preparing response")
+                return {
+                    "text": _render_provider_tool_output(last_tool_name, rendered_feedback or rendered_payload),
+                    "tool_events": tool_events,
+                    "payload": rendered_payload,
+                }
+            if not plain_text_retry_requested:
+                plain_text_retry_requested = True
+                tools_enabled = False
+                _progress_update(progress, stage="working", step="Provider repeated the same tool calls; forcing final answer")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "You already have the tool results. Answer directly in plain text without any more tool calls.",
+                    }
+                )
+                continue
+
         had_tool_calls = True
         tool_results = []
         for tool_use in tool_uses:
             tool_name = tool_use["name"]
             tool_input = tool_use.get("input", {})
+            seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
+            last_tool_name = tool_name
             _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
             try:
-                tool_result = _run_tool(tool_name, tool_input)
+                tool_result = _run_tool(tool_name, tool_input, user=context.get("user"))
                 _validate_tool_result(tool_name, tool_result)
+                tool_feedback = _tool_result_feedback_payload(tool_name, tool_result)
                 tool_events.append(f"{tool_name} {tool_input}")
                 rendered_payload = tool_result
+                rendered_feedback = tool_feedback
                 tool_results.append(
                     {
                         "type": "tool_result",
                         "tool_use_id": tool_use["id"],
-                        "content": json.dumps(tool_result, default=str),
+                        "content": json.dumps(tool_feedback, default=str),
                     }
                 )
             except Exception as exc:
@@ -2902,6 +2775,8 @@ def _anthropic_chat(
                     "tool": tool_name,
                     "input": tool_input,
                 }
+                tool_feedback = _tool_result_feedback_payload(tool_name, error_payload)
+                rendered_feedback = tool_feedback
                 tool_events.append(f"{tool_name} {tool_input} (error)")
                 _progress_update(progress, stage="working", step=f"Tool failed: {_humanize_tool_name(tool_name)}")
                 tool_results.append(
@@ -2909,17 +2784,15 @@ def _anthropic_chat(
                         "type": "tool_result",
                         "tool_use_id": tool_use["id"],
                         "is_error": True,
-                        "content": json.dumps(error_payload, default=str),
+                        "content": json.dumps(tool_feedback, default=str),
                     }
                 )
 
         messages.append({"role": "user", "content": tool_results})
         _progress_update(progress, stage="working", partial_text="")
 
-    raise RuntimeError(
-        f"AI assistant exceeded configured tool-call rounds ({max_tool_rounds}). "
-        "Try a narrower prompt or increase ERP_AI_ANTHROPIC_MAX_TOOL_ROUNDS."
-    )
+    _progress_update(progress, stage="working", step="Preparing response")
+    return _tool_round_limit_response(last_tool_name, rendered_payload, rendered_feedback, tool_events, max_tool_rounds)
 
 
 def _extract_error_detail(response: requests.Response) -> str:
@@ -2979,8 +2852,7 @@ def _is_sampling_parameter_error(detail: str) -> bool:
 
 
 def _openai_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
-    tool_definitions = get_tool_definitions()
-    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, tool_definitions)
+    tool_definitions = get_tool_definitions(user=(context or {}).get("user"))
     specs = [
         {
             "type": "function",
@@ -2989,17 +2861,16 @@ def _openai_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) ->
             "parameters": spec["inputSchema"],
         }
         for name, spec in tool_definitions.items()
-        if name in allowed_names
     ]
+    specs = _prioritize_tool_specs(specs)
     if _cfg_bool("ERP_AI_OPENAI_MCP_ENABLED", False):
         specs.extend(get_remote_mcp_servers())
     return specs
 
 
 def _openai_compatible_tool_specs(prompt: str, context: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
-    tool_definitions = get_tool_definitions()
-    allowed_names = _selected_tool_names_for_prompt(prompt, context or {}, tool_definitions)
-    return [
+    tool_definitions = get_tool_definitions(user=(context or {}).get("user"))
+    specs = [
         {
             "type": "function",
             "function": {
@@ -3009,12 +2880,15 @@ def _openai_compatible_tool_specs(prompt: str, context: Optional[dict[str, Any]]
             },
         }
         for name, spec in tool_definitions.items()
-        if name in allowed_names
     ]
+    return _prioritize_tool_specs(specs)
 
 
 def _build_openai_input(
-    history: Optional[list[dict[str, Any]]], prompt: str, images: Optional[list[dict[str, str]]] = None
+    history: Optional[list[dict[str, Any]]],
+    prompt: str,
+    context: Optional[dict[str, Any]] = None,
+    images: Optional[list[dict[str, str]]] = None,
 ) -> list[dict[str, Any]]:
     rows = [dict(item) for item in (history or [])]
     normalized: list[dict[str, Any]] = []
@@ -3031,7 +2905,7 @@ def _build_openai_input(
         if role == "user":
             last_user_index = len(normalized) - 1
 
-    current_content = _build_openai_input_content(_llm_user_prompt(prompt), images)
+    current_content = _build_openai_input_content(_llm_user_prompt(prompt, context), images)
     if current_content:
         if last_user_index >= 0 and images:
             normalized[last_user_index]["content"] = current_content
@@ -3040,11 +2914,14 @@ def _build_openai_input(
         else:
             normalized[-1]["content"] = current_content
 
-    return normalized or [{"role": "user", "content": _build_openai_input_content(prompt, images)}]
+    return normalized or [{"role": "user", "content": _build_openai_input_content(_llm_user_prompt(prompt, context), images)}]
 
 
 def _build_openai_compatible_messages(
-    history: Optional[list[dict[str, Any]]], prompt: str, images: Optional[list[dict[str, str]]] = None
+    history: Optional[list[dict[str, Any]]],
+    prompt: str,
+    context: Optional[dict[str, Any]] = None,
+    images: Optional[list[dict[str, str]]] = None,
 ) -> list[dict[str, Any]]:
     rows = [dict(item) for item in (history or [])]
     normalized: list[dict[str, Any]] = []
@@ -3057,7 +2934,7 @@ def _build_openai_compatible_messages(
             continue
         normalized.append({"role": role, "content": content})
 
-    current_content = _build_openai_compatible_content(_llm_user_prompt(prompt), images)
+    current_content = _build_openai_compatible_content(_llm_user_prompt(prompt, context), images)
     normalized.append({"role": "user", "content": current_content})
     return normalized
 
@@ -3172,6 +3049,32 @@ def _extract_textual_tool_call(raw_text: Any) -> dict[str, Any] | None:
                 },
             }
 
+    json_tool_match = re.search(r"<tool_call>\s*(?P<body>\{[\s\S]*?\})\s*</tool_call>", unescaped_text, re.IGNORECASE)
+    if json_tool_match:
+        body = str(json_tool_match.group("body") or "").strip()
+        try:
+            payload = json.loads(body)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            raw_name = str(payload.get("tool_name") or payload.get("name") or "").strip()
+            tool_name = raw_name.split(".")[-1] if raw_name else ""
+            normalized_name = TOOL_NAME_MAP.get(raw_name, TOOL_NAME_MAP.get(tool_name, tool_name))
+            arguments = payload.get("args")
+            if not isinstance(arguments, dict):
+                arguments = payload.get("arguments")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            if normalized_name:
+                return {
+                    "id": f"textual-{normalized_name}",
+                    "type": "function",
+                    "function": {
+                        "name": normalized_name,
+                        "arguments": json.dumps(arguments, default=str),
+                    },
+                }
+
     inline_tool_match = re.search(
         r"<\|tool_call_begin\|>\s*(?P<name>[\w\.\-]+)(?::\d+)?\s*<\|tool_call_argument_begin\|>\s*(?P<args>\{[\s\S]*?\})\s*<\|tool_call_end\|>",
         unescaped_text,
@@ -3249,7 +3152,10 @@ def _openai_compatible_supports_sampling_controls(model: str | None) -> bool:
 
 
 def _build_messages_with_images(
-    history: Optional[list[dict[str, Any]]], prompt: str, images: Optional[list[dict[str, str]]] = None
+    history: Optional[list[dict[str, Any]]],
+    prompt: str,
+    context: Optional[dict[str, Any]] = None,
+    images: Optional[list[dict[str, str]]] = None,
 ) -> list[dict[str, Any]]:
     rows = []
     for item in history or []:
@@ -3261,9 +3167,9 @@ def _build_messages_with_images(
     image_blocks = _build_image_blocks(images)
 
     if not image_blocks:
-        return rows or [{"role": "user", "content": _llm_user_prompt(prompt)}]
+        return rows or [{"role": "user", "content": _llm_user_prompt(prompt, context)}]
 
-    merged_content = _build_user_multimodal_content(_llm_user_prompt(prompt), image_blocks)
+    merged_content = _build_user_multimodal_content(_llm_user_prompt(prompt, context), image_blocks)
     for index in range(len(rows) - 1, -1, -1):
         if str(rows[index].get("role") or "").strip().lower() == "user":
             rows[index]["content"] = merged_content
@@ -3675,8 +3581,10 @@ def _parse_sse_events(lines: list[str], endpoint: str) -> dict[str, Any]:
     }
 
 
-def _run_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
+def _run_tool(tool_name: str, arguments: dict[str, Any], user: str | None = None) -> Any:
     mapped_name = TOOL_NAME_MAP.get(tool_name, tool_name)
+    if mapped_name in {"list_documents", "export_doctype_records"}:
+        arguments = _prepare_export_tool_arguments(tool_name, arguments)
     if tool_name == "get_list":
         arguments = {
             "doctype": arguments["doctype"],
@@ -3694,26 +3602,530 @@ def _run_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
         arguments = dict(arguments)
         arguments["data"] = arguments.pop("document")
 
-    return dispatch_tool(mapped_name, arguments)
+    payload = dispatch_tool(mapped_name, arguments, user=user)
+    return _enrich_tool_result_with_request_context(mapped_name, arguments, payload)
 
 
 def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
     return f"{str(tool_name or '').strip()}::{json.dumps(arguments or {}, sort_keys=True, default=str)}"
 
 
+def _enrich_tool_result_with_request_context(tool_name: str, arguments: dict[str, Any], payload: Any) -> Any:
+    normalized_tool = _normalized_tool_name(tool_name)
+    if not isinstance(payload, dict):
+        return payload
+    if payload.get("success") is False:
+        return payload
+    if normalized_tool not in (DOCUMENT_MUTATION_TOOL_NAMES | WORKFLOW_TOOL_NAMES):
+        return payload
+
+    enriched = dict(payload)
+    requested_doctype = str(arguments.get("doctype") or "").strip()
+    requested_name = str(arguments.get("name") or arguments.get("docname") or arguments.get("document_name") or "").strip()
+
+    if requested_doctype and not str(enriched.get("doctype") or enriched.get("ref_doctype") or "").strip():
+        enriched["doctype"] = requested_doctype
+    if requested_name and not _document_name_from_payload(enriched):
+        enriched["name"] = requested_name
+
+    document = enriched.get("document")
+    if isinstance(document, dict):
+        document_copy = dict(document)
+        if requested_doctype and not str(document_copy.get("doctype") or "").strip():
+            document_copy["doctype"] = requested_doctype
+        if requested_name and not str(document_copy.get("name") or document_copy.get("docname") or document_copy.get("document_name") or "").strip():
+            document_copy["name"] = requested_name
+        enriched["document"] = document_copy
+
+    return enriched
+
+
 def _document_name_from_payload(payload: Any) -> str:
+    def _extract_name(value: Any, *, depth: int = 0) -> str:
+        if depth > 4 or not isinstance(value, dict):
+            return ""
+        for key in ("name", "docname", "document_name"):
+            current = str(value.get(key) or "").strip()
+            if current:
+                return current
+        message = value.get("message")
+        if isinstance(message, dict):
+            message_name = _extract_name(message, depth=depth + 1)
+            if message_name:
+                return message_name
+        for key in ("document", "data", "result"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                nested_name = _extract_name(nested, depth=depth + 1)
+                if nested_name:
+                    return nested_name
+        return ""
+
     if not isinstance(payload, dict):
         return ""
-    name = str(payload.get("name") or payload.get("docname") or "").strip()
+    name = _extract_name(payload)
     if name:
         return name
-    data = payload.get("data")
-    if isinstance(data, dict):
-        return str(data.get("name") or data.get("docname") or "").strip()
-    result = payload.get("result")
-    if isinstance(result, dict):
-        return str(result.get("name") or result.get("docname") or "").strip()
     return ""
+
+
+def _mutation_has_success_signal(payload: Any, normalized: dict[str, Any]) -> bool:
+    if normalized.get("document_name"):
+        return True
+    if isinstance(payload, dict):
+        if payload.get("success") is True:
+            return True
+        if isinstance(payload.get("updated_fields"), list) and payload.get("updated_fields"):
+            return True
+        if isinstance(payload.get("fields_validated"), list) and payload.get("fields_validated"):
+            return True
+        document = payload.get("document")
+        if isinstance(document, dict) and any(str(document.get(key) or "").strip() for key in ("name", "docname", "document_name")):
+            return True
+        for key in ("data", "result"):
+            nested = payload.get(key)
+            if isinstance(nested, dict) and any(str(nested.get(nested_key) or "").strip() for nested_key in ("name", "docname", "document_name")):
+                return True
+    data = normalized.get("data")
+    if isinstance(data, dict) and data:
+        return True
+    return False
+
+
+DOCUMENT_READ_TOOL_NAMES = {"get_document", "find_one_document"}
+DOCUMENT_LIST_TOOL_NAMES = {"list_documents", "get_list", "search_documents", "search_link"}
+DOCUMENT_MUTATION_TOOL_NAMES = {"create_document", "update_document", "delete_document"}
+WORKFLOW_TOOL_NAMES = {"submit_document", "run_workflow"}
+DOCTYPE_INFO_TOOL_NAMES = {"get_doctype_info"}
+REPORT_TOOL_NAMES_NORMALIZED = {"create_report", "generate_report", "get_report", "report_list", "report_requirements"}
+EXPORT_TOOL_NAMES = {"export_report", "export_doctype_records"}
+
+
+def _compact_tool_payload(payload: Any, *, max_items: int = 5) -> Any:
+    rows = _unwrap_tool_payload(payload)
+    if isinstance(rows, list):
+        compact_rows: list[Any] = []
+        for row in rows[:max_items]:
+            if isinstance(row, dict):
+                compact_rows.append(
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key
+                        and key not in {"_assign", "_comments", "_liked_by", "_seen", "_user_tags"}
+                        and not str(key).startswith("_")
+                    }
+                )
+            else:
+                compact_rows.append(row)
+        return compact_rows
+    if isinstance(rows, dict):
+        return {
+            key: value
+            for key, value in rows.items()
+            if key
+            and key not in {"_assign", "_comments", "_liked_by", "_seen", "_user_tags"}
+            and not str(key).startswith("_")
+        }
+    return rows
+
+
+def _normalized_tool_name(tool_name: str) -> str:
+    return str(tool_name or "").strip().lower()
+
+
+def _tool_kind(normalized_name: str) -> str:
+    if normalized_name in DOCUMENT_READ_TOOL_NAMES:
+        return "document_read"
+    if normalized_name in DOCUMENT_LIST_TOOL_NAMES:
+        return "document_list"
+    if normalized_name in DOCUMENT_MUTATION_TOOL_NAMES:
+        return "document_mutation"
+    if normalized_name in WORKFLOW_TOOL_NAMES:
+        return "workflow"
+    if normalized_name in DOCTYPE_INFO_TOOL_NAMES:
+        return "doctype_info"
+    if normalized_name in REPORT_TOOL_NAMES_NORMALIZED:
+        return "report"
+    if normalized_name in EXPORT_TOOL_NAMES:
+        return "export"
+    return "generic"
+
+
+def _base_normalized_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized_name = _normalized_tool_name(tool_name)
+    if not isinstance(payload, dict):
+        return {
+            "status": "unknown",
+            "tool": normalized_name,
+            "kind": _tool_kind(normalized_name),
+            "summary": f"{normalized_name or 'tool'} returned a non-structured result.",
+            "doctype": None,
+            "document_name": None,
+            "report_name": None,
+            "file_url": None,
+            "data": payload,
+            "raw_success": None,
+            "confidence": "low",
+        }
+
+    success = payload.get("success")
+    status = "error" if success is False else "success"
+    normalized: dict[str, Any] = {
+        "status": status,
+        "tool": normalized_name,
+        "kind": _tool_kind(normalized_name),
+        "summary": f"{normalized_name or 'tool'} completed.",
+        "doctype": str(payload.get("doctype") or payload.get("ref_doctype") or "").strip() or None,
+        "document_name": _document_name_from_payload(payload) or None,
+        "report_name": str(payload.get("report_name") or payload.get("name") or "").strip() or None,
+        "file_url": str(payload.get("file_url") or "").strip() or None,
+        "data": _compact_tool_payload(payload),
+        "raw_success": success if isinstance(success, bool) else None,
+        "confidence": "medium",
+    }
+    error_text = str(payload.get("error") or "").strip()
+    if error_text:
+        normalized["error"] = error_text
+    return normalized
+
+
+def _normalize_generic_tool_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or normalized.get("summary") or "Tool execution failed.").strip()
+        normalized["confidence"] = "low"
+    elif normalized.get("status") == "unknown":
+        normalized["confidence"] = "low"
+    return normalized
+
+
+def _normalize_document_list_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or "Lookup failed.").strip()
+        normalized["confidence"] = "low"
+        return normalized
+    rows = normalized.get("data")
+    row_count = len(rows) if isinstance(rows, list) else 1 if rows else 0
+    if row_count > 1:
+        normalized["status"] = "partial"
+        normalized["summary"] = "Multiple matching records were returned."
+        normalized["confidence"] = "medium"
+        normalized["next_action"] = "ask_for_disambiguation"
+    elif row_count == 1:
+        normalized["summary"] = "Found one matching record."
+        normalized["confidence"] = "high"
+    else:
+        normalized["status"] = "partial"
+        normalized["summary"] = "No matching records were returned."
+        normalized["confidence"] = "medium"
+    if row_count == 1 and isinstance(rows, list) and isinstance(rows[0], dict):
+        normalized["document_name"] = str(rows[0].get("name") or normalized.get("document_name") or "").strip() or None
+        normalized["doctype"] = str(rows[0].get("doctype") or normalized.get("doctype") or "").strip() or normalized.get("doctype")
+    return normalized
+
+
+def _normalize_document_read_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or "Document lookup failed.").strip()
+        normalized["confidence"] = "low"
+        return normalized
+    if normalized.get("document_name"):
+        normalized["summary"] = f"Loaded {(normalized.get('doctype') or 'document')} {normalized.get('document_name')}."
+        normalized["confidence"] = "high"
+    elif normalized.get("status") == "unknown":
+        normalized["confidence"] = "low"
+    return normalized
+
+
+def _normalize_doctype_info_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or "DocType metadata lookup failed.").strip()
+        normalized["confidence"] = "low"
+        return normalized
+    data = payload if isinstance(payload, dict) else {}
+    fields = data.get("fields") or []
+    if not isinstance(fields, list):
+        fields = []
+    normalized["summary"] = f"Loaded metadata for {normalized.get('doctype') or 'DocType'} with {len(fields)} field(s)."
+    normalized["data"] = {
+        "doctype": normalized.get("doctype"),
+        "module": data.get("module"),
+        "is_tree": bool(data.get("is_tree")),
+        "is_submittable": bool(data.get("is_submittable")),
+        "required_fields": [
+            str(row.get("fieldname") or "").strip()
+            for row in fields
+            if isinstance(row, dict) and row.get("reqd")
+        ][:12],
+        "editable_fields": [
+            str(row.get("fieldname") or "").strip()
+            for row in fields
+            if isinstance(row, dict) and not row.get("read_only")
+        ][:20],
+    }
+    normalized["confidence"] = "high"
+    return normalized
+
+
+def _normalize_mutation_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or "ERP mutation failed.").strip()
+        normalized["confidence"] = "low"
+        return normalized
+    action_label = {
+        "create_document": "Created",
+        "update_document": "Updated",
+        "delete_document": "Deleted",
+    }.get(_normalized_tool_name(tool_name), "Processed")
+    if normalized.get("document_name"):
+        normalized["summary"] = f"{action_label} {(normalized.get('doctype') or 'document')} {normalized.get('document_name')}."
+        normalized["confidence"] = "high"
+    else:
+        normalized["status"] = "partial"
+        normalized["summary"] = f"Mutation was attempted, but ERP did not confirm the resulting {(normalized.get('doctype') or 'document')} identifier."
+        normalized["confidence"] = "low"
+        normalized["next_action"] = "do_not_claim_mutation_success"
+    return normalized
+
+
+def _normalize_workflow_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or "Workflow action failed.").strip()
+        normalized["confidence"] = "low"
+        return normalized
+    action = str(payload.get("action") or payload.get("workflow_action") or "").strip()
+    document_name = normalized.get("document_name")
+    doctype = normalized.get("doctype") or "document"
+    if document_name and action:
+        normalized["summary"] = f"Applied workflow action '{action}' to {doctype} {document_name}."
+        normalized["confidence"] = "high"
+    elif document_name and not action:
+        normalized["status"] = "partial"
+        normalized["summary"] = f"Workflow updated {doctype} {document_name}, but ERP did not explicitly confirm which action was applied."
+        normalized["confidence"] = "medium"
+    else:
+        normalized["status"] = "partial"
+        normalized["summary"] = "Workflow action was attempted, but ERP did not confirm the target document and action."
+        normalized["confidence"] = "low"
+        normalized["next_action"] = "do_not_claim_mutation_success"
+    return normalized
+
+
+def _normalize_report_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or "Report operation failed.").strip()
+        normalized["confidence"] = "low"
+        return normalized
+    data = payload if isinstance(payload, dict) else {}
+    result_rows = data.get("result") or data.get("data") or data.get("reports")
+    if isinstance(result_rows, list):
+        normalized["data"] = _compact_tool_payload({"data": result_rows}, max_items=10)
+        normalized["summary"] = f"Prepared report result with {len(result_rows)} row(s)."
+        normalized["confidence"] = "high"
+    elif normalized.get("report_name"):
+        normalized["summary"] = f"Prepared report result for {normalized.get('report_name')}."
+        normalized["confidence"] = "medium"
+    else:
+        normalized["status"] = "partial"
+        normalized["summary"] = "Report operation returned without rows or report identity."
+        normalized["confidence"] = "low"
+    return normalized
+
+
+def _normalize_export_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _base_normalized_result(tool_name, payload)
+    if normalized.get("status") == "error":
+        normalized["summary"] = str(normalized.get("error") or "Export failed.").strip()
+        normalized["confidence"] = "low"
+        return normalized
+    file_name = str(payload.get("file_name") or "").strip()
+    file_url = normalized.get("file_url")
+    if file_url:
+        normalized["summary"] = f"Prepared export file {file_name or normalized.get('file_url')}."
+        normalized["confidence"] = "high"
+    else:
+        normalized["status"] = "partial"
+        normalized["summary"] = "Export was requested, but ERP did not return a downloadable file."
+        normalized["confidence"] = "low"
+        normalized["next_action"] = "inform_user_export_not_ready"
+    return normalized
+
+
+TOOL_RESULT_NORMALIZERS: dict[str, Any] = {}
+for _tool_name in DOCUMENT_READ_TOOL_NAMES:
+    TOOL_RESULT_NORMALIZERS[_tool_name] = _normalize_document_read_result
+for _tool_name in DOCUMENT_LIST_TOOL_NAMES:
+    TOOL_RESULT_NORMALIZERS[_tool_name] = _normalize_document_list_result
+for _tool_name in DOCUMENT_MUTATION_TOOL_NAMES:
+    TOOL_RESULT_NORMALIZERS[_tool_name] = _normalize_mutation_result
+for _tool_name in WORKFLOW_TOOL_NAMES:
+    TOOL_RESULT_NORMALIZERS[_tool_name] = _normalize_workflow_result
+for _tool_name in DOCTYPE_INFO_TOOL_NAMES:
+    TOOL_RESULT_NORMALIZERS[_tool_name] = _normalize_doctype_info_result
+for _tool_name in REPORT_TOOL_NAMES_NORMALIZED:
+    TOOL_RESULT_NORMALIZERS[_tool_name] = _normalize_report_result
+for _tool_name in EXPORT_TOOL_NAMES:
+    TOOL_RESULT_NORMALIZERS[_tool_name] = _normalize_export_result
+
+
+def _normalize_tool_result(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized_name = str(tool_name or "").strip().lower()
+    normalizer = TOOL_RESULT_NORMALIZERS.get(normalized_name, _normalize_generic_tool_result)
+    return normalizer(tool_name, payload)
+
+
+def _verify_generic_tool_result(tool_name: str, payload: Any, normalized: dict[str, Any]) -> dict[str, Any]:
+    issues: list[str] = []
+    warnings: list[str] = []
+    checks: dict[str, Any] = {}
+
+    structured_payload = isinstance(payload, dict)
+    checks["structured_payload"] = structured_payload
+    if not structured_payload:
+        issues.append("Tool returned a non-structured payload.")
+
+    status = str(normalized.get("status") or "").strip().lower()
+    checks["status"] = status
+
+    if status == "error":
+        issues.append(str(normalized.get("error") or normalized.get("summary") or "Tool returned an error."))
+    elif status not in {"success", "partial", "unknown"}:
+        warnings.append(f"Normalized result has unexpected status '{status}'.")
+
+    if structured_payload:
+        embedded_error_fields = [
+            payload.get("error"),
+            payload.get("errors"),
+            payload.get("exc"),
+            payload.get("exception"),
+            payload.get("traceback"),
+            payload.get("_server_messages"),
+        ]
+        has_embedded_error = any(bool(item) for item in embedded_error_fields)
+        checks["has_embedded_error"] = has_embedded_error
+        if has_embedded_error and status != "error":
+            warnings.append("Payload contains embedded error indicators.")
+
+    if status == "unknown":
+        warnings.append("Tool result could not be fully classified.")
+
+    if status == "success" and not str(normalized.get("summary") or "").strip():
+        warnings.append("Successful result is missing a summary.")
+
+    kind = str(normalized.get("kind") or "")
+    if not structured_payload and kind in {"document_mutation", "workflow", "export"}:
+        issues.append("This tool class requires a structured payload to confirm success.")
+
+    return {"ok": not issues, "issues": issues, "warnings": warnings, "checks": checks}
+
+
+def _verify_document_list_result(tool_name: str, payload: Any, normalized: dict[str, Any]) -> dict[str, Any]:
+    result = _verify_generic_tool_result(tool_name, payload, normalized)
+    rows = normalized.get("data")
+    row_count = len(rows) if isinstance(rows, list) else 1 if rows else 0
+    result.setdefault("checks", {})
+    result["checks"]["row_count"] = row_count
+    result["checks"]["multiple_matches"] = row_count > 1
+    result["checks"]["requires_disambiguation"] = row_count > 1
+    if row_count > 1:
+        result["warnings"].append("Multiple matching records were returned.")
+    return result
+
+
+def _verify_document_mutation_result(tool_name: str, payload: Any, normalized: dict[str, Any]) -> dict[str, Any]:
+    result = _verify_generic_tool_result(tool_name, payload, normalized)
+    result.setdefault("checks", {})
+    result["checks"]["has_doctype"] = bool(normalized.get("doctype"))
+    result["checks"]["has_document_name"] = bool(normalized.get("document_name"))
+    result["checks"]["has_required_identifiers"] = bool(normalized.get("doctype") and normalized.get("document_name"))
+    success_signal = _mutation_has_success_signal(payload, normalized)
+    result["checks"]["has_success_signal"] = success_signal
+    if normalized.get("status") != "error" and not normalized.get("document_name"):
+        result["warnings"].append("ERP did not confirm the target document name.")
+        if not success_signal:
+            result["issues"].append("ERP did not provide enough confirmation for the mutation result.")
+    result["ok"] = not result["issues"]
+    return result
+
+
+def _verify_workflow_result(tool_name: str, payload: Any, normalized: dict[str, Any]) -> dict[str, Any]:
+    result = _verify_document_mutation_result(tool_name, payload, normalized)
+    result.setdefault("checks", {})
+    if normalized.get("status") != "error":
+        action = str(payload.get("action") or payload.get("workflow_action") or "").strip()
+        has_action = bool(action)
+        result["checks"]["has_workflow_action"] = has_action
+        if not has_action:
+            result["warnings"].append("ERP did not explicitly confirm which workflow action was applied.")
+    return result
+
+
+def _verify_report_result(tool_name: str, payload: Any, normalized: dict[str, Any]) -> dict[str, Any]:
+    result = _verify_generic_tool_result(tool_name, payload, normalized)
+    normalized_name = _normalized_tool_name(tool_name)
+    result.setdefault("checks", {})
+    result["checks"]["has_report_name"] = bool(normalized.get("report_name"))
+    if normalized_name == "create_report" and not normalized.get("report_name"):
+        result["issues"].append("ERP did not confirm the created report name.")
+    result["ok"] = not result["issues"]
+    return result
+
+
+def _verify_export_result(tool_name: str, payload: Any, normalized: dict[str, Any]) -> dict[str, Any]:
+    result = _verify_generic_tool_result(tool_name, payload, normalized)
+    result.setdefault("checks", {})
+    has_file_url = bool(normalized.get("file_url"))
+    result["checks"]["has_file_url"] = has_file_url
+    if normalized.get("status") != "error" and not has_file_url:
+        result["issues"].append("ERP did not return a downloadable file.")
+    result["ok"] = not result["issues"]
+    return result
+
+
+TOOL_RESULT_VERIFIERS: dict[str, Any] = {}
+for _tool_name in DOCUMENT_LIST_TOOL_NAMES:
+    TOOL_RESULT_VERIFIERS[_tool_name] = _verify_document_list_result
+for _tool_name in DOCUMENT_MUTATION_TOOL_NAMES:
+    TOOL_RESULT_VERIFIERS[_tool_name] = _verify_document_mutation_result
+for _tool_name in WORKFLOW_TOOL_NAMES:
+    TOOL_RESULT_VERIFIERS[_tool_name] = _verify_workflow_result
+for _tool_name in REPORT_TOOL_NAMES_NORMALIZED:
+    TOOL_RESULT_VERIFIERS[_tool_name] = _verify_report_result
+for _tool_name in EXPORT_TOOL_NAMES:
+    TOOL_RESULT_VERIFIERS[_tool_name] = _verify_export_result
+
+
+def _verify_tool_result(tool_name: str, payload: Any, normalized: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    normalized_payload = normalized or _normalize_tool_result(tool_name, payload)
+    verifier = TOOL_RESULT_VERIFIERS.get(_normalized_tool_name(tool_name), _verify_generic_tool_result)
+    result = verifier(tool_name, payload, normalized_payload)
+    result.setdefault("issues", [])
+    result.setdefault("warnings", [])
+    result["ok"] = not bool(result.get("issues"))
+    return result
+
+
+def _tool_result_feedback_payload(tool_name: str, payload: Any) -> dict[str, Any]:
+    normalized = _normalize_tool_result(tool_name, payload)
+    verification = _verify_tool_result(tool_name, payload, normalized)
+    if not verification.get("ok"):
+        normalized = dict(normalized)
+        normalized["status"] = "error"
+        if verification.get("issues"):
+            normalized["error"] = "; ".join(str(item).strip() for item in verification.get("issues") if str(item).strip())
+            normalized["summary"] = str(normalized["error"]).strip() or str(normalized.get("summary") or "").strip()
+        normalized["confidence"] = "low"
+    return {
+        "normalized_result": normalized,
+        "verification": verification,
+    }
 
 
 def _validate_tool_result(tool_name: str, payload: Any) -> None:
@@ -3726,7 +4138,8 @@ def _validate_tool_result(tool_name: str, payload: Any) -> None:
 
     normalized = str(tool_name or "").strip().lower()
     if normalized == "create_document":
-        if not _document_name_from_payload(payload):
+        normalized_payload = _normalize_tool_result(tool_name, payload)
+        if not _document_name_from_payload(payload) and not _mutation_has_success_signal(payload, normalized_payload):
             raise RuntimeError("FAC did not confirm the created document name.")
     elif normalized == "create_report":
         report_name = str(payload.get("name") or "").strip()
@@ -3754,6 +4167,32 @@ def _validate_tool_result(tool_name: str, payload: Any) -> None:
 
 
 def _render_provider_tool_output(tool_name: str | None, payload: Any) -> str:
+    if isinstance(payload, dict) and isinstance(payload.get("normalized_result"), dict):
+        normalized_result = payload.get("normalized_result") or {}
+        verification = payload.get("verification") or {}
+        summary = str(normalized_result.get("summary") or "").strip()
+        issues = verification.get("issues") or []
+        warnings = verification.get("warnings") or []
+        lines = [summary or "Tool result prepared."]
+        if issues:
+            issue_text = "; ".join(str(item).strip() for item in issues if str(item).strip())
+            if issue_text:
+                lines.append(f"Issue: {issue_text}")
+        elif warnings:
+            warning_text = "; ".join(str(item).strip() for item in warnings if str(item).strip())
+            if warning_text:
+                lines.append(f"Note: {warning_text}")
+        document_name = str(normalized_result.get("document_name") or "").strip()
+        report_name = str(normalized_result.get("report_name") or "").strip()
+        file_url = str(normalized_result.get("file_url") or "").strip()
+        if document_name:
+            lines.append(f"Document: {document_name}")
+        elif report_name:
+            lines.append(f"Report: {report_name}")
+        elif file_url:
+            lines.append(f"File: {file_url}")
+        return "\n".join(lines).strip()
+
     reverse_map = {
         "list_documents": "get_list",
         "generate_report": "get_report",
@@ -3762,6 +4201,7 @@ def _render_provider_tool_output(tool_name: str | None, payload: Any) -> str:
     if normalized in {
         "get_list",
         "get_document",
+        "get_doctype_info",
         "get_report",
         "report_list",
         "report_requirements",
@@ -3791,6 +4231,8 @@ def _render_tool_output(tool_name: str, payload: Any, heading: Optional[str] = N
         return _format_list_result(payload.get("data", payload), heading)
     if tool_name == "get_document":
         return _format_document_result(payload.get("data", payload), heading)
+    if tool_name == "get_doctype_info":
+        return _format_doctype_info_result(payload, heading)
     if tool_name == "get_report":
         return _format_report_result(payload, heading)
     if tool_name == "report_list":
@@ -3822,20 +4264,29 @@ def _format_list_result(payload: Any, heading: Optional[str]) -> str:
 def _format_document_result(payload: Any, heading: Optional[str]) -> str:
     if not isinstance(payload, dict):
         return str(payload)
-    title = heading or payload.get("name") or "Document"
-    lines = [title, ""]
-    shown = 0
-    for key in ["name", "customer_name", "employee_name", "designation", "status", "territory", "modified", "modified_by"]:
+    name = str(payload.get("name") or "").strip()
+    status = payload.get("status")
+    primary_label = payload.get("title") or payload.get("customer_name") or payload.get("employee_name") or payload.get("item_name")
+    title = heading or name or primary_label or "Document"
+    lines = [title]
+    if primary_label and str(primary_label).strip() and str(primary_label).strip() != title:
+        lines.append(f"Label: {primary_label}")
+    if status not in (None, "", [], {}):
+        lines.append(f"Status: {status}")
+    if name and name != title:
+        lines.append(f"Document: {name}")
+    details = []
+    for key in ["doctype", "posting_date", "transaction_date", "company", "warehouse", "territory", "modified", "modified_by"]:
         value = payload.get(key)
         if value not in (None, "", [], {}):
-            lines.append(f"{key}: {value}")
-            shown += 1
-    if shown == 0:
+            details.append(f"{key.replace('_', ' ').title()}: {value}")
+    if details:
+        lines.extend(details[:6])
+    if len(lines) == 1:
         for key, value in payload.items():
             if value not in (None, "", [], {}):
-                lines.append(f"{key}: {value}")
-                shown += 1
-            if shown >= 8:
+                lines.append(f"{key.replace('_', ' ').title()}: {value}")
+            if len(lines) >= 8:
                 break
     return "\n".join(lines)
 
@@ -3848,6 +4299,42 @@ def _format_report_result(payload: Any, heading: Optional[str]) -> str:
     if isinstance(payload, list):
         return _format_list_result(payload, heading or "Report results")
     return _format_generic_result(payload, heading)
+
+
+def _format_doctype_info_result(payload: Any, heading: Optional[str]) -> str:
+    if not isinstance(payload, dict):
+        return _format_generic_result(payload, heading or "DocType metadata")
+
+    doctype = str(payload.get("doctype") or heading or "DocType").strip() or "DocType"
+    module = str(payload.get("module") or "").strip()
+    fields = payload.get("fields") or []
+    if not isinstance(fields, list):
+        fields = []
+
+    writable_fields = []
+    required_fields = []
+    for row in fields:
+        if not isinstance(row, dict):
+            continue
+        fieldname = str(row.get("fieldname") or "").strip()
+        fieldtype = str(row.get("fieldtype") or "").strip()
+        if not fieldname or fieldtype in {"Section Break", "Column Break", "Tab Break", "Fold", "HTML", "Button"}:
+            continue
+        if not int(bool(row.get("read_only"))):
+            writable_fields.append(fieldname)
+        if int(bool(row.get("reqd"))):
+            required_fields.append(fieldname)
+
+    lines = [f"{doctype} metadata loaded."]
+    if module:
+        lines.append(f"Module: {module}")
+    if required_fields:
+        lines.append(f"Required fields: {', '.join(required_fields[:8])}")
+    if writable_fields:
+        lines.append(f"Editable fields: {', '.join(writable_fields[:12])}")
+    if not required_fields and not writable_fields:
+        lines.append(f"Field count: {len(fields)}")
+    return "\n".join(lines)
 
 
 def _format_report_list_result(payload: Any, heading: Optional[str]) -> str:
@@ -3897,12 +4384,32 @@ def _format_report_requirements_result(payload: Any, heading: Optional[str]) -> 
 def _format_mutation_result(payload: Any, heading: Optional[str]) -> str:
     if not isinstance(payload, dict):
         return str(payload)
-    title = heading or payload.get("message") or "Operation completed"
-    lines = [title, ""]
-    for key in ["message", "doctype", "name", "modified", "modified_by", "creation"]:
+    message = str(payload.get("message") or "").strip()
+    doctype = str(payload.get("doctype") or "").strip()
+    name = _document_name_from_payload(payload)
+    status = str(payload.get("status") or "").strip()
+    title = heading or message or "Operation completed"
+    lines = [title]
+    if doctype and name:
+        lines.append(f"{doctype} {name}")
+    elif name:
+        lines.append(name)
+    elif doctype:
+        lines.append(doctype)
+    if status:
+        lines.append(f"Status: {status}")
+    detail_lines = []
+    for key in ["creation", "modified", "modified_by", "owner"]:
         value = payload.get(key)
         if value not in (None, "", [], {}):
-            lines.append(f"{key}: {value}")
+            detail_lines.append(f"{key.replace('_', ' ').title()}: {value}")
+    updated_parts = payload.get("updated_parts")
+    if isinstance(updated_parts, list) and updated_parts:
+        detail_lines.append(f"Updated parts: {', '.join(str(item) for item in updated_parts[:6])}")
+    if message and message != title:
+        detail_lines.insert(0, message)
+    if detail_lines:
+        lines.extend(detail_lines[:5])
     return "\n".join(lines)
 
 

@@ -44,6 +44,52 @@ def _payload_to_rows(payload: Any) -> list[dict[str, Any]]:
     return [{"value": _stringify_cell(payload)}]
 
 
+def _attachment_label_for_filename(file_name: str) -> str:
+    extension = str(file_name or "").strip().rsplit(".", 1)
+    ext = extension[1].lower() if len(extension) == 2 else ""
+    return {
+        "xlsx": "Excel",
+        "xls": "Excel",
+        "csv": "CSV",
+        "pdf": "PDF",
+        "docx": "Word",
+        "doc": "Word",
+    }.get(ext, "File")
+
+
+def _extract_direct_file_attachment(payload: Any, *, max_depth: int = 5) -> dict[str, str] | None:
+    def _walk(value: Any, depth: int) -> dict[str, str] | None:
+        if depth > max_depth:
+            return None
+        if isinstance(value, dict):
+            file_url = str(value.get("file_url") or "").strip()
+            file_name = str(value.get("file_name") or "").strip()
+            if file_url and file_name:
+                extension = file_name.rsplit(".", 1)
+                file_type = extension[1].lower() if len(extension) == 2 else ""
+                return {
+                    "id": uuid.uuid4().hex,
+                    "label": _attachment_label_for_filename(file_name),
+                    "filename": file_name,
+                    "file_type": file_type,
+                    "file_url": file_url,
+                }
+            for key in ("result", "data", "normalized_result"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    found = _walk(nested, depth + 1)
+                    if found:
+                        return found
+        elif isinstance(value, list):
+            for item in value:
+                found = _walk(item, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return _walk(payload, 0)
+
+
 def _unwrap_export_payload(payload: Any) -> Any:
     current = payload
     for _ in range(5):
@@ -151,6 +197,10 @@ def create_message_artifacts(
     title: str,
     formats: list[str] | None = None,
 ) -> dict[str, Any]:
+    direct_attachment = _extract_direct_file_attachment(payload)
+    if direct_attachment:
+        return {"attachments": [direct_attachment], "exports": {}}
+
     rows = _payload_to_rows(payload)
     if not rows:
         return {"attachments": [], "exports": {}}
@@ -196,6 +246,9 @@ def add_message_attachment_urls(message_name: str, package: dict[str, Any]) -> d
         if not isinstance(item, dict):
             continue
         row = dict(item)
+        if str(row.get("file_url") or "").strip():
+            hydrated.append(row)
+            continue
         attachment_id = str(row.get("id") or "").strip()
         export_id = str(row.get("export_id") or "").strip()
         if not attachment_id or export_id not in exports:

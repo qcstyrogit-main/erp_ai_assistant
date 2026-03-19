@@ -83,10 +83,17 @@ def _extract_remote_tool_definitions(result: Any) -> dict[str, dict[str, Any]]:
         input_schema = tool.get("inputSchema")
         if not isinstance(input_schema, dict):
             input_schema = {"type": "object", "properties": {}}
+        annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else None
+        normalized_schema = _normalize_input_schema(input_schema)
         definitions[name] = {
-            "description": str(tool.get("description") or "").strip() or name,
-            "inputSchema": input_schema,
-            "annotations": tool.get("annotations"),
+            "description": _enriched_tool_description(
+                name,
+                str(tool.get("description") or "").strip() or name,
+                normalized_schema,
+                annotations,
+            ),
+            "inputSchema": normalized_schema,
+            "annotations": annotations,
         }
     return definitions
 
@@ -110,9 +117,9 @@ def _extract_remote_tool_result(result: Any) -> Any:
         return text
 
 
-def _registry_tool_definitions(registry: Any) -> dict[str, dict[str, Any]]:
+def _registry_tool_definitions(registry: Any, user: str | None = None) -> dict[str, dict[str, Any]]:
     try:
-        tools = registry.get_available_tools(user=frappe.session.user)
+        tools = registry.get_available_tools(user=user or frappe.session.user)
     except Exception:
         return {}
 
@@ -126,12 +133,100 @@ def _registry_tool_definitions(registry: Any) -> dict[str, dict[str, Any]]:
         input_schema = tool.get("inputSchema")
         if not isinstance(input_schema, dict):
             input_schema = {"type": "object", "properties": {}}
+        annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else None
+        normalized_schema = _normalize_input_schema(input_schema)
         definitions[name] = {
-            "description": str(tool.get("description") or "").strip() or name,
-            "inputSchema": input_schema,
-            "annotations": tool.get("annotations"),
+            "description": _enriched_tool_description(
+                name,
+                str(tool.get("description") or "").strip() or name,
+                normalized_schema,
+                annotations,
+            ),
+            "inputSchema": normalized_schema,
+            "annotations": annotations,
         }
     return definitions
+
+
+def _normalize_input_schema(input_schema: Any) -> dict[str, Any]:
+    schema = input_schema if isinstance(input_schema, dict) else {"type": "object", "properties": {}}
+    if schema.get("type") != "object":
+        schema = {"type": "object", "properties": {}}
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        schema = dict(schema)
+        schema["properties"] = {}
+    if "additionalProperties" not in schema:
+        schema = dict(schema)
+        schema["additionalProperties"] = False
+    return schema
+
+
+def _schema_summary(input_schema: dict[str, Any]) -> str:
+    properties = input_schema.get("properties") or {}
+    required = input_schema.get("required") or []
+    if not isinstance(properties, dict):
+        properties = {}
+    if not isinstance(required, list):
+        required = []
+
+    property_names = [str(name).strip() for name in properties.keys() if str(name).strip()]
+    required_names = [str(name).strip() for name in required if str(name).strip()]
+    parts: list[str] = []
+    if required_names:
+        parts.append(f"required: {', '.join(required_names[:6])}")
+    if property_names:
+        parts.append(f"fields: {', '.join(property_names[:10])}")
+    return "; ".join(parts)
+
+
+def _enriched_tool_description(
+    name: str,
+    description: str,
+    input_schema: dict[str, Any],
+    annotations: dict[str, Any] | None,
+) -> str:
+    text = str(description or "").strip() or str(name or "").strip()
+    lowered = str(name or "").strip().lower()
+    schema_hint = _schema_summary(input_schema)
+    annotation_hint = ""
+    if annotations:
+        titles = [str(value).strip() for value in annotations.values() if str(value).strip()]
+        if titles:
+            annotation_hint = f" annotations: {', '.join(titles[:4])}."
+
+    workflow_hint = ""
+    if lowered == "get_doctype_info":
+        workflow_hint = " Use this before create_document or update_document to learn exact fieldnames, required fields, and child tables."
+    elif lowered == "create_document":
+        workflow_hint = (
+            " Use after get_doctype_info. Pass the exact DocType in doctype and the document body in data."
+            " Child tables must be arrays of objects under the correct table field."
+        )
+    elif lowered == "update_document":
+        workflow_hint = (
+            " Use after identifying the exact target document. Pass doctype, name, and only the fields that should change."
+        )
+    elif lowered == "search_link":
+        workflow_hint = " Use this to resolve referenced records such as Item, Customer, Supplier, Warehouse, Company, or User before mutations."
+    elif lowered == "list_documents":
+        workflow_hint = " Use this to identify candidate records or confirm targets before update or workflow actions."
+    elif lowered == "get_document":
+        workflow_hint = " Use this to read the exact current document state before updating, submitting, or applying workflow actions."
+    elif lowered == "export_doctype_records":
+        workflow_hint = (
+            " Use this to generate a real export file for a DocType."
+            " Always pass doctype and a useful fields list."
+            " Do not rely on the default name-only export when the user asks for a detailed file."
+        )
+
+    if schema_hint:
+        text = f"{text} Input schema: {schema_hint}."
+    if workflow_hint:
+        text = f"{text}{workflow_hint}"
+    if annotation_hint:
+        text = f"{text}{annotation_hint}"
+    return text.strip()
 
 
 def test_remote_mcp_connection() -> dict[str, Any]:
@@ -187,18 +282,18 @@ def _fac_registry():
         return None
 
 
-def _local_fac_available() -> tuple[Any, dict[str, dict[str, Any]]]:
+def _local_fac_available(user: str | None = None) -> tuple[Any, dict[str, dict[str, Any]]]:
     registry = _fac_registry()
     if not registry:
         return None, {}
-    definitions = _registry_tool_definitions(registry)
+    definitions = _registry_tool_definitions(registry, user=user)
     if not definitions:
         return registry, {}
     return registry, definitions
 
 
-def get_tool_definitions() -> dict[str, dict[str, Any]]:
-    _registry, local_definitions = _local_fac_available()
+def get_tool_definitions(user: str | None = None) -> dict[str, dict[str, Any]]:
+    _registry, local_definitions = _local_fac_available(user=user)
     if local_definitions:
         return local_definitions
 
@@ -212,9 +307,11 @@ def get_tool_definitions() -> dict[str, dict[str, Any]]:
     return {}
 
 
-def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
-    registry, local_definitions = _local_fac_available()
+def dispatch_tool(name: str, arguments: dict[str, Any], user: str | None = None) -> Any:
+    registry, local_definitions = _local_fac_available(user=user)
     if registry and local_definitions:
+        if user:
+            frappe.set_user(user)
         return registry.execute_tool(name, arguments or {})
 
     try:
@@ -234,7 +331,7 @@ def dispatch_tool(name: str, arguments: dict[str, Any]) -> Any:
 
 
 def test_fac_connection() -> dict[str, Any]:
-    registry, local_definitions = _local_fac_available()
+    registry, local_definitions = _local_fac_available(user=frappe.session.user)
     if registry and local_definitions:
         tool_names = sorted(local_definitions.keys())
         return {

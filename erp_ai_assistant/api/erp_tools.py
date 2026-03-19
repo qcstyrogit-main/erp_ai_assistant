@@ -1118,9 +1118,13 @@ def continue_pending_action_internal(pending_action: dict[str, Any], prompt: str
         existing_values = pending_action.get("values") or {}
         if not isinstance(existing_values, dict):
             existing_values = {}
+        confirmation_only = _is_confirmation_reply(prompt_text)
+        missing_fields = pending_action.get("missing_fields") or []
 
         ambiguous_link = pending_action.get("ambiguous_link") or {}
         if isinstance(ambiguous_link, dict) and ambiguous_link.get("fieldname"):
+            if confirmation_only:
+                return None
             fieldname = str(ambiguous_link.get("fieldname") or "").strip()
             if fieldname:
                 merged_values = dict(existing_values)
@@ -1141,8 +1145,9 @@ def continue_pending_action_internal(pending_action: dict[str, Any], prompt: str
             return create_erp_document_internal(doctype, merged_values)
 
         additional_values = extract_field_value_pairs_internal(doctype, prompt_text)
-        missing_fields = pending_action.get("missing_fields") or []
-        if not additional_values and isinstance(missing_fields, list) and len(missing_fields) == 1:
+        if confirmation_only and not missing_child_rows and not missing_fields:
+            return create_erp_document_internal(doctype, existing_values)
+        if not additional_values and not confirmation_only and isinstance(missing_fields, list) and len(missing_fields) == 1:
             fieldname = str(missing_fields[0].get("fieldname") or "").strip()
             if fieldname:
                 additional_values[fieldname] = prompt_text
@@ -1211,6 +1216,30 @@ def continue_pending_action_internal(pending_action: dict[str, Any], prompt: str
         return run_workflow_action_internal(doctype=doctype, record=chosen or record, action=workflow_action)
 
     return None
+
+
+def _is_confirmation_reply(prompt_text: str) -> bool:
+    text = str(prompt_text or "").strip().lower()
+    if not text:
+        return False
+    confirmations = {
+        "yes",
+        "yes please",
+        "yes proceed",
+        "proceed",
+        "continue",
+        "go ahead",
+        "create it",
+        "yes create it",
+        "yes proceed creating",
+        "confirm",
+        "confirmed",
+        "okay proceed",
+        "ok proceed",
+    }
+    if text in confirmations:
+        return True
+    return text.startswith("yes proceed") or text.startswith("go ahead") or text.startswith("please proceed")
 
 
 def _extract_pending_choice(pending_action: dict[str, Any], prompt_text: str) -> str:

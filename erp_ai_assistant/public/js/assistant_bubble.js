@@ -52,6 +52,21 @@
       /** @type {Array<Object>} */
       this.pendingImages = [];
 
+        /** @type {Object<string, Array<Object>>} */
+        this.pendingConversationMessages = {};
+
+        /** @type {Object<string, Array<Object>>} */
+        this.conversationMessageCache = {};
+
+        /** @type {Object<string, Array<Object>>} */
+        this.optimisticAssistantMessages = {};
+
+        /** @type {Object<string, boolean>} */
+        this.awaitingQueueAck = {};
+
+        /** @type {Object<string, number>} */
+        this.completionReloadTimers = {};
+
       /** @type {boolean} */
       this.globalEventsBound = false;
 
@@ -475,7 +490,8 @@
       });
     }
 
-    loadConversation(name) {
+    loadConversation(name, options) {
+      const settings = options || {};
       frappe.call({
         method: "erp_ai_assistant.api.chat.get_conversation",
         args: { name },
@@ -484,8 +500,27 @@
           this.activeConversation = payload.conversation || null;
           this.isDraftConversation = false;
           this._clearPendingImages();
-          this.renderMessages(payload.messages || []);
+          const serverMessages = Array.isArray(payload.messages) ? payload.messages : [];
+          this.conversationMessageCache[name] = serverMessages;
+          const optimisticMessages = Array.isArray(this.optimisticAssistantMessages[name])
+            ? this.optimisticAssistantMessages[name]
+            : [];
+          if (optimisticMessages.length) {
+            const lastOptimistic = optimisticMessages[optimisticMessages.length - 1];
+            const hasMatchingServerReply = serverMessages.some((row) =>
+              row
+              && row.role === "assistant"
+              && String(row.content || "").trim() === String(lastOptimistic.content || "").trim()
+            );
+            if (hasMatchingServerReply) {
+              delete this.optimisticAssistantMessages[name];
+            }
+          }
+          this.renderMessages(this._getConversationMessages(name));
           this.renderHistory();
+          if (typeof settings.onLoaded === "function") {
+            settings.onLoaded(payload, serverMessages);
+          }
         },
         error: (error) => {
           this.activeConversation = null;
@@ -935,6 +970,7 @@
           const conversation = response.message;
           this.activeConversation = conversation;
           this.isDraftConversation = false;
+          this.renderHistory();
           this.refreshHistory();
           callback(conversation.name);
         },
@@ -952,9 +988,11 @@
       if (!prompt && !images.length) return;
 
       // Add user message to UI immediately
-      this._addUserMessageToUI(prompt, images);
-
       this.ensureConversation((conversationName) => {
+        this._queuePendingUserMessage(conversationName, prompt, images);
+        this._renderPendingConversation(conversationName);
+        this.awaitingQueueAck[conversationName] = true;
+
         const context = this.getCurrentContext();
         const imagePayload = images.map((item) => ({
           name: item.name,
@@ -969,7 +1007,6 @@
 
         this.abortRequested = false;
         this._setGeneratingState(true);
-        this._startProgressPolling(conversationName);
 
         const request = frappe.call({
           method: "erp_ai_assistant.api.assistant.handle_prompt",
@@ -985,12 +1022,15 @@
           callback: (response) => {
             const payload = response?.message || {};
             if (payload.queued) {
+              this.awaitingQueueAck[conversationName] = false;
+              this._startProgressPolling(conversationName);
               return;
             }
             this._finishPromptRun(conversationName);
           },
           error: (error) => {
             if (this.abortRequested) return;
+            delete this.awaitingQueueAck[conversationName];
             this._finishPromptRun(null, { keepMessages: true });
             frappe.show_alert({ message: error.message || "Assistant request failed", indicator: "red" });
           },
@@ -1013,6 +1053,9 @@
         this.pendingPromptRequest.abort("abort");
       }
       this.pendingPromptRequest = null;
+      Object.keys(this.awaitingQueueAck).forEach((key) => {
+        delete this.awaitingQueueAck[key];
+      });
       this._finishPromptRun(null, { keepMessages: true });
     }
 
@@ -1053,6 +1096,89 @@
 
       this.elements.messages.appendChild(userBubble);
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
+    }
+
+    _buildPendingUserMessage(prompt, images) {
+      const text = String(prompt || "").trim();
+      const imageCount = Array.isArray(images) ? images.length : 0;
+      const imageNote = imageCount ? `\n\n[Attached ${imageCount} image${imageCount === 1 ? "" : "s"}]` : "";
+      const body = text ? `${text}${imageNote}` : imageNote.trim();
+      const attachments = imageCount
+        ? {
+          attachments: images.map((item, index) => ({
+            label: "Image",
+            filename: item.name || `image-${index + 1}`,
+            file_type: String(item.type || "image").split("/").pop(),
+            file_url: item.dataUrl,
+          })),
+        }
+        : null;
+
+      return {
+        role: "user",
+        content: body,
+        creation: new Date().toISOString(),
+        attachments_json: attachments ? JSON.stringify(attachments) : null,
+      };
+    }
+
+    _queuePendingUserMessage(conversationName, prompt, images) {
+      if (!conversationName) return;
+      const pendingMessages = Array.isArray(this.pendingConversationMessages[conversationName])
+        ? this.pendingConversationMessages[conversationName].slice()
+        : [];
+      pendingMessages.push(this._buildPendingUserMessage(prompt, images));
+      this.pendingConversationMessages[conversationName] = pendingMessages;
+    }
+
+    _renderPendingConversation(conversationName) {
+      if (!conversationName) return;
+      const messages = this._getConversationMessages(conversationName);
+      if (!messages.length) return;
+      this.activeConversation = this.activeConversation && this.activeConversation.name === conversationName
+        ? this.activeConversation
+        : { name: conversationName };
+      this.isDraftConversation = false;
+      this.renderMessages(messages);
+      this.renderHistory();
+    }
+
+    _getConversationMessages(conversationName) {
+      const serverMessages = Array.isArray(this.conversationMessageCache[conversationName])
+        ? this.conversationMessageCache[conversationName]
+        : [];
+      const pendingMessages = Array.isArray(this.pendingConversationMessages[conversationName])
+        ? this.pendingConversationMessages[conversationName]
+        : [];
+      const optimisticAssistantMessages = Array.isArray(this.optimisticAssistantMessages[conversationName])
+        ? this.optimisticAssistantMessages[conversationName]
+        : [];
+
+      if (!pendingMessages.length && !optimisticAssistantMessages.length) {
+        return serverMessages;
+      }
+
+      return serverMessages.concat(pendingMessages, optimisticAssistantMessages);
+    }
+
+    _queueOptimisticAssistantMessage(conversationName, replyText) {
+      const content = String(replyText || "").trim();
+      if (!conversationName || !content) return;
+      const existing = Array.isArray(this.optimisticAssistantMessages[conversationName])
+        ? this.optimisticAssistantMessages[conversationName].slice()
+        : [];
+      const last = existing.length ? existing[existing.length - 1] : null;
+      if (last && String(last.content || "").trim() === content) {
+        return;
+      }
+      existing.push({
+        role: "assistant",
+        content,
+        creation: new Date().toISOString(),
+        tool_events: "[]",
+        attachments_json: null,
+      });
+      this.optimisticAssistantMessages[conversationName] = existing;
     }
 
     _showTypingIndicator(steps) {
@@ -1121,6 +1247,10 @@
           callback: (response) => {
             const progress = response?.message || {};
             const steps = Array.isArray(progress.steps) ? progress.steps : [];
+            const stage = String(progress.stage || "").trim().toLowerCase();
+            if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) {
+              return;
+            }
             this._updateTypingSteps(steps, progress.partial_text || "");
             if (progress.done) {
               this._stopProgressPolling();
@@ -1129,7 +1259,21 @@
                 frappe.show_alert({ message: progress.error || "Assistant request failed", indicator: "red" });
                 return;
               }
-              this._finishPromptRun(conversationName);
+              frappe.call({
+                method: "erp_ai_assistant.api.ai.get_prompt_result",
+                args: { conversation: conversationName },
+                callback: (resultResponse) => {
+                  const result = resultResponse?.message || {};
+                  if (result.done && String(result.reply || "").trim()) {
+                    this._queueOptimisticAssistantMessage(conversationName, result.reply);
+                    this._renderPendingConversation(conversationName);
+                  }
+                  this._finishPromptRun(conversationName);
+                },
+                error: () => {
+                  this._finishPromptRun(conversationName);
+                },
+              });
             }
           },
           always: () => {
@@ -1159,6 +1303,34 @@
       }
     }
 
+    _clearCompletionReloadTimer(conversationName) {
+      const timer = this.completionReloadTimers[conversationName];
+      if (timer) {
+        clearTimeout(timer);
+        delete this.completionReloadTimers[conversationName];
+      }
+    }
+
+    _loadConversationAfterCompletion(conversationName, attempt) {
+      if (!conversationName) return;
+      const tryCount = Number(attempt || 0);
+      this._clearCompletionReloadTimer(conversationName);
+      this.loadConversation(conversationName, {
+        onLoaded: (_payload, serverMessages) => {
+          const rows = Array.isArray(serverMessages) ? serverMessages : [];
+          const lastMessage = rows.length ? rows[rows.length - 1] : null;
+          const hasAssistantReply = !!(lastMessage && lastMessage.role === "assistant");
+          if (!hasAssistantReply && tryCount < 5) {
+            this.completionReloadTimers[conversationName] = window.setTimeout(() => {
+              this._loadConversationAfterCompletion(conversationName, tryCount + 1);
+            }, 1200);
+            return;
+          }
+          this._clearCompletionReloadTimer(conversationName);
+        },
+      });
+    }
+
     _finishPromptRun(conversationName, options) {
       const settings = options || {};
       this._stopProgressPolling();
@@ -1166,8 +1338,10 @@
       this._hideTypingIndicator();
       this.abortRequested = false;
       if (conversationName) {
+        delete this.awaitingQueueAck[conversationName];
+        delete this.pendingConversationMessages[conversationName];
         this.refreshHistory();
-        this.loadConversation(conversationName);
+        this._loadConversationAfterCompletion(conversationName, 0);
         return;
       }
       if (!settings.keepMessages) {
