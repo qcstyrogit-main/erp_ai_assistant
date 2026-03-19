@@ -5,7 +5,6 @@ from typing import Any
 import frappe
 from frappe import _
 from frappe.utils.file_manager import save_file
-from frappe.utils.print_utils import get_print
 
 from .catalog import SAFE_ERP_ALIASES as SAFE_EXPORT_ALIASES
 from .catalog import SAFE_ERP_DOCTYPES as SAFE_EXPORT_DOCTYPES
@@ -251,7 +250,7 @@ def generate_document_pdf_internal(doctype: str, docname: str, print_format: str
 
     doc = frappe.get_doc(doctype_name, name)
     doc.check_permission("read")
-    pdf_content = get_print(
+    pdf_content = frappe.get_print(
         doctype_name,
         name,
         print_format=str(print_format or "").strip() or None,
