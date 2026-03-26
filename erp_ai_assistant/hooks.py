@@ -1,7 +1,7 @@
 app_name = "erp_ai_assistant"
 app_title = "ERP AI Assistant"
 app_publisher = "OpenAI"
-app_description = "FAC-backed AI assistant workspace inside ERP"
+app_description = "FAC-backed ERP copilot for ERPNext/Frappe"
 app_email = "support@example.com"
 app_license = "MIT"
 
@@ -32,3 +32,19 @@ doctype_js = {
 
 permission_query_conditions = {}
 has_permission = {}
+
+# Production-oriented tool set: keep the default catalog focused on ERP work,
+# file presentation, and user interaction. High-risk or non-ERP lifestyle tools
+# are intentionally excluded from the default whole-company deployment.
+assistant_tools = [
+    "erp_ai_assistant.assistant_tools.web_tools.WebSearchTool",
+    "erp_ai_assistant.assistant_tools.web_tools.WebFetchTool",
+    "erp_ai_assistant.assistant_tools.web_tools.ImageSearchTool",
+    "erp_ai_assistant.assistant_tools.file_ops.CreateFileTool",
+    "erp_ai_assistant.assistant_tools.file_ops.StrReplaceTool",
+    "erp_ai_assistant.assistant_tools.file_ops.ViewTool",
+    "erp_ai_assistant.assistant_tools.file_ops.PresentFilesTool",
+    "erp_ai_assistant.assistant_tools.ui_tools.AskUserInputTool",
+    "erp_ai_assistant.assistant_tools.ui_tools.MessageComposeTool",
+    "erp_ai_assistant.assistant_tools.ui_tools.ToolSearchTool",
+]

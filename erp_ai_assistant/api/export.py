@@ -1,5 +1,6 @@
-"""Export functionality for ERP AI Assistant - Excel, PDF, and Word export."""
+"""Export functionality for ERP AI Assistant - Excel, CSV, PDF, and Word export."""
 
+import csv
 import json
 import uuid
 from io import BytesIO
@@ -151,6 +152,22 @@ def export_to_excel(payload: str, filename: str | None = None):
 
 
 @frappe.whitelist()
+def export_to_csv(payload: str, filename: str | None = None):
+    """Export payload data to CSV format."""
+    title, rows = _normalize_export_payload(payload)
+
+    if not rows:
+        frappe.throw("No data to export")
+
+    bytes_content = _build_csv_bytes(title, rows)
+
+    fname = _slugify_filename(filename or title)
+    frappe.local.response.filename = f"{fname}.csv"
+    frappe.local.response.filecontent = bytes_content
+    frappe.local.response.type = "download"
+
+
+@frappe.whitelist()
 def export_to_pdf(payload: str, filename: str | None = None):
     """Export payload data to PDF format."""
     try:
@@ -217,6 +234,7 @@ def create_message_artifacts(
 
     builders = [
         ("xlsx", "Excel"),
+        ("csv", "CSV"),
         ("pdf", "PDF"),
         ("docx", "Word"),
     ]
@@ -282,6 +300,7 @@ def _parse_attachment_package(raw: Any) -> dict[str, Any]:
 def _export_builder(file_type: str):
     builders = {
         "xlsx": _build_excel_bytes,
+        "csv": _build_csv_bytes,
         "pdf": _build_pdf_bytes,
         "docx": _build_word_bytes,
     }
@@ -335,6 +354,43 @@ def download_message_attachment(message: str, attachment_id: str):
     frappe.local.response.type = "download"
 
 
+def _build_csv_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
+    headers = list(rows[0].keys())
+    buffer = BytesIO()
+    text_buffer = []
+    import io
+    handle = io.StringIO()
+    writer = csv.writer(handle)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow([_stringify_cell(row.get(header, "")) for header in headers])
+    return handle.getvalue().encode("utf-8-sig")
+
+
+def _build_overview_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    headers = list(rows[0].keys())
+    return [
+        {"Metric": "Rows", "Value": len(rows)},
+        {"Metric": "Columns", "Value": len(headers)},
+        {"Metric": "Columns List", "Value": ", ".join(headers)},
+    ]
+
+
+def _fit_worksheet(ws, max_width: int = 48) -> None:
+    from openpyxl.styles import Alignment
+    for column in ws.columns:
+        max_length = 0
+        col_cells = list(column)
+        for cell in col_cells:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            val = _stringify_cell(cell.value)
+            if len(val) > max_length:
+                max_length = len(val)
+        ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_length + 2, 12), max_width)
+
+
 def _build_excel_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
@@ -363,15 +419,21 @@ def _build_excel_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
                 ws.cell(row=row_idx, column=col_idx).fill = alt_fill
 
     ws.freeze_panes = "A2"
-
-    for column in ws.columns:
-        max_length = 0
-        col_cells = list(column)
-        for cell in col_cells:
-            val = _stringify_cell(cell.value)
-            if len(val) > max_length:
-                max_length = len(val)
-        ws.column_dimensions[col_cells[0].column_letter].width = min(max_length + 2, 50)
+    ws.auto_filter.ref = ws.dimensions
+    overview_ws = wb.create_sheet(title="Overview", index=0)
+    overview_rows = _build_overview_rows(rows)
+    overview_headers = list(overview_rows[0].keys())
+    overview_ws.append(overview_headers)
+    for item in overview_rows:
+        overview_ws.append([_stringify_cell(item.get(key, "")) for key in overview_headers])
+    for col_idx in range(1, overview_ws.max_column + 1):
+        cell = overview_ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    overview_ws.freeze_panes = "A2"
+    _fit_worksheet(overview_ws)
+    _fit_worksheet(ws)
 
     for field in _summary_group_fields(rows)[:3]:
         summary_rows = _build_group_summary(rows, field)
@@ -389,14 +451,8 @@ def _build_excel_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center")
         summary_ws.freeze_panes = "A2"
-        for column in summary_ws.columns:
-            max_length = 0
-            col_cells = list(column)
-            for cell in col_cells:
-                val = _stringify_cell(cell.value)
-                if len(val) > max_length:
-                    max_length = len(val)
-            summary_ws.column_dimensions[col_cells[0].column_letter].width = min(max_length + 2, 48)
+        summary_ws.auto_filter.ref = summary_ws.dimensions
+        _fit_worksheet(summary_ws)
 
     buffer = BytesIO()
     wb.save(buffer)
@@ -463,36 +519,53 @@ def _sheet_title_for_group(field: str) -> str:
 
 def _build_pdf_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
     from reportlab.lib import colors
-    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.pagesizes import landscape, letter
     from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+    from reportlab.lib.units import inch
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     headers = list(rows[0].keys())
-    table_data = [headers]
-    for row in rows:
-        table_data.append([_stringify_cell(row.get(header, "")) for header in headers])
-
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter, title=title)
     styles = getSampleStyleSheet()
-    elements = [Paragraph(title, styles["Title"]), Paragraph("<br/>", styles["Normal"])]
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(letter), title=title, leftMargin=0.4 * inch, rightMargin=0.4 * inch, topMargin=0.45 * inch, bottomMargin=0.45 * inch)
+    elements = [Paragraph(title, styles["Title"]), Spacer(1, 8)]
 
-    table = Table(table_data)
-    table.setStyle(
-        TableStyle(
-            [
-                ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, 0), 10),
-                ("BOTTOMPADDING", (0, 0), (-1, 0), 12),
-                ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
-                ("GRID", (0, 0), (-1, -1), 1, colors.black),
-            ]
-        )
-    )
+    overview_rows = _build_overview_rows(rows)
+    overview_table = Table([[item["Metric"], _stringify_cell(item["Value"])] for item in overview_rows], colWidths=[1.7 * inch, 7.8 * inch])
+    overview_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.whitesmoke),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    elements.extend([overview_table, Spacer(1, 10)])
+
+    max_columns = min(len(headers), 8)
+    visible_headers = headers[:max_columns]
+    table_data = [[Paragraph(f"<b>{_stringify_cell(header)}</b>", styles["BodyText"]) for header in visible_headers]]
+    for row in rows:
+        table_data.append([Paragraph(_stringify_cell(row.get(header, ""))[:500].replace("\n", "<br/>"), styles["BodyText"]) for header in visible_headers])
+
+    page_width = landscape(letter)[0] - doc.leftMargin - doc.rightMargin
+    col_width = page_width / max(1, len(visible_headers))
+    table = Table(table_data, colWidths=[col_width] * len(visible_headers), repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 9),
+        ("FONTSIZE", (0, 1), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, 1), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
+        ("BACKGROUND", (0, 1), (-1, -1), colors.beige),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#F8F1E8")]),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
     elements.append(table)
+    if len(headers) > max_columns:
+        elements.extend([Spacer(1, 10), Paragraph(f"Showing the first {max_columns} of {len(headers)} columns in the PDF layout. Use Excel or CSV for the full wide dataset.", styles["Italic"])])
     doc.build(elements)
     return buffer.getvalue()
 
@@ -502,6 +575,8 @@ def _build_word_bytes(title: str, rows: list[dict[str, Any]]) -> bytes:
 
     doc = Document()
     doc.add_heading(title, 0)
+    for item in _build_overview_rows(rows):
+        doc.add_paragraph(f"{item['Metric']}: {_stringify_cell(item['Value'])}")
 
     headers = list(rows[0].keys())
     table = doc.add_table(rows=len(rows) + 1, cols=len(headers))

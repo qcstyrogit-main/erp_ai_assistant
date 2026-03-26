@@ -7,15 +7,15 @@
  "field_order": [
   "title",
   "status",
-  "is_pinned"
+  "is_pinned",
+  "pending_action_json"
  ],
  "fields": [
   {
    "fieldname": "title",
-   "fieldtype": "Data",
+   "fieldtype": "Long Text",
    "in_list_view": 1,
    "label": "Title",
-   "length": 999,
    "reqd": 1
   },
   {
@@ -30,6 +30,13 @@
    "fieldname": "is_pinned",
    "fieldtype": "Check",
    "label": "Pinned"
+  },
+  {
+   "fieldname": "pending_action_json",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Pending Action JSON",
+   "read_only": 1
   }
  ],
  "links": [],

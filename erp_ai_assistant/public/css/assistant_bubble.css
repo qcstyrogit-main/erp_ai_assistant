@@ -533,7 +533,7 @@
   gap: 8px;
 }
 
-.erp-ai-assistant-message__tools {
+.erp-ai-assistant-message__activity {
   margin-top: 12px;
   border: 1px solid rgba(31, 41, 55, 0.08);
   border-radius: 12px;
@@ -541,26 +541,55 @@
   overflow: hidden;
 }
 
-.erp-ai-assistant-message__tools-summary {
+.erp-ai-assistant-message__activity-head {
   cursor: pointer;
   list-style: none;
   padding: 10px 12px;
   font-size: 12px;
   font-weight: 700;
   color: var(--ai-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.erp-ai-assistant-message__tools-summary::-webkit-details-marker {
+.erp-ai-assistant-message__activity-head::-webkit-details-marker {
   display: none;
 }
 
-.erp-ai-assistant-message__tools-list {
-  margin: 0;
-  padding: 0 12px 12px 28px;
+.erp-ai-assistant-message__activity-status,
+.erp-ai-assistant-message__activity-step-icon {
+  color: var(--ai-primary);
+  font-weight: 700;
+}
+
+.erp-ai-assistant-message__activity-summary {
+  color: var(--ai-text-primary);
+}
+
+.erp-ai-assistant-message__activity-steps {
+  max-height: 300px;
+  overflow: auto;
+  padding: 0 12px 12px;
   display: grid;
   gap: 6px;
+  scrollbar-width: thin;
+}
+
+.erp-ai-assistant-message__activity-step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
   color: var(--ai-text-secondary);
+  background: rgba(31, 41, 55, 0.04);
+  border: 1px solid rgba(31, 41, 55, 0.08);
+  border-radius: 8px;
+  padding: 6px 8px;
+}
+
+.erp-ai-assistant-message__activity-step-label {
+  flex: 1;
 }
 
 .erp-ai-assistant-message__tool-blocks {
@@ -747,12 +776,33 @@
   gap: 8px;
 }
 
+.erp-ai-assistant-progress__log {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(31, 41, 55, 0.08);
+  border-radius: 12px;
+  background: rgba(31, 41, 55, 0.04);
+}
+
 .erp-ai-assistant-progress__head {
   display: inline-flex;
   align-items: center;
   gap: 8px;
   font-size: 14px;
   font-weight: 600;
+  color: var(--ai-text-primary);
+  cursor: pointer;
+  list-style: none;
+  order: 2;
+  margin-top: 8px;
+}
+
+.erp-ai-assistant-progress__head::-webkit-details-marker {
+  display: none;
+}
+
+.erp-ai-assistant-progress__summary {
   color: var(--ai-text-primary);
 }
 
@@ -777,15 +827,31 @@
 .erp-ai-assistant-progress__steps {
   display: grid;
   gap: 6px;
+  max-height: 300px;
+  overflow: auto;
+  scrollbar-width: thin;
+  order: 1;
 }
 
 .erp-ai-assistant-progress__step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
   color: var(--ai-text-secondary);
   background: rgba(31, 41, 55, 0.04);
   border: 1px solid rgba(31, 41, 55, 0.08);
   border-radius: 8px;
   padding: 5px 8px;
+}
+
+.erp-ai-assistant-progress__step-icon {
+  font-weight: 700;
+  color: var(--ai-primary);
+}
+
+.erp-ai-assistant-progress__step-label {
+  flex: 1;
 }
 
 .erp-ai-assistant-message__copy {
@@ -1082,5 +1148,634 @@
 
   .erp-ai-assistant-drawer__sidebar {
     display: none;
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CLAUDE DESKTOP-LEVEL RENDERING ENHANCEMENTS
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Message meta improvements ─────────────────────────────────────────── */
+.erp-ai-assistant-message__meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ai-text-secondary);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.erp-ai-assistant-message__role {
+  color: var(--ai-text-primary);
+  font-weight: 700;
+  font-size: 11px;
+}
+.erp-ai-assistant-message__time {
+  font-weight: 400;
+  color: var(--ai-text-muted);
+  font-size: 10px;
+  text-transform: none;
+}
+
+/* ── Typography improvements ───────────────────────────────────────────── */
+.erp-ai-assistant-message__body {
+  line-height: 1.65;
+  color: var(--ai-text-primary);
+  font-size: 14px;
+  word-break: break-word;
+}
+
+.erp-ai-heading {
+  font-weight: 700;
+  color: var(--ai-text-primary);
+  margin: 1em 0 0.4em;
+  line-height: 1.3;
+}
+.erp-ai-heading--1 { font-size: 1.45em; border-bottom: 1px solid var(--ai-border); padding-bottom: 0.3em; }
+.erp-ai-heading--2 { font-size: 1.2em; border-bottom: 1px solid var(--ai-border); padding-bottom: 0.2em; }
+.erp-ai-heading--3 { font-size: 1.05em; }
+.erp-ai-heading--4, .erp-ai-heading--5, .erp-ai-heading--6 { font-size: 1em; }
+.erp-ai-heading:first-child { margin-top: 0; }
+
+.erp-ai-paragraph {
+  margin: 0.55em 0;
+  line-height: 1.65;
+}
+.erp-ai-paragraph:first-child { margin-top: 0; }
+.erp-ai-paragraph:last-child { margin-bottom: 0; }
+
+.erp-ai-bold { font-weight: 700; }
+.erp-ai-italic { font-style: italic; }
+
+.erp-ai-hr {
+  border: none;
+  border-top: 1px solid var(--ai-border);
+  margin: 1.2em 0;
+}
+
+/* ── Lists ─────────────────────────────────────────────────────────────── */
+.erp-ai-list {
+  margin: 0.6em 0;
+  padding-left: 1.6em;
+}
+.erp-ai-list--ul { list-style-type: disc; }
+.erp-ai-list--ol { list-style-type: decimal; }
+.erp-ai-list__item {
+  margin: 0.25em 0;
+  line-height: 1.6;
+}
+.erp-ai-list__item::marker {
+  color: var(--ai-primary);
+}
+
+/* ── Blockquote ────────────────────────────────────────────────────────── */
+.erp-ai-quote {
+  border-left: 3px solid var(--ai-primary);
+  margin: 0.8em 0;
+  padding: 0.5em 1em;
+  color: var(--ai-text-secondary);
+  font-style: italic;
+  background: rgba(217, 119, 87, 0.05);
+  border-radius: 0 6px 6px 0;
+}
+
+/* ── Inline code ───────────────────────────────────────────────────────── */
+.erp-ai-code-inline {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 0.85em;
+  background: rgba(0, 0, 0, 0.07);
+  color: #c0392b;
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  border: 1px solid rgba(0,0,0,0.08);
+  white-space: nowrap;
+}
+.is-assistant .erp-ai-code-inline {
+  background: rgba(0,0,0,0.06);
+  border-color: rgba(0,0,0,0.08);
+}
+
+/* ── Code blocks (Claude Desktop style) ──────────────────────────────── */
+.erp-ai-code-block {
+  margin: 0.9em 0;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(0,0,0,0.1);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  font-size: 13px;
+}
+.erp-ai-code-block__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: #1e2433;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  gap: 8px;
+}
+.erp-ai-code-lang {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.55);
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+}
+.erp-ai-code-block__copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 5px;
+  border: 1px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.06);
+  color: rgba(255,255,255,0.6);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 150ms ease;
+  white-space: nowrap;
+}
+.erp-ai-code-block__copy:hover {
+  background: rgba(255,255,255,0.12);
+  color: rgba(255,255,255,0.9);
+  border-color: rgba(255,255,255,0.25);
+}
+.erp-ai-code-block__copy.is-copied {
+  background: rgba(34,197,94,0.2);
+  color: #4ade80;
+  border-color: rgba(34,197,94,0.3);
+}
+.erp-ai-code-block__pre {
+  margin: 0;
+  padding: 16px 18px;
+  background: #141822;
+  overflow-x: auto;
+  tab-size: 2;
+}
+.erp-ai-code-block__code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', 'SF Mono', monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: #e2e8f0;
+  white-space: pre;
+  display: block;
+}
+
+/* ── Syntax highlighting tokens ───────────────────────────────────────── */
+.hl-keyword  { color: #c792ea; font-weight: 600; }
+.hl-builtin  { color: #82aaff; }
+.hl-string   { color: #c3e88d; }
+.hl-comment  { color: #546e7a; font-style: italic; }
+.hl-number   { color: #f78c6c; }
+.hl-decorator{ color: #ffcb6b; }
+.hl-method   { color: #82aaff; }
+.hl-key      { color: #80cbc4; }
+.hl-flag     { color: #ffcb6b; }
+.hl-variable { color: #f07178; }
+.hl-tag      { color: #f07178; }
+.hl-attr     { color: #ffcb6b; }
+.hl-selector { color: #c792ea; }
+.hl-prop     { color: #80cbc4; }
+.hl-value    { color: #c3e88d; }
+
+/* ── Tables (Claude Desktop quality) ─────────────────────────────────── */
+.erp-ai-table-wrap {
+  overflow-x: auto;
+  margin: 0.8em 0;
+  border-radius: 8px;
+  border: 1px solid var(--ai-border);
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+}
+.erp-ai-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.erp-ai-table__th {
+  padding: 9px 14px;
+  background: rgba(0,0,0,0.04);
+  font-weight: 700;
+  text-align: left;
+  color: var(--ai-text-primary);
+  border-bottom: 2px solid var(--ai-border);
+  white-space: nowrap;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.erp-ai-table__td {
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(0,0,0,0.05);
+  color: var(--ai-text-primary);
+  vertical-align: top;
+}
+.erp-ai-table__tr:last-child .erp-ai-table__td {
+  border-bottom: none;
+}
+.erp-ai-table__tr:nth-child(even) .erp-ai-table__td {
+  background: rgba(0,0,0,0.02);
+}
+
+/* ── Links ─────────────────────────────────────────────────────────────── */
+.erp-ai-link {
+  color: var(--ai-primary);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(217, 119, 87, 0.35);
+  transition: border-color 120ms, color 120ms;
+}
+.erp-ai-link:hover {
+  color: var(--ai-primary-dark);
+  border-bottom-color: var(--ai-primary);
+}
+
+/* ── Figures/Images ────────────────────────────────────────────────────── */
+.erp-ai-figure {
+  margin: 0.8em 0;
+}
+.erp-ai-figure__img {
+  max-width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--ai-border);
+  display: block;
+}
+.erp-ai-figure__caption {
+  font-size: 11px;
+  color: var(--ai-text-muted);
+  margin-top: 4px;
+  text-align: center;
+}
+
+/* ── Thinking indicator enhancement ──────────────────────────────────── */
+.erp-ai-thinking-label {
+  animation: erp-ai-pulse 1.4s ease-in-out infinite;
+}
+@keyframes erp-ai-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+/* ── Tool activity improvements ──────────────────────────────────────── */
+.erp-ai-assistant-message__activity {
+  margin-bottom: 10px;
+  border: 1px solid var(--ai-border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12.5px;
+  background: rgba(0,0,0,0.02);
+}
+.erp-ai-assistant-message__activity-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;
+  color: var(--ai-text-secondary);
+  background: transparent;
+  user-select: none;
+  transition: background 120ms;
+}
+.erp-ai-assistant-message__activity-head:hover {
+  background: rgba(0,0,0,0.03);
+}
+.erp-ai-assistant-message__activity-head::-webkit-details-marker { display: none; }
+.erp-ai-assistant-message__activity-status {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: rgba(34,197,94,0.15);
+  color: #16a34a;
+  font-size: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.erp-ai-assistant-message__activity-summary {
+  font-weight: 600;
+  color: var(--ai-text-secondary);
+  font-size: 12px;
+}
+.erp-ai-assistant-message__activity-steps {
+  padding: 6px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.erp-ai-assistant-message__activity-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ai-text-secondary);
+  padding: 2px 0;
+}
+.erp-ai-assistant-message__activity-step-icon {
+  color: #16a34a;
+  font-size: 11px;
+  margin-top: 1px;
+  flex-shrink: 0;
+}
+.erp-ai-assistant-message__activity-step-label {
+  line-height: 1.4;
+}
+
+/* ── Empty state improvements ─────────────────────────────────────────── */
+.erp-ai-assistant-messages__empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: 100%;
+  min-height: 200px;
+  text-align: center;
+  padding: 40px 24px;
+  color: var(--ai-text-secondary);
+}
+.erp-ai-assistant-messages__empty-icon {
+  font-size: 32px;
+  opacity: 0.5;
+}
+
+/* ── Message copy button improvements ────────────────────────────────── */
+.erp-ai-assistant-message__copy {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 3px 8px;
+  border: 1px solid var(--ai-border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--ai-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 140ms;
+}
+.erp-ai-assistant-message:hover .erp-ai-assistant-message__copy {
+  display: inline-flex;
+}
+.erp-ai-assistant-message__copy:hover {
+  background: rgba(0,0,0,0.04);
+  color: var(--ai-text-secondary);
+  border-color: var(--ai-text-muted);
+}
+
+/* ── Progress / thinking block ───────────────────────────────────────── */
+.erp-ai-assistant-progress {
+  padding: 4px 0;
+}
+.erp-ai-assistant-progress__log {
+  border: 1px solid var(--ai-border);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+}
+.erp-ai-assistant-progress__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  list-style: none;
+  background: rgba(0,0,0,0.02);
+  color: var(--ai-text-secondary);
+  user-select: none;
+}
+.erp-ai-assistant-progress__head::-webkit-details-marker { display: none; }
+.erp-ai-assistant-progress__spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--ai-border);
+  border-top-color: var(--ai-primary);
+  border-radius: 50%;
+  animation: erp-ai-spin 700ms linear infinite;
+  flex-shrink: 0;
+}
+@keyframes erp-ai-spin {
+  to { transform: rotate(360deg); }
+}
+.erp-ai-assistant-message--typing.is-done .erp-ai-assistant-progress__spinner {
+  border: none;
+  background: none;
+  animation: none;
+}
+.erp-ai-assistant-progress__summary {
+  font-weight: 600;
+  color: var(--ai-text-secondary);
+}
+.erp-ai-assistant-progress__steps {
+  padding: 6px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.erp-ai-assistant-progress__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ai-text-secondary);
+  padding: 2px 0;
+}
+.erp-ai-assistant-progress__step-icon {
+  color: var(--ai-primary);
+  font-size: 11px;
+  margin-top: 1px;
+  flex-shrink: 0;
+}
+.erp-ai-assistant-progress__partial {
+  font-size: 13px;
+  color: var(--ai-text-primary);
+  line-height: 1.5;
+  padding: 4px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  opacity: 0.7;
+  margin-bottom: 8px;
+}
+
+/* ── Attachment / file cards ─────────────────────────────────────────── */
+.erp-ai-assistant-message__attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.erp-ai-assistant-message__attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--ai-border);
+  background: var(--ai-surface);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ai-text-primary);
+  transition: all 140ms;
+  text-decoration: none;
+}
+.erp-ai-assistant-message__attachment:hover {
+  background: rgba(217, 119, 87, 0.07);
+  border-color: var(--ai-primary);
+  color: var(--ai-primary);
+}
+.erp-ai-assistant-message__attachment::before {
+  content: "↓";
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+/* Desk bubble chrome upgrade */
+.erp-ai-assistant-message {
+  max-width: min(860px, 92%);
+  padding: 18px 20px;
+  border-radius: 22px;
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.08);
+}
+
+.erp-ai-assistant-message.is-assistant {
+  background: linear-gradient(180deg, rgba(255, 250, 243, 0.98), rgba(255, 255, 255, 0.98));
+}
+
+.erp-ai-assistant-message__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.erp-ai-assistant-message__meta {
+  margin-bottom: 0;
+  flex-wrap: wrap;
+}
+
+.erp-ai-assistant-message__role {
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}
+
+.erp-ai-assistant-message__badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.erp-ai-assistant-message__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  background: rgba(31, 41, 55, 0.06);
+  color: var(--ai-text-primary);
+  border: 1px solid rgba(31, 41, 55, 0.06);
+}
+
+.erp-ai-assistant-message__badge.is-verified {
+  background: rgba(15, 139, 109, 0.10);
+  color: #0f8b6d;
+  border-color: rgba(15, 139, 109, 0.18);
+}
+
+.erp-ai-assistant-message__badge.is-visual {
+  background: rgba(41, 91, 155, 0.10);
+  color: #295b9b;
+  border-color: rgba(41, 91, 155, 0.18);
+}
+
+.erp-ai-assistant-message__badge.is-safe {
+  background: rgba(154, 103, 0, 0.10);
+  color: #9a6700;
+  border-color: rgba(154, 103, 0, 0.18);
+}
+
+.erp-ai-assistant-message__summary {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(31, 41, 55, 0.035);
+  border: 1px solid rgba(31, 41, 55, 0.06);
+  color: var(--ai-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.is-user .erp-ai-assistant-message__summary,
+.is-user .erp-ai-assistant-message__badge {
+  background: rgba(255,255,255,0.14);
+  color: #fffaf5;
+  border-color: rgba(255,255,255,0.18);
+}
+
+.erp-ai-assistant-message__copy {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(31, 41, 55, 0.06);
+  color: var(--ai-text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition: all 160ms ease;
+}
+
+.erp-ai-assistant-message:hover .erp-ai-assistant-message__copy,
+.erp-ai-assistant-message:focus-within .erp-ai-assistant-message__copy {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.erp-ai-assistant-message__copy:hover,
+.erp-ai-assistant-message__copy.is-copied {
+  background: rgba(217, 119, 87, 0.12);
+  color: var(--ai-primary-dark);
+}
+
+.erp-ai-assistant-message__activity {
+  margin: 0 0 12px;
+  border-radius: 16px;
+}
+
+.erp-ai-assistant-message__activity-head {
+  padding: 12px 14px;
+}
+
+.erp-ai-assistant-message__attachment {
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 900px) {
+  .erp-ai-assistant-message {
+    max-width: 100%;
+  }
+
+  .erp-ai-assistant-message__head {
+    flex-direction: column;
+  }
+
+  .erp-ai-assistant-message__badges {
+    justify-content: flex-start;
   }
 }

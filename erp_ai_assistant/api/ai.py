@@ -10,27 +10,37 @@ import frappe
 import requests
 from frappe import _
 
+import time as _time_module
+
 from .chat import add_message, create_conversation
 from .export import add_message_attachment_urls, create_message_artifacts
-from .fac_client import dispatch_tool, get_tool_definitions
+from .copilot_response import build_copilot_package
+from .fac_client import dispatch_tool, get_tool_definitions, read_fac_resource
 from .provider_settings import get_active_provider, get_provider_setting, get_remote_mcp_servers
 from .resource_registry import list_resource_specs
+from .audit import write_audit_log, PromptTimer
+from .rate_limit import check_rate_limit
 
 
-TOOL_NAME_MAP = {
-    "get_list": "list_documents",
-    "get_report": "generate_report",
-    "frappe.get_list": "get_list",
-    "frappe.client.get_list": "get_list",
-    "frappe.get_doc": "get_document",
-    "frappe.client.get": "get_document",
-    "frappe.get_report": "get_report",
-}
+from .tool_aliases import resolve_tool_name as _resolve_tool_name
+
+# Kept for backward compatibility — callers that do TOOL_NAME_MAP.get(name, name)
+# will now get the registry-resolved value.
+class _ToolNameMap:
+    """Proxy that delegates to the registry-driven alias resolver."""
+    def get(self, key: str, default: str | None = None) -> str:
+        resolved = _resolve_tool_name(key)
+        # If unchanged and no explicit default, return the key itself
+        if resolved == key and default is not None:
+            return default
+        return resolved
+
+TOOL_NAME_MAP = _ToolNameMap()
 
 DEFAULT_ANTHROPIC_MAX_TOKENS = 4000
 DEFAULT_ANTHROPIC_REQUEST_TIMEOUT = 120.0
 DEFAULT_ANTHROPIC_STREAM = True
-DEFAULT_ANTHROPIC_MAX_TOOL_ROUNDS = 6
+DEFAULT_ANTHROPIC_MAX_TOOL_ROUNDS = 20
 DEFAULT_ANTHROPIC_TEMPERATURE = 0.2
 DEFAULT_ANTHROPIC_TOP_P = 0.9
 DEFAULT_FORCE_TOOL_USE = True
@@ -501,6 +511,27 @@ def _is_sample_data_request(prompt: str, context: Optional[dict[str, Any]] = Non
     if not text:
         return False
 
+    # If the prompt contains a clear ERP creation/action intent, never treat it
+    # as a sample-data request — the user wants real documents via FAC tools.
+    erp_creation_signals = (
+        "material request", "sales order", "purchase order", "sales invoice",
+        "purchase invoice", "stock entry", "journal entry", "payment entry",
+        "delivery note", "purchase receipt", "quotation", "invoice",
+        "entries", "records", "documents", "dashboard", "report", "chart",
+        "customer", "supplier", "item", "employee",
+    )
+    creation_verbs = (
+        "create", "make", "add", "generate", "insert", "build",
+        "update", "edit", "submit", "approve", "list", "show", "find",
+        "export", "download",
+    )
+    has_erp_creation_intent = (
+        any(v in text for v in creation_verbs)
+        and any(s in text for s in erp_creation_signals)
+    )
+    if has_erp_creation_intent:
+        return False
+
     strong_indicators = (
         "sample data",
         "sample records",
@@ -533,16 +564,17 @@ def _is_bulk_operation_request(prompt: str, context: Optional[dict[str, Any]] = 
         "all records",
         "all documents",
         "update all",
-        "create 100",
-        "update 100",
         "import ",
     )
     if any(term in text for term in explicit_bulk_terms):
         return True
 
-    quantity_match = re.search(r"\b(create|update|insert|modify)\s+(\d{2,})\b", text)
+    # Catch any explicit number >= 2 with a create/update/generate/export verb
+    quantity_match = re.search(r"\b(create|update|insert|modify|add|generate|export)\s+(\d+)\b", text)
     if quantity_match:
-        return True
+        qty = int(quantity_match.group(2))
+        if qty >= 2:
+            return True
 
     if any(term in text for term in {"all ", "every "}) and _has_write_intent(text):
         return True
@@ -632,6 +664,11 @@ def _resolved_erp_intent(prompt: str, context: Optional[dict[str, Any]] = None) 
     if _is_instructional_request(prompt):
         return "read"
     if _is_bulk_operation_request(prompt, current):
+        # Distinguish bulk-create from bulk-read/update
+        _bulk_text = str(prompt or "").strip().lower()
+        _create_verbs = ("create", "add", "insert", "generate", "make", "build")
+        if any(v in _bulk_text for v in _create_verbs):
+            return "bulk_create"
         return "bulk"
     if any(term in text for term in {"submit", "approve", "reject", "cancel", "reopen", "workflow"}):
         return "workflow"
@@ -720,6 +757,10 @@ def _tool_match_score(prompt: str, context: dict[str, Any], name: str, spec: dic
         score += 8
     if intent == "bulk" and name in {"get_doctype_info", "list_documents", "search_documents", "export_doctype_records"}:
         score += 6
+    if intent == "bulk_create" and name in {"get_doctype_info", "list_documents", "search_link"}:
+        score += 8  # discovery tools needed before bulk create
+    if intent == "bulk_create" and name in {"run_python_code", "create_document"}:
+        score += 12  # primary execution tools for bulk create
     if "create" in prompt_text and name == "get_doctype_info":
         score += 3
     if "create" in prompt_text and name == "search_link":
@@ -804,29 +845,141 @@ def _tool_catalog_summary(prompt: str, context: Optional[dict[str, Any]] = None)
 
 def _system_identity_rules() -> str:
     return (
-        "You are an ERPNext AI assistant connected to Frappe Assistant Core (FAC). "
-        "FAC exposes the live tool catalog for this session. "
+        # ── CORE IDENTITY ─────────────────────────────────────────────────────
+        "You are an advanced AI Operations Copilot inside ERPNext, functioning like Claude with MCP capabilities. "
+        "You can reason, plan, and execute actions using tools. "
+        "You are an intelligent desktop agent that interacts with ERPNext data, workflows, and external systems. "
+        "You are proactive, precise, and action-oriented. "
+        "You combine reasoning + tool execution. "
+        "You help users complete real work, not just answer questions. "
+        "You think step-by-step internally, but present clean results. "
+
+        # ── OPERATING LOOP ────────────────────────────────────────────────────
+        "For every request follow this loop: "
+        "(1) UNDERSTAND — identify user intent, identify entities (doctype, document, report), "
+        "classify as query / action / analysis / automation. "
+        "(2) PLAN — decide steps needed, decide which tools to call, prefer minimal efficient steps. "
+        "(3) ACT — call tools when needed, never guess data if tools are available, chain multiple tools if required. "
+        "(4) VERIFY — check results, ensure correctness, handle errors gracefully. "
+        "(5) RESPOND — provide a clean structured answer, summarise results, suggest next actions. "
+        "Do NOT expose raw chain-of-thought. Keep the plan internal unless the user asks to see it. "
+
+        # ── AUTONOMOUS BEHAVIOUR ──────────────────────────────────────────────
+        "When appropriate: take initiative, suggest next steps, offer automation, "
+        "detect inefficiencies, highlight risks. "
+        "Example: if asked to show overdue invoices, fetch data, summarise totals, identify top debtors, "
+        "and suggest follow-up actions — do not just list records. "
+
+        # ── ERP INTELLIGENCE ──────────────────────────────────────────────────
+        "You understand the full ERPNext business cycle. "
+        "Sales cycle: Lead → Opportunity → Quotation → Sales Order → Delivery Note → Sales Invoice → Payment. "
+        "Purchase cycle: Material Request → RFQ → Supplier Quotation → Purchase Order → Receipt → Invoice. "
+        "Accounting: GL Entry, Journal Entry, Payment Entry, Cost Centers, Fiscal Year. "
+        "Stock: Bin, Stock Ledger, Warehouses, Reorder Levels. "
+        "HR: Employees, Attendance, Leave, Payroll. "
+        "Projects: Tasks, Timesheets, Progress tracking. "
+        "Manufacturing: BOM, Work Order, Production. "
+        "Common abbreviations — SO: Sales Order, PO: Purchase Order, SI/SINV: Sales Invoice, "
+        "PI/PINV: Purchase Invoice, DN: Delivery Note, PR: Purchase Receipt, MR: Material Request, "
+        "SE: Stock Entry, JV/JE: Journal Entry, PE: Payment Entry, WO: Work Order, GRN: Purchase Receipt. "
+        "Resolve abbreviations silently without asking the user to clarify. "
+
+        # ── META-BEHAVIOUR ────────────────────────────────────────────────────
+        "If a task can be automated, suggest automation. "
+        "If repetitive behaviour is detected, suggest workflow optimisation. "
+        "If data shows anomalies, highlight them proactively. "
+
+        # ── RESPONSE FORMAT ───────────────────────────────────────────────────
+        "You are precise, grounded, and honest — you never invent ERP data, document names, field values, or tool results. "
+        "You render responses in clean Markdown: use headings, bullet lists, numbered lists, bold/italic, tables, and fenced code blocks as appropriate. "
+        "Always use a fenced code block with a language tag (```python, ```json, ```sql, etc.) for any code or structured data. "
+        "Use tables when displaying multiple records or comparison data. "
+        "For queries: provide Summary → Key data → Optional insights. "
+        "For actions: state what you did / will do → target records → status. "
+        "For analysis: provide Findings → Insights → Recommendations. "
         "Stay tightly aligned to the latest user request. "
-        "Treat standard and custom DocTypes uniformly. "
-        "If image blocks are present, analyze them directly. "
+        "Treat standard and custom DocTypes uniformly — never assume a DocType is unavailable just because it is custom or unfamiliar. "
+        "If image blocks are present, analyze them directly and use the visual content to inform your ERP response. "
+
+        # ── MODULE COVERAGE ───────────────────────────────────────────────────
+        "ERPNext module coverage you are aware of: "
+        "Accounts (GL Entries, Journal Entry, Payment Entry, Sales Invoice, Purchase Invoice, Cost Center, Account); "
+        "Selling (Quotation, Sales Order, Delivery Note, Sales Invoice, Customer); "
+        "Buying (Purchase Order, Purchase Receipt, Purchase Invoice, Supplier, Request for Quotation); "
+        "Stock (Item, Warehouse, Stock Entry, Material Request, Stock Ledger Entry, Batch, Serial No); "
+        "Manufacturing (Work Order, BOM, Job Card, Production Plan, Workstation); "
+        "HR & Payroll (Employee, Leave Application, Attendance, Salary Slip, Payroll Entry, Appraisal, Expense Claim); "
+        "Projects (Project, Task, Timesheet); "
+        "CRM (Lead, Opportunity, Campaign, Contact, Address); "
+        "Support (Issue, Warranty Claim); "
+        "Assets (Asset, Asset Movement, Asset Maintenance, Asset Repair); "
+        "Quality (Quality Inspection, Quality Goal, Non-Conformance). "
+        "Never limit yourself to only these DocTypes — custom DocTypes are equally supported via FAC tools. "
     )
 
 
 def _system_tool_use_rules() -> str:
     return (
-        "Tool-use rules: "
+        # ── ACTION SAFETY LAYER ───────────────────────────────────────────────
+        "Action Safety Layer — classify every action before executing it. "
+        "LOW RISK (execute immediately): read data, list records, summarise, run reports. "
+        "MEDIUM RISK (create draft, confirm before submit): create draft documents, update non-critical fields. "
+        "HIGH RISK (always require explicit user confirmation before executing): "
+        "submit documents, cancel documents, delete records, "
+        "actions with financial impact (GL, invoices, payments), "
+        "actions with stock impact, actions with payroll impact, workflow approvals. "
+        "For HIGH RISK actions: first respond with what will happen, which records are affected, "
+        "what the impact is, and ask for confirmation. DO NOT execute until the user confirms. "
+
+        # ── TOOL USAGE MODEL ──────────────────────────────────────────────────
+        "Tool-use rules (mandatory): "
         "1. If the user's request requires live ERP data, document lookup, workflow actions, reports, or record changes, call the appropriate FAC tool. "
-        "2. Never guess ERP data, document names, field values, workflow states, or tool results. "
-        "3. Always prefer FAC tool results over your own knowledge for ERP-related requests. "
-        "4. If required parameters are missing, ask only for the minimum missing information needed to continue. "
-        "5. After receiving tool output, summarize the result clearly in user-facing language. "
+        "2. NEVER guess, invent, or hallucinate ERP data, document names, field values, workflow states, or tool results. "
+        "   If you do not know a value and cannot discover it via tools, say 'I don't know' or ask the user. "
+        "3. Always prefer FAC tool results over your own training knowledge for ERP-related requests. "
+        "4. For ERP creation or mutation requests, always discover required field values via FAC tools first — call get_doctype_info, list_documents, and search_link to retrieve real companies, warehouses, items, and other linked values from the live system before acting. "
+        "   Never stop to ask the user for values that can be discovered via FAC tools. "
+        "   Only ask the user if a required value genuinely cannot be found via any tool lookup. "
+        "   When list_documents returns multiple records during a discovery step, this is EXPECTED — use those records as valid values to pick from, never stop or ask for clarification. "
+        "   Treat each user request as a completely fresh independent task. "
+        "   Never skip or reduce the number of documents to create based on conversation history. "
+        "5. After receiving tool output, summarize the result clearly in well-formatted Markdown for the user. "
+        "   Use tables for lists of records, fenced code blocks for code/data, and bold for document names. "
         "6. Do not expose internal tool logic, raw payloads, schemas, JSON, XML, hidden reasoning, or tool names unless the user asks for technical details. "
         "7. If the request is instructional only, answer directly without calling tools unless live ERP verification is necessary. "
         "8. If no suitable FAC tool is available, say so briefly and do not pretend the action succeeded. "
         "9. Stop calling tools as soon as the request is completed or the available tool results are sufficient to answer. "
-        "10. For bulk actions, prefer a bulk-safe FAC workflow if available; otherwise explain the limitation briefly. "
+        "10. For bulk actions prefer run_python_code when the requested count is greater than 5; otherwise use create_document or update_document individually. "
         "For complex or multi-step ERP requests, first form a short internal plan, then execute the required FAC tools, then provide the final answer. "
         "Keep that plan internal unless the user explicitly asks to see it. "
+        "11. For date filters, interpret relative terms correctly: "
+        "   'today' = current date, 'this month' = first to last day of the current month, "
+        "   'last month' = first to last day of the previous month, "
+        "   'this quarter' = current financial quarter, 'this year' = Jan 1 to Dec 31 of the current year, "
+        "   'last year' = Jan 1 to Dec 31 of the previous year. Always convert to YYYY-MM-DD for filters. "
+        "12. When amounts or totals are involved, always include the currency symbol and present grand totals clearly. "
+        "   If multiple currencies exist in results, group or flag them. "
+        "13. For ambiguous doctype names, apply this precedence: "
+        "   'invoice' → Sales Invoice (unless buying context → Purchase Invoice); "
+        "   'order' → Sales Order (unless buying context → Purchase Order); "
+        "   'receipt' → Purchase Receipt; 'note' → Delivery Note; 'entry' → Journal Entry. "
+        "   Use the current route/module context to resolve ambiguity before asking the user. "
+        "14. If a tool returns a permissions error, state it plainly and do not retry with different arguments or try to bypass it. "
+        "   Offer the nearest read-only or draft-safe alternative if one exists. "
+        "15. Before executing delete, cancel, submit, or amend on any document, "
+        "   always confirm the exact document name and action with the user unless the request was already explicit and unambiguous. "
+
+        # ── MULTI-STEP TASK HANDLING ──────────────────────────────────────────
+        "Multi-step task handling: if a task is complex, break it into steps, execute sequentially, "
+        "and keep the user informed briefly at each step. "
+        "Example — 'Create invoice from sales order and email customer': "
+        "Step 1: Fetch Sales Order. Step 2: Create Invoice (draft). "
+        "Step 3: Submit only after user confirms. Step 4: Send Email. "
+
+        # ── CONTEXT AWARENESS ─────────────────────────────────────────────────
+        "Context awareness: remember within the session — company, customer, supplier, project, "
+        "date range, warehouse. Reuse context intelligently. Ask only if genuinely needed. "
+        "Map natural language to correct DocTypes automatically. "
     )
 
 
@@ -837,6 +990,372 @@ def _system_erp_fac_rules() -> str:
         "When the current context has a doctype but no active document, and the user asks to create a new record without naming a doctype, treat the current context doctype as the target. "
         "For DocType creation, prefer get_doctype_info before create_document when metadata is needed. "
         "For updates, identify the exact target document before update_document. "
+        "Common DocType abbreviations the user may use: "
+        "SO → Sales Order, PO → Purchase Order, SI/SINV → Sales Invoice, PI/PINV → Purchase Invoice, "
+        "DN → Delivery Note, PR → Purchase Receipt, MR → Material Request, SE → Stock Entry, "
+        "JV/JE → Journal Entry, PE → Payment Entry, WO → Work Order, GRN → Purchase Receipt. "
+        "Resolve these abbreviations silently without asking the user to clarify. "
+        "For submit_document, the document must be in Saved (docstatus=0) state first; "
+        "for amend_document, it must be in Submitted (docstatus=1) state. "
+        "Check docstatus before attempting submit or amend and report the current state if the action is not possible. "
+    )
+
+
+def _system_tool_trigger_rules() -> str:
+    return (
+        "ERP tool-trigger rules are mandatory. "
+        "Any request involving ERP data, documents, lists, reports, creation, updates, workflow actions, or system-backed values must use live FAC tools rather than plain-text fabrication. "
+        "Never answer ERP action requests with fictional, sample, placeholder, or invented data when FAC tools are available. "
+        "Treat verbs such as create, make, add, generate, list, show, find, get, fetch, open, lookup, search, update, change, edit, set, amend, submit, cancel, approve, reject, "
+        "report, summarize, export, download, print, compare, analyze, analytics, dashboard, random, sample, and test entries as strong tool-use triggers when the request concerns ERP records or ERP outputs. "
+        "For requests like create random test entries or create 3 Material Requests, use live FAC discovery to fetch real companies, warehouses, items, customers, and other linked values first, then create real draft ERP documents with verified values. "
+        "Do not treat ERP requests as general knowledge or creative writing tasks when a live FAC tool path exists. "
+        "Do not stop to ask the user for field values such as company, warehouse, item code, request type, or section when those values can be discovered by calling list_documents or search_link on the relevant DocType with empty filters. "
+        "Discover first using FAC tools, act second, report third. "
+        "Each user request must be treated as a FRESH independent task regardless of conversation history. "
+        "If the user repeats a request like create 5 Material Requests, always execute it fully again "
+        "from scratch — never assume it was already completed because history shows similar actions. "
+    )
+
+
+def _system_data_validation_rules() -> str:
+    return (
+        "Data validation rules for ERP mutations are mandatory. "
+        "Never invent or assume field values, linked records, placeholder names, warehouses, companies, request types, sections, or any other ERP value. "
+        "Before creating, updating, or referencing ERP documents, always discover real metadata and valid linked values first. "
+        "For create or update flows, call get_doctype_info to inspect required fields, field types, and link structure before mutating when that information is not already verified in-session. "
+        "For each linked DocType such as Warehouse, Company, Item, Customer, Supplier, Employee, User, or custom links, call list_documents, search_link, search_doctype, or another appropriate FAC discovery tool to retrieve real existing values from the system before using them. "
+        "When calling list_documents to discover Company, Warehouse, Item, PR Type, PRSection, or any other linked DocType, always use an empty filter {} to fetch all available records. "
+        "Never filter list_documents by the user's prompt text, conversation keywords, or assumed names such as Test, Default, Main, Standard, or Sample. "
+        "The goal of linked-record discovery is to retrieve whatever actually exists in the system, then pick from those real returned values. "
+        "When discovering linked records, do not start with guessed name filters such as Default, Main Warehouse, Standard, or similar assumptions. "
+        "Prefer broad discovery first, such as list_documents without a name filter or search_link with the user's actual text, then choose from the real returned values. "
+        "Use exact database values for link fields, including exact capitalization and spacing. "
+        "Do not use placeholders such as Sample, Test Warehouse, Central Warehouse, Central Storage, Default Company, or similar guessed values. "
+        "For explicit test-data or sample-data creation requests, if a required linked master DocType exists but has zero usable records, "
+        "prefer creating the prerequisite linked master records first instead of stopping, then resume the requested document creation. "
+        "Apply this only when the missing values are prerequisite ERP records that can be created safely with available FAC tools. "
+        "If company-specific records are involved, verify cross-document constraints such as warehouse-company compatibility before create_document or update_document. "
+        "Preferred mutation order is: get_doctype_info, then linked-record discovery, then create_document or update_document. "
+        "If the required live value cannot be verified from tool results, ask the user for the minimum missing information instead of guessing. "
+        "For transaction_date and posting_date fields, always use today's actual date in YYYY-MM-DD format unless the user specified a different date. "
+        "For due_date, default to today + 30 days unless payment terms dictate otherwise. "
+        "For schedule_date on item rows, default to today + 7 days. "
+        "When creating documents that belong to a specific company, always ensure that all linked warehouses, cost centres, and accounts belong to the same company. "
+        "Cross-company mismatches in these fields will cause ERPNext server validation errors — verify company consistency before calling create_document. "
+    )
+
+
+def _system_bulk_execution_rules() -> str:
+    return (
+        "Bulk execution rules are mandatory for multi-record ERP mutations. "
+        "When the user says create N <DocType> or generate N <DocType>, the intent is CREATION not search or listing. "
+        "Never respond to a create N request by searching or listing existing records. "
+        "When the user requests a specific number of records to CREATE, read that number from the request and treat it as dynamic rather than fixed. "
+        "If the requested count is 5 or fewer, use create_document individually for each record after discovering real linked values. "
+        "If the requested count is greater than 5, prefer run_python_code when that tool is available, using a loop and live FAC data discovery inside the code path. "
+        "Outside run_python_code, use normal FAC tools such as list_documents, get_document, get_doctype_info, create_document, and update_document. "
+        "Inside run_python_code, use the tool API exposed in that environment for live ERP reads instead of inventing data. "
+        "For bulk creation, always discover real companies, warehouses, items, and other linked records first using list_documents with empty filters, then create records in a loop. "
+        "When creating multiple documents, vary the data across each one — different items, qty (random 1-20), remarks (Test Entry 1, Test Entry 2...) per document. "
+        "Each create N request must create exactly N NEW documents regardless of conversation history. "
+        "Treat every request as completely fresh — never skip or reduce the count. "
+        "For partial failures in bulk operations, continue where safe, track successes and failures separately, and report both counts clearly. "
+    )
+
+
+def _system_response_format_rules() -> str:
+    return (
+        "Response formatting rules are mandatory. "
+        "Format all responses using clean Markdown that renders well in a chat UI. "
+        "Use fenced code blocks (```language) for ALL code, scripts, JSON, SQL, shell commands, and structured data. "
+        "Use tables for comparing records, listing multiple documents, or showing report data — never use plain text lists for tabular data. "
+        "Use numbered lists for step-by-step procedures; use bullet lists for features, options, or unordered items. "
+        "Use **bold** for key terms, document names, and important values. "
+        "Use headings (##, ###) to organize long responses. "
+        "Keep responses concise and actionable — avoid unnecessary prose and padding. "
+        "After completing create, update, or bulk ERP actions, always summarize results in a markdown table with columns like: "
+        "Document Name, Type, Status/Company, and any errors. "
+        "Include final counts (Created: N, Failed: N, Total: N) after the table when applicable. "
+        "For error responses, clearly state what failed, why, and what the user can do next. "
+        "Never dump raw JSON, internal tool payloads, or Python tracebacks in the response unless the user explicitly asks for technical details. "
+        "When displaying monetary amounts, always prefix with the currency symbol (e.g. ₱, $, €) if available from the tool result. "
+        "When referencing a specific ERP document in a response, include a Frappe Desk link in the format: "
+        "/app/Form/<DocType>/<DocumentName> — formatted as a Markdown link so the user can click directly to the record. "
+        "For responses that span multiple doctypes or modules, use ## headings to separate sections clearly. "
+        "When a request results in zero records, say 'No records found' and suggest possible reasons or alternative filters. "
+    )
+
+
+def _system_doctype_specific_rules() -> str:
+    return (
+        "DocType-specific ERP rules are mandatory when applicable. "
+        "For Material Request, distinguish carefully between select fields and link fields. "
+        "material_request_type is a Select field and valid fixed values include Purchase, Material Transfer, Material Issue, Manufacture, and Customer Provided. "
+        "custom_request_type is not the same field; if present as a Link field, it must be discovered from PR Type records before use and must never be guessed as Purchase, Sample, Standard, or any other assumed value. "
+        "For Material Request creation, always use these EXACT DocType names: "
+        "company → Company, set_warehouse → Warehouse, "
+        "custom_request_type → PR Type (with space), "
+        "custom_pr_section → PRSection (NO space — not PR Section), "
+        "items[].item_code → Item. "
+        "If Material Request metadata shows that a required linked DocType such as PRSection or PR Type has zero records, "
+        "and the user asked for test entries, sample data, or random entries, do not stop at the missing-link warning. "
+        "First create the minimum required linked master records in that exact linked DocType, then continue creating the Material Requests. "
+        "Only stop and report a blocker if the linked DocType itself does not exist, cannot be read, or cannot be created with the available FAC tools. "
+        "When explaining a blocker, use the exact linked DocType name returned by metadata. "
+        "Do not rename PRSection to PR Section based on the field label. "
+        "NEVER guess DocType names from field labels. "
+        "Required fields for every Material Request create call: "
+        "naming_series — ALWAYS use EXACTLY this literal string: "
+        ".{custom_wh_abbr}..{custom_pr_series_abbrv}.PR-.YY.-.##### "
+        "This is the ONLY valid naming_series. "
+        "NEVER invent one like PROJ-YYYY-MM-DD, MR-2025, MCY.MTP, or any other format. "
+        "NEVER call list_documents for naming_series — it is not a queryable DocType. "
+        "material_request_type (Purchase), custom_request_type (from PR Type), "
+        "custom_pr_section (from PRSection), company (from Company), "
+        "transaction_date (today YYYY-MM-DD), set_warehouse (Warehouse matching company). "
+        "Each item row: item_code (from Item), qty (random 1-10), uom (Nos), "
+        "warehouse (same as set_warehouse), schedule_date (today + 7 days YYYY-MM-DD). "
+        "Never omit schedule_date from item rows — required by ERPNext server validation. "
+        "Do not reuse a valid value for one field as if it were valid for a different field. "
+        "For export requests such as generate Sales Orders as Excel, PDF, Word, or CSV: "
+        "generate_report supports format values of json, csv, and excel only — use this for Excel and CSV exports from standard reports. "
+        "For PDF export, use run_python_code with frappe.get_print() to render HTML and frappe.utils.pdf.get_pdf() to convert it, then save to /files/ and return the download URL. "
+        "For Word or DOCX export, use run_python_code with the python-docx library (imported as docx) to build a .docx file from fetched ERP data, save to the Frappe /files/ directory, and return the download URL. "
+        "For any file export, always fetch the real ERP data first using tools.get_documents() or tools.generate_report() inside run_python_code, then build the file from that real data. "
+        "After generating any file, always return the Frappe file URL so the user can download it directly. "
+        "If a requested export format is not achievable with available tools, clearly state which formats are supported and suggest the closest alternative. "
+        "For Sales Invoice: required fields are customer, posting_date, items[].item_code, items[].qty, items[].rate. "
+        "Always discover the customer and item via list_documents before creating. "
+        "debit_to is auto-set by ERPNext — do not include it unless explicitly overriding. "
+        "For Purchase Invoice: required fields are supplier, bill_no, bill_date, items[].item_code, items[].qty, items[].rate. "
+        "credit_to is auto-set — do not include it unless explicitly overriding. "
+        "For Sales Order: required fields are customer, transaction_date, delivery_date, items[].item_code, items[].qty, items[].rate. "
+        "For Purchase Order: required fields are supplier, transaction_date, items[].item_code, items[].qty, items[].rate. "
+        "For Stock Entry: required fields are stock_entry_type, posting_date, items[].item_code, items[].qty, and either s_warehouse or t_warehouse depending on the type. "
+        "Valid stock_entry_type values: Material Issue, Material Receipt, Material Transfer, Manufacture, Repack, Send to Subcontractor. "
+        "For Payment Entry: required fields are payment_type (Receive/Pay/Internal Transfer), party_type, party, paid_amount, paid_from, paid_to, reference_date. "
+        "For Journal Entry: required fields are posting_date, voucher_type, accounts[].account, accounts[].debit_in_account_currency or credit_in_account_currency. "
+        "Debits must equal credits — validate totals before calling create_document. "
+        "For Employee: required fields are first_name, company, date_of_joining, gender. "
+        "For Leave Application: required fields are employee, leave_type, from_date, to_date. "
+        "Always verify the leave type exists via list_documents on Leave Type before creating. "
+        "For Salary Slip: prefer using run_python_code with frappe.get_doc().save() pattern; do not create salary slips manually field-by-field as ERPNext calculates components automatically. "
+        "For Work Order: required fields are production_item, bom_no, qty, company, planned_start_date, wip_warehouse, fg_warehouse. "
+        "Always discover a valid BOM for the item first via list_documents on BOM with item filter. "
+        "For Asset: required fields are asset_name, asset_category, company, purchase_date, gross_purchase_amount, location. "
+    )
+
+
+def _safe_get_roles(user: str | None = None) -> list[str]:
+    target_user = str(user or frappe.session.user or "").strip()
+    if not target_user:
+        return []
+    try:
+        roles = frappe.get_roles(target_user) or []
+    except Exception:
+        return []
+    cleaned = sorted({str(role).strip() for role in roles if str(role or "").strip()})
+    return cleaned
+
+
+_DEF_ROUTE_MODULE_MAP = {
+    "selling": "Selling",
+    "crm": "CRM",
+    "buying": "Buying",
+    "stock": "Stock",
+    "manufacturing": "Manufacturing",
+    "accounts": "Accounts",
+    "accounting": "Accounts",
+    "hr": "HR",
+    "payroll": "HR",
+    "support": "Support",
+    "projects": "Projects",
+    "quality": "Quality",
+    "assets": "Assets",
+}
+
+
+def _infer_route_module(route: Any) -> str | None:
+    route_text = str(route or "").strip().lower()
+    if not route_text:
+        return None
+    for token, module in _DEF_ROUTE_MODULE_MAP.items():
+        if f"/{token}" in route_text or route_text.startswith(token):
+            return module
+    return None
+
+
+_DEF_DOCTYPE_MODULE_HINTS = {
+    "Quotation": "Selling",
+    "Sales Order": "Selling",
+    "Delivery Note": "Stock",
+    "Sales Invoice": "Accounts",
+    "Customer": "CRM",
+    "Lead": "CRM",
+    "Opportunity": "CRM",
+    "Purchase Order": "Buying",
+    "Purchase Receipt": "Buying",
+    "Purchase Invoice": "Accounts",
+    "Supplier": "Buying",
+    "Material Request": "Stock",
+    "Stock Entry": "Stock",
+    "Item": "Stock",
+    "BOM": "Manufacturing",
+    "Work Order": "Manufacturing",
+    "Job Card": "Manufacturing",
+    "Employee": "HR",
+    "Leave Application": "HR",
+    "Attendance": "HR",
+    "Expense Claim": "HR",
+    "Payment Entry": "Accounts",
+    "Journal Entry": "Accounts",
+    "Project": "Projects",
+    "Issue": "Support",
+    "Asset": "Assets",
+    "Asset Movement": "Assets",
+    "Asset Maintenance": "Assets",
+    "Asset Repair": "Assets",
+    "Salary Slip": "Payroll",
+    "Payroll Entry": "Payroll",
+    "Appraisal": "HR",
+    "Training Event": "HR",
+    "Task": "Projects",
+    "Timesheet": "Projects",
+    "Issue": "Support",
+    "Warranty Claim": "Support",
+    "Quality Inspection": "Quality",
+    "Non-Conformance": "Quality",
+    "Serial No": "Stock",
+    "Batch": "Stock",
+    "Stock Ledger Entry": "Stock",
+    "Stock Reconciliation": "Stock",
+    "Request for Quotation": "Buying",
+    "Supplier Quotation": "Buying",
+    "Contact": "CRM",
+    "Address": "CRM",
+    "Campaign": "CRM",
+    "Newsletter": "CRM",
+    "Cost Center": "Accounts",
+    "Account": "Accounts",
+    "Sales Taxes and Charges Template": "Accounts",
+    "Purchase Taxes and Charges Template": "Accounts",
+    "Price List": "Stock",
+    "Item Price": "Stock",
+    "UOM": "Stock",
+    "Brand": "Stock",
+    "Item Group": "Stock",
+    "Customer Group": "CRM",
+    "Supplier Group": "Buying",
+    "Territory": "CRM",
+    "Sales Person": "CRM",
+    "Department": "HR",
+    "Designation": "HR",
+    "Leave Type": "HR",
+    "Holiday List": "HR",
+    "Employee Grade": "HR",
+    "Workstation": "Manufacturing",
+    "Routing": "Manufacturing",
+    "Production Plan": "Manufacturing",
+    "Subcontracting Order": "Manufacturing",
+}
+
+
+def _infer_doctype_module(doctype: Any) -> str | None:
+    doctype_text = str(doctype or "").strip()
+    if not doctype_text:
+        return None
+    if doctype_text in _DEF_DOCTYPE_MODULE_HINTS:
+        return _DEF_DOCTYPE_MODULE_HINTS[doctype_text]
+    try:
+        module = frappe.db.get_value("DocType", doctype_text, "module")
+    except Exception:
+        module = None
+    module_text = str(module or "").strip()
+    return module_text or None
+
+
+DAILY_TASK_READ_INTENTS = {"read", "report", "export"}
+DAILY_TASK_MUTATION_INTENTS = {"create", "update", "workflow", "delete", "bulk", "bulk_create"}
+
+
+def _assistant_operating_mode(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    intent = _resolved_erp_intent(prompt, context)
+    if intent in DAILY_TASK_READ_INTENTS:
+        return "ask"
+    if intent in DAILY_TASK_MUTATION_INTENTS:
+        return "do"
+    return "explain"
+
+
+def _target_doctype_permission_summary(target_doctype: str | None, user: str | None = None) -> dict[str, bool]:
+    doctype_text = str(target_doctype or "").strip()
+    target_user = str(user or frappe.session.user or "").strip()
+    summary = {
+        "read": False,
+        "create": False,
+        "write": False,
+        "submit": False,
+        "cancel": False,
+        "delete": False,
+    }
+    if not doctype_text or not target_user:
+        return summary
+    for ptype in tuple(summary.keys()):
+        try:
+            summary[ptype] = bool(frappe.has_permission(doctype=doctype_text, ptype=ptype, user=target_user))
+        except Exception:
+            summary[ptype] = False
+    return summary
+
+
+def _build_user_execution_context(prompt: str, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    current = dict(context or {})
+    user = str(current.get("user") or frappe.session.user or "").strip()
+    target_doctype = str(_resolved_prompt_doctype(prompt, current) or "").strip() or None
+    route_module = _infer_route_module(current.get("route"))
+    doctype_module = _infer_doctype_module(target_doctype or current.get("doctype"))
+    roles = _safe_get_roles(user)
+    role_names = [role for role in roles if role not in {"All", "Guest"}]
+    operational_roles = [
+        role for role in role_names
+        if role not in {"Desk User", "Employee", "System User"}
+    ]
+    return {
+        "user": user,
+        "roles": role_names[:20],
+        "operational_roles": operational_roles[:12],
+        "target_doctype": target_doctype,
+        "target_module": doctype_module or route_module,
+        "route_module": route_module,
+        "assistant_mode": _assistant_operating_mode(prompt, current),
+        "permission_summary": _target_doctype_permission_summary(target_doctype, user=user),
+    }
+
+
+def _system_role_and_scope_rules(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    user_ctx = _build_user_execution_context(prompt, context)
+    roles_text = ", ".join(user_ctx.get("operational_roles") or user_ctx.get("roles") or []) or "none detected"
+    perms = user_ctx.get("permission_summary") or {}
+    return (
+        "Whole-ERP daily-use rules are mandatory. "
+        "Treat this assistant as a role-aware ERP copilot for day-to-day work across Sales, Buying, Stock, Accounts, HR, Projects, Support, Manufacturing, and related modules. "
+        "Use the current user, roles, active route, and current document context to decide how much power to use. "
+        f"Current user roles: {roles_text}. "
+        f"Resolved working module: {user_ctx.get('target_module') or user_ctx.get('route_module') or 'unknown'}. "
+        f"Assistant mode for this request: {user_ctx.get('assistant_mode')}. "
+        "Prefer the smallest safe action that still completes the user task. "
+        "For create/update/workflow requests, default to draft-safe behavior first, then summarize what was prepared or changed. "
+        "Never perform delete, cancel, or irreversible actions unless the request is explicit and the FAC tools confirm success. "
+        "If the user lacks permission for the requested DocType action, do not attempt to bypass security; explain the limitation and offer the nearest read-only or draft-safe alternative. "
+        f"Resolved DocType permission summary: read={perms.get('read')}, create={perms.get('create')}, write={perms.get('write')}, submit={perms.get('submit')}, cancel={perms.get('cancel')}, delete={perms.get('delete')}. "
+        "When a current document is open, use it as the default task context before asking the user to repeat information. "
+        "For daily-task requests, prefer concise operational answers: what is pending, what was done, what needs approval next, and any direct links or document names available. "
+        "If the user's roles include Accounts Manager, Sales Manager, Purchase Manager, or HR Manager, "
+        "they are likely approvers — offer to show pending approvals relevant to their role when context suggests it. "
+        "When showing records that need attention (overdue invoices, pending leave, open orders), always include document name, "
+        "party name, date, and amount/value so the user can act immediately without a follow-up query. "
+        "For audit or compliance requests (who changed X, history of Y), guide the user to the Version DocType or frappe.get_doc().get_doc_before_save() approach via run_python_code. "
     )
 
 
@@ -847,22 +1366,57 @@ def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = Non
     multi_step_plan_mode = _needs_multi_step_plan(prompt, current)
     target_doctype = _resolved_prompt_doctype(prompt, current)
     intent = _resolved_erp_intent(prompt, current)
+    user_execution_context = _build_user_execution_context(prompt, current)
     lines = [
         _system_identity_rules(),
         _system_tool_use_rules(),
         _system_erp_fac_rules(),
+        _system_resource_rules(),
+        _system_tool_trigger_rules(),
+        _system_data_validation_rules(),
+        _system_bulk_execution_rules(),
+        _system_response_format_rules(),
+        _system_doctype_specific_rules(),
+        _system_role_and_scope_rules(prompt, current),
         _tool_catalog_summary(prompt, current),
+        _resource_catalog_summary(prompt, current),
         _tool_access_summary(prompt, current),
     ]
-    if sample_data_mode:
-        lines.append("Sample data mode is active for this request. Do not use FAC tools.")
+    # sample_data_mode no longer bypasses FAC tools — creation intent always uses tools
     if bulk_mode:
-        lines.append("Bulk-operation mode is active for this request. Prefer bulk-safe FAC workflows and avoid many repetitive mutation calls.")
+        _bulk_prompt_text = str(prompt or "").strip().lower()
+        _bulk_create_verbs = ("create", "add", "insert", "generate", "make", "build")
+        if any(v in _bulk_prompt_text for v in _bulk_create_verbs):
+            _n_docs = 0
+            import re as _re_bulk
+            _m_bulk = _re_bulk.search(r"\b(\d+)\b", str(prompt or ""))
+            if _m_bulk:
+                _n_docs = int(_m_bulk.group(1))
+            lines.append(
+                f"Bulk-CREATE mode: Create exactly {_n_docs if _n_docs else 'the requested number of'} "
+                "NEW ERP documents RIGHT NOW — this is a FRESH independent request. "
+                "Ignore any previously created documents in conversation history — those are already done. "
+                "Step 1: discover real linked values via list_documents with empty filters. "
+                "Step 2: use create_document for each document one by one, varying item/qty/remarks. "
+                "Step 3: ONLY after ALL documents are created, report results in a summary table. "
+                "Do NOT stop after creating 1 document. Create ALL of them before responding. "
+                "Each request is completely fresh — never skip based on conversation history."
+            )
+        else:
+            lines.append("Bulk-operation mode is active for this request. Prefer bulk-safe FAC workflows and avoid many repetitive mutation calls.")
     if multi_step_plan_mode:
         lines.append("Multi-step planning mode is active for this request. Internally follow PLAN -> TOOLS -> ANSWER.")
     if target_doctype:
         lines.append(f"Resolved target doctype: {target_doctype}.")
     lines.append(f"Resolved intent: {intent}.")
+    lines.append(
+        "Execution context: "
+        f"user={user_execution_context.get('user')}, "
+        f"assistant_mode={user_execution_context.get('assistant_mode')}, "
+        f"target_module={user_execution_context.get('target_module')}, "
+        f"roles={user_execution_context.get('roles')}"
+        "."
+    )
     lines.append(f"Current context: doctype={current.get('doctype')}, docname={current.get('docname')}, route={current.get('route')}.")
     return " ".join(line.strip() for line in lines if str(line or "").strip())
 
@@ -898,17 +1452,23 @@ def _request_focus_summary(prompt: str, context: Optional[dict[str, Any]] = None
 
 def _llm_user_prompt(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
     cleaned = str(prompt or "").strip()
+    resource_manifest = _resource_runtime_manifest(cleaned, context)
+    manifest_block = f"{resource_manifest}\n\n" if resource_manifest else ""
     return (
         f"{_request_focus_summary(cleaned, context)}\n\n"
+        f"{manifest_block}"
         "User request:\n"
         f"{cleaned}\n\n"
+        "Format your response using clean Markdown: use fenced code blocks for code/JSON/SQL/scripts, "
+        "tables for lists of records or comparisons, bullet/numbered lists for steps and options, "
+        "and **bold** for document names and key values. "
         "Use the live FAC tool catalog when the request needs live ERP data or actions. "
         "For complex requests, first make a short hidden plan, then call tools, then answer. "
         "If the request is instructional only, answer directly unless live verification is necessary. "
         "Ask only for the minimum missing information if the request is blocked. "
-        "Summarize tool results clearly for the user. "
+        "Summarize tool results clearly using Markdown formatting. "
         "Do not reveal internal reasoning, raw tool output, JSON, XML, or hidden tags such as <think>. "
-        "For sample/testing data requests, generate fictional realistic sample output directly."
+        "Never generate fictional, placeholder, or invented ERP data — always use live FAC tools to fetch and create real values."
     ).strip()
 
 
@@ -960,11 +1520,6 @@ def _prioritize_tool_specs(tool_specs: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def _tool_access_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
-    if _is_sample_data_request(prompt, context or {}):
-        return (
-            "This request is for sample or testing data, not live ERP facts. "
-            "Answer directly without tools and do not search ERP records."
-        )
     if not _is_erp_intent(prompt, context or {}):
         return (
             "If the request is general and does not need ERP/Frappe data, answer directly without tools. "
@@ -975,6 +1530,166 @@ def _tool_access_summary(prompt: str, context: Optional[dict[str, Any]] = None) 
         "Use the live tool catalog rather than assuming any read, write, delete, or workflow capability exists. "
         "Let the model see and choose among the relevant live FAC tools instead of forcing a narrow static subset."
     )
+
+
+def _system_resource_rules() -> str:
+    return (
+        "Resource-use rules are mandatory. "
+        "Treat FAC resources like Claude Desktop workspace context: read them to ground the session before guessing. "
+        "Prefer current_page_context for route and user scope, current_document for the active ERP record, "
+        "doctype_schema for field structure and required values, and pending_assistant_action for resumable clarifications. "
+        "Use resource contents as read-only grounding, then call FAC tools for mutations, reports, searches, and workflow actions. "
+        "Do not ask the user to restate information that is already available in session resources. "
+        "current_page_context: use to identify which module/doctype/docname the user is currently viewing. "
+        "current_document: use to read field values of the active ERP record without calling get_document again. "
+        "doctype_schema: use to inspect required fields, field types, and link targets before create_document or update_document. "
+        "pending_assistant_action: use to resume a multi-step task the user previously started and did not finish. "
+        "available_doctypes: use to verify that a DocType exists in this system before referencing it in tool calls. "
+        "If a resource is listed as available but its content is empty or stale, fall back to the equivalent FAC tool call. "
+    )
+
+
+def _resource_catalog_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    specs = list_resource_specs()
+    if not specs:
+        return "No FAC resources are available in this session."
+
+    current = context or {}
+    available = {str(spec.get('name') or '').strip(): spec for spec in specs if str(spec.get('name') or '').strip()}
+    preferred: list[str] = []
+    for name in ("current_page_context", "current_document", "doctype_schema", "pending_assistant_action", "available_doctypes"):
+        if name not in available:
+            continue
+        if name == "current_document" and not _has_active_document_context(current):
+            continue
+        if name == "doctype_schema" and not (_resolved_prompt_doctype(prompt, current) or current.get("doctype")):
+            continue
+        if name == "pending_assistant_action" and not current.get("conversation"):
+            continue
+        preferred.append(name)
+
+    preview: list[str] = []
+    for spec in specs[:8]:
+        name = str(spec.get("name") or "").strip()
+        title = str(spec.get("title") or name).strip()
+        if name:
+            preview.append(f"{name} ({title})")
+
+    lines = [
+        f"Live FAC resources available in this session: {len(specs)}.",
+        f"Resource catalog preview: {'; '.join(preview)}.",
+    ]
+    if preferred:
+        lines.append(f"Best-fit resources for this request: {', '.join(preferred)}.")
+    return " ".join(lines)
+
+
+def _schema_field_hints(fields_payload: Any) -> str:
+    rows = fields_payload if isinstance(fields_payload, list) else []
+    if not rows:
+        return "No field metadata was returned"
+
+    required: list[str] = []
+    linked: list[str] = []
+    child_tables: list[str] = []
+    preview: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        fieldname = str(row.get("fieldname") or "").strip()
+        fieldtype = str(row.get("fieldtype") or "").strip()
+        options = str(row.get("options") or "").strip()
+        if not fieldname:
+            continue
+        if len(preview) < 8:
+            preview.append(f"{fieldname}:{fieldtype or 'Data'}")
+        if row.get("reqd") and len(required) < 8:
+            required.append(fieldname)
+        if fieldtype == "Link" and len(linked) < 8:
+            linked.append(f"{fieldname}->{options or '?'}")
+        if fieldtype == "Table" and len(child_tables) < 5:
+            child_tables.append(f"{fieldname}->{options or '?'}")
+
+    parts: list[str] = []
+    if required:
+        parts.append(f"required fields: {', '.join(required)}")
+    if linked:
+        parts.append(f"link fields: {', '.join(linked)}")
+    if child_tables:
+        parts.append(f"child tables: {', '.join(child_tables)}")
+    if preview:
+        parts.append(f"field preview: {', '.join(preview)}")
+    return "; ".join(parts) if parts else "Field metadata was present but could not be summarized"
+
+
+def _compact_resource_snapshot(name: str, payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return f"{name}: unavailable."
+
+    data = payload.get("data")
+    if name == "current_page_context" and isinstance(data, dict):
+        return (
+            "current_page_context: "
+            f"doctype={data.get('doctype')}, docname={data.get('docname')}, route={data.get('route')}, "
+            f"user={data.get('user')}, target_doctype={data.get('target_doctype')}."
+        )
+
+    if name == "current_document" and isinstance(data, dict):
+        document = data.get("document") if isinstance(data.get("document"), dict) else {}
+        highlights: list[str] = []
+        for key in ("name", "docstatus", "status", "workflow_state", "company", "customer", "supplier", "posting_date", "transaction_date"):
+            value = document.get(key)
+            if value not in (None, "", []):
+                highlights.append(f"{key}={value}")
+        summary = ", ".join(highlights[:8]) if highlights else "document loaded"
+        return f"current_document: {summary}."
+
+    if name == "doctype_schema" and isinstance(data, dict):
+        schema = data.get("schema") if isinstance(data.get("schema"), dict) else {}
+        fields = data.get("fields")
+        schema_doctype = str(schema.get("doctype") or schema.get("name") or "").strip()
+        prefix = f"doctype_schema: {schema_doctype}. " if schema_doctype else "doctype_schema: "
+        return prefix + _schema_field_hints(fields) + "."
+
+    if name == "pending_assistant_action" and isinstance(data, dict):
+        pending = data.get("pending_action")
+        if isinstance(pending, dict) and pending:
+            action = str(pending.get("action") or pending.get("type") or "pending").strip()
+            missing = pending.get("missing_fields") if isinstance(pending.get("missing_fields"), list) else []
+            suffix = f" missing_fields={missing[:6]}" if missing else ""
+            return f"pending_assistant_action: {action}.{suffix}"
+        return "pending_assistant_action: none."
+
+    return f"{name}: available."
+
+
+def _resource_runtime_manifest(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
+    current = dict(context or {})
+    user = str(current.get("user") or frappe.session.user or "").strip() or None
+    names: list[str] = ["current_page_context"]
+    target_doctype = _resolved_prompt_doctype(prompt, current) or str(current.get("doctype") or "").strip() or None
+    if _has_active_document_context(current):
+        names.append("current_document")
+    if target_doctype:
+        names.append("doctype_schema")
+    if current.get("conversation"):
+        names.append("pending_assistant_action")
+
+    snapshots: list[str] = []
+    for name in names:
+        arguments = {"doctype": target_doctype} if name == "doctype_schema" and target_doctype else {}
+        if name == "pending_assistant_action" and current.get("conversation"):
+            arguments["conversation"] = current.get("conversation")
+        try:
+            payload = read_fac_resource(name, context=current, arguments=arguments, user=user)
+        except Exception as exc:
+            snapshots.append(f"{name}: unavailable ({str(exc)[:120]}).")
+            continue
+        snapshots.append(_compact_resource_snapshot(name, payload))
+
+    if not snapshots:
+        return ""
+    return "Workspace manifest:\n" + "\n".join(f"- {line}" for line in snapshots)
 
 
 def _verification_prompt(tool_events: list[str]) -> str:
@@ -1139,6 +1854,71 @@ def _execute_prompt(
         frappe.set_user(effective_user)
 
     prompt_text = (prompt or "").strip()
+    _audit_timer = PromptTimer()
+    _audit_timer.__enter__()
+    _audit_error: str = ""
+
+    try:
+        result = _execute_prompt_inner(
+            prompt=prompt_text,
+            conversation=conversation,
+            doctype=doctype,
+            docname=docname,
+            route=route,
+            model=model,
+            images=images,
+            user=effective_user,
+        )
+        return result
+    except Exception as exc:
+        _audit_error = str(exc)[:1000]
+        raise
+    finally:
+        _audit_timer.__exit__(None, None, None)
+        try:
+            _audit_result = locals().get("result") or {}
+            _tools_used = [
+                ev.get("tool") for ev in (_audit_result.get("tool_events") or [])
+                if isinstance(ev, dict) and ev.get("tool")
+            ]
+            _affected = [
+                {"doctype": ev.get("doctype"), "name": ev.get("name")}
+                for ev in (_audit_result.get("tool_events") or [])
+                if isinstance(ev, dict) and ev.get("name")
+            ]
+            write_audit_log(
+                user=effective_user or frappe.session.user,
+                conversation=conversation,
+                prompt=prompt_text,
+                tools_used=_tools_used,
+                affected_records=_affected,
+                tokens_in=0,
+                tokens_out=0,
+                duration_ms=_audit_timer.elapsed_ms,
+                provider=get_active_provider(),
+                model=str(model or ""),
+                route=str(route or ""),
+                doctype_context=str(doctype or ""),
+                docname_context=str(docname or ""),
+                error_message=_audit_error,
+                confirmed_destructive=False,
+            )
+        except Exception:
+            pass
+
+
+def _execute_prompt_inner(
+    *,
+    prompt: str = "",
+    conversation: str | None = None,
+    doctype: str | None = None,
+    docname: str | None = None,
+    route: str | None = None,
+    model: str | None = None,
+    images: str | list[dict[str, Any]] | None = None,
+    user: str | None = None,
+) -> dict[str, Any]:
+    prompt_text = prompt
     had_image_payload = images not in (None, "", "[]", [])
     parsed_images = _parse_prompt_images(images)
     if had_image_payload and not parsed_images:
@@ -1160,11 +1940,18 @@ def _execute_prompt(
     _set_conversation_title_from_prompt(conversation_name, prompt_text or user_content)
     frappe.db.commit()
 
+    target_doctype = doctype or _resolved_prompt_doctype(prompt_text, {"doctype": doctype, "docname": docname, "route": route, "user": frappe.session.user})
     context = {
         "doctype": doctype,
         "docname": docname,
         "route": route,
+        "conversation": conversation_name,
         "user": frappe.session.user,
+        "target_doctype": target_doctype,
+        "route_module": _infer_route_module(route),
+        "target_module": _infer_doctype_module(target_doctype or doctype),
+        "user_roles": _safe_get_roles(frappe.session.user),
+        "permission_summary": _target_doctype_permission_summary(target_doctype, user=frappe.session.user),
     }
 
     selected_model = _resolve_model_for_request(model, has_images=bool(parsed_images))
@@ -1201,12 +1988,23 @@ def _execute_prompt(
         prompt=prompt_text,
     )
     attachments = _merge_attachment_packages(attachments, response.get("attachments"))
+    attachments["copilot"] = build_copilot_package(prompt=prompt_text, context=context, payload=response.get("payload"), reply_text=response.get("text"))
     reply_text = _finalize_reply_text(
         response["text"],
         prompt_text,
         attachments,
         payload=response.get("payload"),
+        all_payloads=response.get("all_payloads"),
     )
+    # Guard: if finalization produced an empty string (e.g. LLM returned only
+    # a filler opener that got stripped, or verify-pass returned nothing),
+    # synthesize a safe fallback so the frontend never shows a blank bubble.
+    if not reply_text or not reply_text.strip():
+        _intent = _resolved_erp_intent(prompt_text or "", context)
+        if _intent in {"update", "create", "workflow", "delete"}:
+            reply_text = "Done. The record has been updated successfully."
+        else:
+            reply_text = "The request was completed. No additional details were returned."
     message = add_message(
         conversation_name,
         "assistant",
@@ -1219,7 +2017,7 @@ def _execute_prompt(
         assistant_message = frappe.get_doc("AI Message", message["name"])
         assistant_message.db_set("attachments_json", json.dumps(attachments, default=str), update_modified=False)
     frappe.db.commit()
-    _progress_update(progress, stage="completed", done=True, step="Response ready", partial_text="")
+    _progress_update(progress, stage="completed", done=True, step="Response ready", partial_text=reply_text)
 
     result = {
         "conversation": conversation_name,
@@ -1228,11 +2026,18 @@ def _execute_prompt(
         "payload": response.get("payload"),
         "attachments": attachments,
         "context": context,
+        "debug": _build_debug_payload(),
     }
     _set_prompt_result(
         conversation_name,
         frappe.session.user,
-        {"status": "completed", "done": True, "conversation": conversation_name, "reply": reply_text},
+        {
+            "status": "completed",
+            "done": True,
+            "conversation": conversation_name,
+            "reply": reply_text,
+            "debug": result.get("debug"),
+        },
     )
     return result
 
@@ -1274,6 +2079,9 @@ def enqueue_prompt(
     if not prompt_text and not parsed_images:
         raise frappe.ValidationError(_("Prompt or image is required"))
 
+    # ── Rate limit check (per-user hourly quota) ──────────────────────────────
+    check_rate_limit(frappe.session.user)
+
     conversation_name = conversation or create_conversation(title=_summarize_title(prompt_text or _("Image prompt")))["name"]
     progress = {"conversation": conversation_name, "user": frappe.session.user, "model": _resolve_model_for_request(model, has_images=bool(parsed_images)), "steps": []}
     _progress_update(progress, stage="queued", step="Queued request")
@@ -1313,6 +2121,16 @@ def send_prompt(
     images: str | list[dict[str, Any]] | None = None,
 ):
     """Process a user prompt for the ERP-native assistant drawer."""
+    # ── Mandatory context injection warning ───────────────────────────────────
+    # If the frontend sends no route and no doctype, log a warning so developers
+    # know to pass page context. The request still proceeds but with degraded
+    # context awareness.
+    if not route and not doctype:
+        frappe.log_error(
+            "erp_ai_assistant: send_prompt called without route or doctype context. "
+            "Update the frontend to pass doctype, docname, and route on every request.",
+            "ERP AI Assistant: Missing Context"
+        )
     return _execute_prompt(
         prompt=prompt,
         conversation=conversation,
@@ -1327,10 +2145,18 @@ def send_prompt(
 def _build_message_attachments(payload: Any, title: str, conversation: str, prompt: str) -> dict[str, Any]:
     if payload in (None, "", [], {}):
         return {"attachments": [], "exports": {}}
+    formats = _requested_export_formats(prompt)
+    # Do not generate any file exports unless the user explicitly asked for one.
+    # An empty formats list means no export keywords were found — do not fall
+    # through to create_message_artifacts which defaults to generating all formats
+    # (causing unwanted xlsx/csv/pdf/docx files on simple show/find/list prompts).
+    if not formats:
+        return {"attachments": [], "exports": {}}
+    # Skip export generation for single-record lookups even if the prompt
+    # accidentally contains a trigger word (e.g. "show me employee named ... file").
+    if _is_single_record_payload(payload):
+        return {"attachments": [], "exports": {}}
     try:
-        formats = _requested_export_formats(prompt)
-        if not formats:
-            return {"attachments": [], "exports": {}}
         return create_message_artifacts(
             payload=payload,
             title=title,
@@ -1341,28 +2167,45 @@ def _build_message_attachments(payload: Any, title: str, conversation: str, prom
         return {"attachments": [], "exports": {}}
 
 
+def _is_single_record_payload(payload: Any) -> bool:
+    """Return True when the payload looks like a single ERP document rather than a list or report."""
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        result = payload.get("result")
+        # Plain document dict from get_document — no 'data' or 'result' list wrapper
+        if data is None and result is None:
+            return True
+        # Wrapped single document: {"data": {...}}
+        if isinstance(data, dict):
+            return True
+    return False
+
+
 def _merge_attachment_packages(*packages: Any) -> dict[str, Any]:
-    merged = {"attachments": [], "exports": {}}
+    merged = {"attachments": [], "exports": {}, "copilot": {}}
     for package in packages:
         if not isinstance(package, dict):
             continue
         attachments = package.get("attachments") or []
         exports = package.get("exports") or {}
+        copilot = package.get("copilot") or {}
         if isinstance(attachments, list):
             merged["attachments"].extend(item for item in attachments if isinstance(item, dict))
         if isinstance(exports, dict):
             merged["exports"].update(exports)
+        if isinstance(copilot, dict):
+            merged["copilot"].update(copilot)
     return merged
 
 
-def _finalize_reply_text(text: str, prompt: str, attachments: dict[str, Any], payload: Any = None) -> str:
+def _finalize_reply_text(text: str, prompt: str, attachments: dict[str, Any], payload: Any = None, all_payloads: list[Any] | None = None) -> str:
     attachment_rows = attachments.get("attachments") or []
     if attachment_rows and _requested_export_formats(prompt) and any(item.get("export_id") for item in attachment_rows):
         labels = ", ".join(str(item.get("label") or item.get("file_type") or "file").strip() for item in attachment_rows[:3])
         base_text = f"Prepared your export. Use the downloadable attachment below{f' ({labels})' if labels else ''}."
     else:
         base_text = _sanitize_assistant_reply(text)
-    return _append_related_links(base_text, prompt, payload)
+    return _append_related_links(base_text, prompt, payload, all_payloads=all_payloads)
 
 
 def _sanitize_assistant_reply(text: Any) -> str:
@@ -1375,8 +2218,12 @@ def _sanitize_assistant_reply(text: Any) -> str:
     cleaned = re.sub(r"<analysis>[\s\S]*?</analysis>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"<reasoning>[\s\S]*?</reasoning>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"<tool_call>[\s\S]*?</tool_call>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<TOOLCALL>[\s\S]*?</TOOLCALL>", "", cleaned)
     cleaned = re.sub(r"<next_steps>[\s\S]*?</next_steps>", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"^\s*(okay|alright|let me think|thinking)[\s\S]*?(?=\n\s*\n)", "", cleaned, flags=re.IGNORECASE)
+    # Only strip the filler opener word/phrase itself (up to the first comma, period, or newline),
+    # NOT the entire paragraph — the original greedy regex could wipe the whole response
+    # if the LLM gave a short single-paragraph answer like "Alright, I updated the record."
+    cleaned = re.sub(r"^\s*(okay[,!.]?|alright[,!.]?|sure[,!.]?|of course[,!.]?)\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.strip()
 
     if not cleaned:
@@ -1387,41 +2234,54 @@ def _sanitize_assistant_reply(text: Any) -> str:
 
 def _requested_export_formats(prompt: str) -> list[str]:
     text = (prompt or "").lower()
-    if not any(
-        term in text
-        for term in [
-            "export",
-            "download",
-            "file",
-            "excel",
-            "pdf",
-            "word",
-            "docx",
-            "xlsx",
-            "csv",
-            "spreadsheet",
-            "report file",
-            "save as",
-            "save it as",
-            "create excel",
-            "create xlsx",
-            "create spreadsheet",
-            "on excel",
-            "into excel",
-        ]
-    ):
+    export_terms = [
+        "export",
+        "download",
+        "file",
+        "excel",
+        "pdf",
+        "word",
+        "docx",
+        "xlsx",
+        "csv",
+        "spreadsheet",
+        "report file",
+        "save as",
+        "save it as",
+        "create excel",
+        "create xlsx",
+        "create spreadsheet",
+        "on excel",
+        "into excel",
+        "generate file",
+        "generate excel",
+        "generate pdf",
+        "generate report",
+        "attach file",
+        "send as file",
+        "tabular",
+        "printable",
+        "print report",
+    ]
+    if not any(term in text for term in export_terms):
         return []
 
     formats: list[str] = []
-    if any(term in text for term in ["excel", ".xlsx", "xlsx", "spreadsheet", "csv", "on excel", "into excel"]):
-        formats.append("xlsx")
-    if any(term in text for term in ["pdf", ".pdf"]):
-        formats.append("pdf")
-    if any(term in text for term in ["word", "docx", ".docx", "document file"]):
-        formats.append("docx")
+    format_hints = {
+        "xlsx": ["excel", ".xlsx", "xlsx", "spreadsheet", "on excel", "into excel"],
+        "csv": ["csv", ".csv"],
+        "pdf": ["pdf", ".pdf"],
+        "docx": ["word", "docx", ".docx", "document file"],
+    }
+    for export_format, hints in format_hints.items():
+        if any(term in text for term in hints) and export_format not in formats:
+            formats.append(export_format)
+
     if not formats and any(term in text for term in ["export", "download", "file"]):
         formats.append("xlsx")
     return formats
+
+
 
 
 def _desk_form_link(doctype: Any, name: Any) -> str:
@@ -1528,15 +2388,129 @@ def _extract_link_targets_from_payload(payload: Any, prompt: str) -> list[tuple[
     return targets[:8]
 
 
-def _append_related_links(text: str, prompt: str, payload: Any) -> str:
+def _extract_discovery_doctype_names(payload: Any) -> set[str]:
+    names: set[str] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key in ("data", "result", "contents", "message"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    visit(nested)
+            name = str(value.get("name") or value.get("doctype") or "").strip()
+            if name:
+                names.add(name)
+            return
+
+        if isinstance(value, list):
+            for row in value:
+                visit(row)
+
+    visit(payload)
+    return names
+
+
+def _get_discovery_doctypes() -> set[str]:
+    cached = getattr(frappe.local, "_erp_ai_discovery_doctypes", None)
+    if isinstance(cached, set) and cached:
+        return cached
+
+    user = str(getattr(frappe.session, "user", "") or "").strip() or None
+
+    try:
+        resource_payload = read_fac_resource(
+            "available_doctypes",
+            context={"user": user} if user else {},
+            arguments={"limit": 500},
+            user=user,
+        )
+        discovered = _extract_discovery_doctype_names(resource_payload)
+        if discovered:
+            frappe.local._erp_ai_discovery_doctypes = discovered
+            return discovered
+    except Exception:
+        pass
+
+    try:
+        tool_definitions = get_tool_definitions(user=user)
+        if "list_erp_doctypes" in tool_definitions:
+            tool_payload = dispatch_tool("list_erp_doctypes", {"limit": 500}, user=user)
+            discovered = _extract_discovery_doctype_names(tool_payload)
+            if discovered:
+                frappe.local._erp_ai_discovery_doctypes = discovered
+                return discovered
+    except Exception:
+        pass
+
+    fallback = {
+        "Company", "Warehouse", "Item", "PR Type", "PRSection",
+        "Customer", "Supplier", "Employee", "User", "Item Group",
+    }
+    frappe.local._erp_ai_discovery_doctypes = fallback
+    return fallback
+
+
+def _build_debug_payload() -> dict[str, Any]:
+    return {
+        "discovery_doctypes": sorted(_get_discovery_doctypes()),
+    }
+
+
+def _append_related_links(text: str, prompt: str, payload: Any, all_payloads: list[Any] | None = None) -> str:
     base = str(text or "").strip()
-    link_targets = _extract_link_targets_from_payload(payload, prompt)
-    if not link_targets:
+    combined_targets: list[tuple[str, str, str]] = []
+    seen_labels: set[str] = set()
+    _discovery_doctypes = _get_discovery_doctypes()
+
+    def _is_mutation_payload(p: Any) -> bool:
+        if not isinstance(p, dict):
+            return False
+        result = p.get("result") or p
+        if isinstance(result, dict):
+            doctype = str(result.get("doctype") or "").strip()
+            name = str(result.get("name") or "").strip()
+            if doctype and name and doctype not in _discovery_doctypes:
+                return True
+            doc = result.get("document") or {}
+            if isinstance(doc, dict):
+                dt = str(doc.get("doctype") or "").strip()
+                nm = str(doc.get("name") or "").strip()
+                if dt and nm and dt not in _discovery_doctypes:
+                    return True
+        return False
+
+    def _merge(targets: list[tuple[str, str, str]]) -> None:
+        for entry in targets:
+            if entry[0] not in seen_labels:
+                seen_labels.add(entry[0])
+                combined_targets.append(entry)
+
+    if all_payloads:
+        mutation_payloads = [p for p in all_payloads if _is_mutation_payload(p)]
+        if mutation_payloads:
+            for p in mutation_payloads:
+                _merge(_extract_link_targets_from_payload(p, prompt))
+        else:
+            _merge(_extract_link_targets_from_payload(payload, prompt))
+    else:
+        _merge(_extract_link_targets_from_payload(payload, prompt))
+
+    if not combined_targets:
+        return base
+
+    # Only show "Open links" for read/lookup responses (show, get, find).
+    # For update, create, delete, and workflow responses the LLM already
+    # mentions the document name in its reply — the extra link block is
+    # redundant noise and confuses users into thinking it is a separate result.
+    _prompt_lower = str(prompt or "").lower()
+    _write_verbs = ("update", "edit", "change", "modify", "set ", "create", "add ", "delete",
+                    "remove", "submit", "cancel", "approve", "reject", "amend")
+    if any(v in _prompt_lower for v in _write_verbs):
         return base
 
     lines = [base] if base else []
     lines.extend(["", "Open links:"])
-    for label, url, _kind in link_targets:
+    for label, url, _kind in combined_targets:
         lines.append(f"- [{label}]({url})")
     return "\n".join(lines).strip()
 
@@ -1550,26 +2524,17 @@ def _is_erp_intent(prompt: str, context: dict[str, Any]) -> bool:
     if not text:
         return False
     erp_markers = (
-        "customer",
-        "supplier",
-        "employee",
-        "item",
-        "invoice",
-        "order",
-        "quotation",
-        "lead",
-        "opportunity",
-        "report",
-        "dashboard",
-        "chart",
-        "doctype",
-        "workflow",
-        "erp",
-        "sales",
-        "purchase",
-        "stock",
-        "accounts",
-        "hr",
+        "customer", "supplier", "employee", "item", "invoice", "order",
+        "quotation", "lead", "opportunity", "report", "dashboard", "chart",
+        "doctype", "workflow", "erp", "sales", "purchase", "stock",
+        "accounts", "hr",
+        # additional markers for broader intent detection
+        "material request", "material transfer", "material issue",
+        "stock entry", "journal entry", "payment entry",
+        "delivery note", "purchase receipt", "purchase order", "sales order",
+        "warehouse", "company", "entries", "records", "documents",
+        "create", "update", "submit", "approve", "reject",
+        "export", "excel", "pdf", "word", "csv", "download",
     )
     return any(marker in text for marker in erp_markers)
 
@@ -1924,7 +2889,17 @@ def _default_export_fields_for_doctype(doctype: str, *, max_fields: int = 24) ->
     search_fields = str(getattr(meta, "search_fields", "") or "").strip()
     if search_fields:
         preferred.extend([item.strip() for item in search_fields.split(",") if item.strip()])
-    preferred.extend(["status", "docstatus", "company", "customer", "supplier", "posting_date", "transaction_date"])
+    try:
+        actual_fieldnames = {
+            str(getattr(f, "fieldname", "") or "").strip()
+            for f in (getattr(meta, "fields", []) or [])
+        }
+    except Exception:
+        actual_fieldnames = set()
+    common_fields = ["status", "docstatus", "company", "customer", "supplier", "posting_date", "transaction_date"]
+    for cf in common_fields:
+        if cf == "docstatus" or cf in actual_fieldnames:
+            preferred.append(cf)
 
     selected: list[str] = []
     seen: set[str] = set()
@@ -2159,6 +3134,7 @@ def _openai_chat(
     tool_events: list[str] = []
     rendered_payload = None
     rendered_feedback = None
+    all_payloads: list[Any] = []
     had_tool_calls = False
     verification_requested = False
     tools_enabled = bool(tool_specs)
@@ -2233,7 +3209,10 @@ def _openai_chat(
             return _stray_tool_call_response()
 
         if not function_calls:
-            if had_tool_calls and verify_pass_enabled and not verification_requested and previous_response_id:
+            # Skip verification during bulk-create: it fires too early and cuts off
+            # document creation before all N docs are created.
+            _skip_verify = _is_bulk_operation_request(prompt, context)
+            if had_tool_calls and verify_pass_enabled and not verification_requested and previous_response_id and not _skip_verify:
                 verification_requested = True
                 _progress_update(progress, stage="working", step="Verifying ERP evidence")
                 pending_input = _verification_prompt(tool_events)
@@ -2243,6 +3222,7 @@ def _openai_chat(
                 "text": _openai_output_text(body) or "No response text returned.",
                 "tool_events": tool_events,
                 "payload": rendered_payload,
+                "all_payloads": all_payloads,
             }
 
         current_signatures = [
@@ -2270,13 +3250,14 @@ def _openai_chat(
             tool_name = str(tool_call.get("name") or "").strip()
             tool_input = _parse_openai_tool_arguments(tool_call.get("arguments"))
             seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
-            _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
+            _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name, tool_input)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input, user=context.get("user"))
                 _validate_tool_result(tool_name, tool_result)
                 tool_feedback = _tool_result_feedback_payload(tool_name, tool_result)
                 last_tool_name = tool_name
                 rendered_payload = tool_result
+                all_payloads.append(tool_result)
                 tool_events.append(f"{tool_name} {tool_input}")
                 pending_results.append(
                     {
@@ -2294,7 +3275,11 @@ def _openai_chat(
                 }
                 tool_feedback = _tool_result_feedback_payload(tool_name, error_payload)
                 tool_events.append(f"{tool_name} {tool_input} (error)")
-                _progress_update(progress, stage="working", step=f"Tool failed: {_humanize_tool_name(tool_name)}")
+                _progress_update(
+                    progress,
+                    stage="working",
+                    step=f"Tool failed: {_humanize_tool_name(tool_name, tool_input)} — {str(exc) or 'Unknown tool error'}",
+                )
                 pending_results.append(
                     {
                         "type": "function_call_output",
@@ -2347,6 +3332,7 @@ def _openai_compatible_chat(
     tool_events: list[str] = []
     rendered_payload = None
     rendered_feedback = None
+    all_payloads: list[Any] = []
     had_tool_calls = False
     verification_requested = False
     disable_tool_choice = bool(compat_profile.get("disable_tool_choice_by_default"))
@@ -2451,7 +3437,8 @@ def _openai_compatible_chat(
             return _stray_tool_call_response()
 
         if not tool_calls:
-            if had_tool_calls and verify_pass_enabled and not verification_requested:
+            _skip_verify_b = _is_bulk_operation_request(prompt, context)
+            if had_tool_calls and verify_pass_enabled and not verification_requested and not _skip_verify_b:
                 verification_requested = True
                 _progress_update(progress, stage="working", step="Verifying ERP evidence")
                 messages.append({"role": "user", "content": _verification_prompt(tool_events)})
@@ -2461,6 +3448,7 @@ def _openai_compatible_chat(
                 "text": text_body or "No response text returned.",
                 "tool_events": tool_events,
                 "payload": rendered_payload,
+                "all_payloads": all_payloads,
             }
 
         current_signatures = []
@@ -2494,13 +3482,14 @@ def _openai_compatible_chat(
             tool_name = str(function_payload.get("name") or "").strip()
             tool_input = _parse_openai_tool_arguments(function_payload.get("arguments"))
             seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
-            _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
+            _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name, tool_input)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input, user=context.get("user"))
                 _validate_tool_result(tool_name, tool_result)
                 tool_feedback = _tool_result_feedback_payload(tool_name, tool_result)
                 last_tool_name = tool_name
                 rendered_payload = tool_result
+                all_payloads.append(tool_result)
                 rendered_feedback = tool_feedback
                 tool_events.append(f"{tool_name} {tool_input}")
                 messages.append(
@@ -2520,7 +3509,11 @@ def _openai_compatible_chat(
                 tool_feedback = _tool_result_feedback_payload(tool_name, error_payload)
                 rendered_feedback = tool_feedback
                 tool_events.append(f"{tool_name} {tool_input} (error)")
-                _progress_update(progress, stage="working", step=f"Tool failed: {_humanize_tool_name(tool_name)}")
+                _progress_update(
+                    progress,
+                    stage="working",
+                    step=f"Tool failed: {_humanize_tool_name(tool_name, tool_input)} — {str(exc) or 'Unknown tool error'}",
+                )
                 messages.append(
                     {
                         "role": "tool",
@@ -2596,6 +3589,7 @@ def _anthropic_chat(
     tool_events: list[str] = []
     rendered_payload = None
     rendered_feedback = None
+    all_payloads: list[Any] = []
     had_tool_calls = False
     verification_requested = False
     tools_enabled = bool(tool_specs)
@@ -2705,7 +3699,8 @@ def _anthropic_chat(
                     step="Provider returned tool_choice schema error in body; retrying with safer tool_choice",
                 )
                 continue
-            if had_tool_calls and verify_pass_enabled and not verification_requested:
+            _skip_verify_c = _is_bulk_operation_request(prompt, context)
+            if had_tool_calls and verify_pass_enabled and not verification_requested and not _skip_verify_c:
                 verification_requested = True
                 _progress_update(progress, stage="working", step="Verifying ERP evidence")
                 messages.append(
@@ -2720,6 +3715,7 @@ def _anthropic_chat(
                 "text": "\n\n".join(chunk for chunk in text_chunks if chunk).strip() or "No response text returned.",
                 "tool_events": tool_events,
                 "payload": rendered_payload,
+                "all_payloads": all_payloads,
             }
 
         current_signatures = [
@@ -2753,13 +3749,14 @@ def _anthropic_chat(
             tool_input = tool_use.get("input", {})
             seen_tool_signatures.add(_tool_call_signature(tool_name, tool_input))
             last_tool_name = tool_name
-            _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name)}")
+            _progress_update(progress, stage="working", step=f"Tool: {_humanize_tool_name(tool_name, tool_input)}")
             try:
                 tool_result = _run_tool(tool_name, tool_input, user=context.get("user"))
                 _validate_tool_result(tool_name, tool_result)
                 tool_feedback = _tool_result_feedback_payload(tool_name, tool_result)
                 tool_events.append(f"{tool_name} {tool_input}")
                 rendered_payload = tool_result
+                all_payloads.append(tool_result)
                 rendered_feedback = tool_feedback
                 tool_results.append(
                     {
@@ -2778,7 +3775,11 @@ def _anthropic_chat(
                 tool_feedback = _tool_result_feedback_payload(tool_name, error_payload)
                 rendered_feedback = tool_feedback
                 tool_events.append(f"{tool_name} {tool_input} (error)")
-                _progress_update(progress, stage="working", step=f"Tool failed: {_humanize_tool_name(tool_name)}")
+                _progress_update(
+                    progress,
+                    stage="working",
+                    step=f"Tool failed: {_humanize_tool_name(tool_name, tool_input)} — {str(exc) or 'Unknown tool error'}",
+                )
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -3048,6 +4049,38 @@ def _extract_textual_tool_call(raw_text: Any) -> dict[str, Any] | None:
                     "arguments": json.dumps(arguments, default=str),
                 },
             }
+
+    # Handle <TOOLCALL>[{"name":...,"arguments":{...}}]</TOOLCALL> format
+    toolcall_array_match = re.search(
+        r"<TOOLCALL>\s*(?P<body>\[[\s\S]*?\])\s*</TOOLCALL>",
+        unescaped_text,
+    )
+    if toolcall_array_match:
+        body = str(toolcall_array_match.group("body") or "").strip()
+        try:
+            arr = json.loads(body)
+        except Exception:
+            arr = None
+        if isinstance(arr, list) and arr:
+            payload = arr[0] if isinstance(arr[0], dict) else {}
+            raw_name = str(payload.get("name") or payload.get("tool_name") or "").strip()
+            tool_name_tc = raw_name.split(".")[-1] if raw_name else ""
+            normalized_tc = TOOL_NAME_MAP.get(raw_name, TOOL_NAME_MAP.get(tool_name_tc, tool_name_tc))
+            args_tc = payload.get("arguments") or payload.get("args") or {}
+            if not isinstance(args_tc, dict):
+                try:
+                    args_tc = json.loads(str(args_tc))
+                except Exception:
+                    args_tc = {}
+            if normalized_tc:
+                return {
+                    "id": f"textual-{normalized_tc}",
+                    "type": "function",
+                    "function": {
+                        "name": normalized_tc,
+                        "arguments": json.dumps(args_tc, default=str),
+                    },
+                }
 
     json_tool_match = re.search(r"<tool_call>\s*(?P<body>\{[\s\S]*?\})\s*</tool_call>", unescaped_text, re.IGNORECASE)
     if json_tool_match:
@@ -3349,9 +4382,40 @@ def _response_rejects_images(text: Any) -> bool:
     return any(term in body for term in blocked_terms)
 
 
-def _humanize_tool_name(name: str) -> str:
-    value = str(name or "").strip().replace("_", " ")
-    return value.capitalize() if value else "Tool"
+def _humanize_tool_name(name: str, tool_input: Optional[dict[str, Any]] = None) -> str:
+    label_map = {
+        "get_doctype_info": "Reading DocType structure",
+        "list_documents": "Fetching records",
+        "get_document": "Reading document",
+        "create_document": "Creating document",
+        "update_document": "Updating document",
+        "submit_document": "Submitting document",
+        "run_workflow": "Running workflow action",
+        "run_workflow_action": "Running workflow action",
+        "run_python_code": "Running bulk operation",
+        "generate_report": "Generating report",
+        "report_requirements": "Reading report structure",
+        "search_link": "Searching linked records",
+        "search_documents": "Searching documents",
+        "search_doctype": "Searching DocType",
+        "extract_file_content": "Reading file",
+        "create_dashboard": "Creating dashboard",
+        "create_dashboard_chart": "Creating chart",
+    }
+    base = str(name or "").strip()
+    label = label_map.get(base, base.replace("_", " ").capitalize())
+    payload = tool_input if isinstance(tool_input, dict) else {}
+    target = (
+        payload.get("doctype")
+        or payload.get("report_name")
+        or payload.get("name")
+        or payload.get("operation")
+        or ""
+    )
+    target_text = str(target or "").strip()
+    if target_text:
+        label = f"{label} — {target_text}"
+    return label or "Tool"
 
 
 @frappe.whitelist()
@@ -3607,7 +4671,18 @@ def _run_tool(tool_name: str, arguments: dict[str, Any], user: str | None = None
 
 
 def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
-    return f"{str(tool_name or '').strip()}::{json.dumps(arguments or {}, sort_keys=True, default=str)}"
+    _mutation_tools = {
+        "create_document", "create_erp_document",
+        "update_document", "update_erp_document",
+        "submit_document", "submit_erp_document",
+        "run_workflow", "run_workflow_action",
+        "run_python_code",
+    }
+    normalized = str(tool_name or "").strip()
+    if normalized in _mutation_tools:
+        import time as _time
+        return f"{normalized}::mutation::{_time.time_ns()}"
+    return f"{normalized}::{json.dumps(arguments or {}, sort_keys=True, default=str)}"
 
 
 def _enrich_tool_result_with_request_context(tool_name: str, arguments: dict[str, Any], payload: Any) -> Any:
@@ -3809,10 +4884,9 @@ def _normalize_document_list_result(tool_name: str, payload: Any) -> dict[str, A
     rows = normalized.get("data")
     row_count = len(rows) if isinstance(rows, list) else 1 if rows else 0
     if row_count > 1:
-        normalized["status"] = "partial"
-        normalized["summary"] = "Multiple matching records were returned."
-        normalized["confidence"] = "medium"
-        normalized["next_action"] = "ask_for_disambiguation"
+        normalized["status"] = "success"
+        normalized["summary"] = f"Fetched {row_count} records for discovery."
+        normalized["confidence"] = "high"
     elif row_count == 1:
         normalized["summary"] = "Found one matching record."
         normalized["confidence"] = "high"
@@ -4033,9 +5107,7 @@ def _verify_document_list_result(tool_name: str, payload: Any, normalized: dict[
     result.setdefault("checks", {})
     result["checks"]["row_count"] = row_count
     result["checks"]["multiple_matches"] = row_count > 1
-    result["checks"]["requires_disambiguation"] = row_count > 1
-    if row_count > 1:
-        result["warnings"].append("Multiple matching records were returned.")
+    result["checks"]["requires_disambiguation"] = False
     return result
 
 
@@ -4252,8 +5324,16 @@ def _format_list_result(payload: Any, heading: Optional[str]) -> str:
     lines = [title, ""]
     for index, row in enumerate(rows[:20], start=1):
         if isinstance(row, dict):
-            primary = row.get("customer_name") or row.get("employee_name") or row.get("item_name") or row.get("name") or f"Row {index}"
-            extras = [f"{key}: {value}" for key, value in row.items() if key not in {"name", "customer_name", "employee_name", "item_name"} and value not in (None, "", [])][:3]
+            primary = (
+                row.get("customer_name") or row.get("supplier_name") or row.get("employee_name")
+                or row.get("item_name") or row.get("project_name") or row.get("lead_name")
+                or row.get("opportunity_from") or row.get("subject") or row.get("asset_name")
+                or row.get("report_name") or row.get("title") or row.get("name") or f"Row {index}"
+            )
+            _primary_keys = {"name", "customer_name", "supplier_name", "employee_name", "item_name",
+                              "project_name", "lead_name", "opportunity_from", "subject", "asset_name",
+                              "report_name", "title"}
+            extras = [f"{key}: {value}" for key, value in row.items() if key not in _primary_keys and value not in (None, "", [])][:3]
             suffix = f" ({', '.join(extras)})" if extras else ""
             lines.append(f"{index}. {primary}{suffix}")
         else:
@@ -4266,7 +5346,11 @@ def _format_document_result(payload: Any, heading: Optional[str]) -> str:
         return str(payload)
     name = str(payload.get("name") or "").strip()
     status = payload.get("status")
-    primary_label = payload.get("title") or payload.get("customer_name") or payload.get("employee_name") or payload.get("item_name")
+    primary_label = (
+        payload.get("title") or payload.get("customer_name") or payload.get("supplier_name")
+        or payload.get("employee_name") or payload.get("item_name") or payload.get("project_name")
+        or payload.get("lead_name") or payload.get("asset_name") or payload.get("subject")
+    )
     title = heading or name or primary_label or "Document"
     lines = [title]
     if primary_label and str(primary_label).strip() and str(primary_label).strip() != title:
@@ -4276,7 +5360,14 @@ def _format_document_result(payload: Any, heading: Optional[str]) -> str:
     if name and name != title:
         lines.append(f"Document: {name}")
     details = []
-    for key in ["doctype", "posting_date", "transaction_date", "company", "warehouse", "territory", "modified", "modified_by"]:
+    for key in [
+        "doctype", "customer", "supplier", "employee_name", "party", "party_name",
+        "posting_date", "transaction_date", "due_date", "delivery_date", "from_date", "to_date",
+        "grand_total", "net_total", "outstanding_amount", "paid_amount", "net_pay", "total_debit",
+        "currency", "company", "warehouse", "territory", "department", "designation",
+        "status", "docstatus", "workflow_state",
+        "modified", "modified_by",
+    ]:
         value = payload.get(key)
         if value not in (None, "", [], {}):
             details.append(f"{key.replace('_', ' ').title()}: {value}")
@@ -4451,17 +5542,96 @@ def _parse_field_assignments(text: str) -> dict[str, Any]:
 
 def _normalize_field_key(raw_key: str) -> str:
     aliases = {
-        "territory": "territory",
-        "designation": "designation",
+        # ── Contact / Identity ───────────────────────────────────────────────
         "email": "email_id",
+        "e-mail": "email_id",
         "mobile": "mobile_no",
         "phone": "mobile_no",
+        "cell": "mobile_no",
+        "fax": "fax",
+        "website": "website",
+        # ── Employee / HR ────────────────────────────────────────────────────
+        "territory": "territory",
+        "designation": "designation",
         "department": "department",
-        "description": "description",
+        "company": "company",
+        "branch": "branch",
+        "gender": "gender",
+        "dob": "date_of_birth",
+        "date of birth": "date_of_birth",
+        "joining": "date_of_joining",
+        "date of joining": "date_of_joining",
+        "relieving": "relieving_date",
+        "relieving date": "relieving_date",
+        "salary mode": "salary_mode",
+        "bank account": "bank_ac_no",
         "salary": "salary",
         "basic salary": "basic_salary",
         "company email": "company_email",
+        # ── Common doc fields ────────────────────────────────────────────────
+        "description": "description",
         "status": "status",
+        "notes": "notes",
+        "remarks": "remarks",
+        "priority": "priority",
+        "title": "title",
+        "subject": "subject",
+        # ── Customer / Supplier ──────────────────────────────────────────────
+        "customer group": "customer_group",
+        "supplier group": "supplier_group",
+        "currency": "default_currency",
+        "price list": "default_price_list",
+        "payment terms": "payment_terms",
+        "credit limit": "credit_limit",
+        "customer type": "customer_type",
+        "supplier type": "supplier_type",
+        # ── Dates ────────────────────────────────────────────────────────────
+        "delivery date": "delivery_date",
+        "transaction date": "transaction_date",
+        "due date": "due_date",
+        "posting date": "posting_date",
+        "schedule date": "schedule_date",
+        "start date": "start_date",
+        "end date": "end_date",
+        "from date": "from_date",
+        "to date": "to_date",
+        # ── Sales / Purchase ─────────────────────────────────────────────────
+        "po no": "po_no",
+        "po number": "po_no",
+        "so no": "sales_order",
+        "rate": "rate",
+        "qty": "qty",
+        "quantity": "qty",
+        "amount": "amount",
+        "discount": "discount_percentage",
+        "tax": "taxes_and_charges",
+        # ── Item ─────────────────────────────────────────────────────────────
+        "item group": "item_group",
+        "stock uom": "stock_uom",
+        "valuation rate": "valuation_rate",
+        "standard rate": "standard_rate",
+        "is stock item": "is_stock_item",
+        "item name": "item_name",
+        "item code": "item_code",
+        # ── Project / Task ───────────────────────────────────────────────────
+        "project": "project",
+        "expected end": "exp_end_date",
+        "expected start": "exp_start_date",
+        "expected end date": "exp_end_date",
+        "expected start date": "exp_start_date",
+        "actual time": "actual_time",
+        "assigned to": "assigned_to",
+        # ── Asset ────────────────────────────────────────────────────────────
+        "asset category": "asset_category",
+        "purchase date": "purchase_date",
+        "gross value": "gross_purchase_amount",
+        "location": "location",
+        # ── Accounts ─────────────────────────────────────────────────────────
+        "cost centre": "cost_center",
+        "cost center": "cost_center",
+        "account": "account",
+        "debit": "debit_in_account_currency",
+        "credit": "credit_in_account_currency",
     }
     normalized = str(raw_key or "").strip().lower()
     return aliases.get(normalized, normalized.replace(" ", "_"))
@@ -4481,8 +5651,13 @@ def _coerce_value(value: str) -> Any:
     if re.fullmatch(r"-?\d+\.\d+", cleaned):
         return float(cleaned)
     lowered = cleaned.lower()
-    if lowered in {"true", "yes"}:
+    if lowered in {"true", "yes", "1", "on", "active", "enabled"}:
         return 1
-    if lowered in {"false", "no"}:
+    if lowered in {"false", "no", "0", "off", "inactive", "disabled"}:
         return 0
+    if lowered == "today":
+        import datetime
+        return datetime.date.today().strftime("%Y-%m-%d")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+        return cleaned  # already a valid date string
     return cleaned

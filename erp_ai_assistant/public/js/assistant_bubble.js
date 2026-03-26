@@ -1,5 +1,5 @@
 (function () {
-  window.__ERP_AI_ASSISTANT_BUILD__ = "2026-03-18-global-desk-context-v1";
+  window.__ERP_AI_ASSISTANT_BUILD__ = "2026-03-24-desk-chrome-upgrade-v2";
 
   function shouldShowToolActivity() {
     try {
@@ -7,6 +7,13 @@
     } catch (error) {
       return false;
     }
+  }
+
+  function logAssistantDebug(payload) {
+    const debug = payload && typeof payload === "object" ? payload.debug : null;
+    const doctypes = Array.isArray(debug?.discovery_doctypes) ? debug.discovery_doctypes : [];
+    if (!doctypes.length || !window.console) return;
+    console.info("[ERP AI Assistant] _get_discovery_doctypes()", doctypes);
   }
 
   /**
@@ -549,34 +556,46 @@
         bubble.className = `erp-ai-assistant-message ${message.role === "user" ? "is-user" : "is-assistant"}`;
 
         const roleLabel = message.role === "user" ? "You" : "Assistant";
-        const emoji = message.role === "user" ? "👤" : "🤖";
-        const timestamp = frappe.datetime.str_to_user ? frappe.datetime.str_to_user(message.creation) : message.creation;
+        const timestamp = frappe.datetime.str_to_user ? frappe.datetime.str_to_user(message.creation) : (message.creation || "");
+        const content = message.content || "";
+        const toolEvents = message.role !== "user" ? this._parseToolEvents(message.tool_events) : [];
+        const attachmentPackage = this._parseAttachmentPackage(message.attachments_json);
+        const messageChrome = this._buildMessageChrome(message, { toolEvents, attachmentPackage, content });
 
         bubble.innerHTML = `
-          <div class="erp-ai-assistant-message__meta">${emoji} ${roleLabel} <span class="erp-ai-assistant-message__time">• ${timestamp}</span></div>
+          <div class="erp-ai-assistant-message__head">
+            <div class="erp-ai-assistant-message__meta">
+              <span class="erp-ai-assistant-message__role">${roleLabel}</span>
+              ${timestamp ? `<span class="erp-ai-assistant-message__time">${timestamp}</span>` : ""}
+            </div>
+            ${messageChrome.badges.length ? `<div class="erp-ai-assistant-message__badges">${messageChrome.badges.map((badge) => `<span class="erp-ai-assistant-message__badge ${badge.tone ? `is-${badge.tone}` : ""}">${this._escapeHtml(badge.label)}</span>`).join("")}</div>` : ""}
+          </div>
+          ${messageChrome.summary ? `<div class="erp-ai-assistant-message__summary">${this._escapeHtml(messageChrome.summary)}</div>` : ""}
           <div class="erp-ai-assistant-message__body"></div>
         `;
 
         const bodyElement = bubble.querySelector(".erp-ai-assistant-message__body");
-        const content = message.content || "";
+
+        if (toolEvents.length) {
+          const activity = this._renderToolEventRow(toolEvents);
+          if (activity) {
+            bubble.insertBefore(activity, bodyElement);
+          }
+        }
 
         bodyElement.innerHTML = this._formatMessageContent(content);
 
-        const toolEvents = this._parseToolEvents(message.tool_events);
-        if (shouldShowToolActivity() && toolEvents.length) {
-          bubble.appendChild(this._renderToolEventRow(toolEvents));
+        if (attachmentPackage.copilot) {
+          const copilotBlock = this._renderCopilotBlock(attachmentPackage.copilot);
+          if (copilotBlock) bubble.appendChild(copilotBlock);
         }
-
-        const attachmentPackage = this._parseAttachmentPackage(message.attachments_json);
         if (attachmentPackage.attachments.length) {
           bubble.appendChild(this._renderAttachmentRow(attachmentPackage.attachments));
         }
-
-        // Add copy button for assistant messages
         if (message.role !== "user" && content) {
           const copyBtn = document.createElement("button");
           copyBtn.className = "erp-ai-assistant-message__copy";
-          copyBtn.innerHTML = "📋";
+          copyBtn.innerHTML = "⧉";
           copyBtn.title = "Copy message";
           copyBtn.type = "button";
           copyBtn.addEventListener("click", async (event) => {
@@ -586,16 +605,18 @@
             if (copied) {
               copyBtn.innerHTML = "✓";
               copyBtn.title = "Copied!";
+              copyBtn.classList.add("is-copied");
               setTimeout(() => {
-                copyBtn.innerHTML = "📋";
+                copyBtn.innerHTML = "⧉";
                 copyBtn.title = "Copy message";
+                copyBtn.classList.remove("is-copied");
               }, 1200);
               return;
             }
             copyBtn.innerHTML = "!";
             copyBtn.title = "Copy failed";
             setTimeout(() => {
-              copyBtn.innerHTML = "📋";
+              copyBtn.innerHTML = "⧉";
               copyBtn.title = "Copy message";
             }, 1200);
           });
@@ -606,67 +627,257 @@
       });
 
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
+      this._wireCopyButtons(this.elements.messages);
     }
 
     _formatMessageContent(content) {
       return this._renderRichText(content || "");
     }
 
-    _renderRichText(content) {
-      if (!content) return "";
+    _buildMessageChrome(message, context) {
+      const role = String(message?.role || "assistant");
+      if (role === "user") return { badges: [], summary: "" };
+      const toolEvents = Array.isArray(context?.toolEvents) ? context.toolEvents : [];
+      const attachmentPackage = context?.attachmentPackage || { attachments: [], exports: {}, copilot: null };
+      const content = String(context?.content || "");
+      const hasCopilot = !!attachmentPackage?.copilot;
+      const hasAttachments = Array.isArray(attachmentPackage?.attachments) && attachmentPackage.attachments.length > 0;
+      const hasDataset = attachmentPackage?.exports && Object.keys(attachmentPackage.exports).length > 0;
+      const hasTable = /\|.+\|/.test(content) || /```(?:json|sql|python|javascript|html|css)/i.test(content);
+      const textEvents = toolEvents.filter((item) => typeof item === "string" && String(item || "").trim());
+      const structuredEvents = toolEvents.filter((item) => item && typeof item === "object" && !Array.isArray(item));
+      const badges = [];
+      if (textEvents.length || structuredEvents.length) badges.push({ label: "ERP verified", tone: "verified" });
+      if (hasCopilot || hasAttachments || hasDataset || hasTable) badges.push({ label: "Visualized", tone: "visual" });
+      const riskyAction = textEvents.some((item) => /submit_document|run_workflow|delete_document/i.test(String(item || "")));
+      if (!riskyAction) badges.push({ label: "Draft-safe", tone: "safe" });
 
-      const tokens = [];
-      const withCodeTokens = String(content).replace(/```([\s\S]*?)```/g, (_, block) => {
-        const token = `__ERP_AI_BLOCK_${tokens.length}__`;
-        tokens.push(`<pre class="erp-ai-assistant-message__code-block"><code>${this._escapeHtml(block || "")}</code></pre>`);
-        return token;
-      });
-
-      const rendered = withCodeTokens
-        .split(/\n{2,}/)
-        .map((chunk) => this._renderBlock(chunk))
-        .filter(Boolean)
-        .join("");
-
-      return this._restoreTokens(rendered, tokens);
+      let summary = "";
+      if (hasCopilot && attachmentPackage.copilot.summary) {
+        summary = String(attachmentPackage.copilot.summary.badge || attachmentPackage.copilot.summary.title || "").trim();
+      }
+      if (!summary && textEvents.length) {
+        const parsed = textEvents.map((item) => this._parseToolEventString(item)).filter(Boolean);
+        summary = parsed.slice(0, 2).map((item) => item.label).join(" • ");
+      }
+      if (!summary && hasAttachments) summary = `${attachmentPackage.attachments.length} attachment${attachmentPackage.attachments.length === 1 ? "" : "s"} ready`;
+      if (!summary && hasDataset) summary = "Structured ERP output ready";
+      return { badges, summary };
     }
 
-    _renderBlock(chunk) {
+    // ─── Claude Desktop-level rich text rendering ─────────────────────────────
+    // Token sentinel uses characters that survive _escapeHtml unchanged.
+    // \x02 (STX) and \x03 (ETX) are never in user text and never touched by escaping.
+
+    _tok(store, html) {
+      const id = store.length;
+      store.push(html);
+      return `\x02${id}\x03`;
+    }
+
+    _restoreAll(text, store) {
+      // Keep replacing until no more sentinels remain (handles nested tokens)
+      let out = text;
+      let prev = null;
+      while (out !== prev) {
+        prev = out;
+        out = out.replace(/\x02(\d+)\x03/g, (_, i) => store[+i] || "");
+      }
+      return out;
+    }
+
+    _renderRichText(content) {
+      if (!content) return "";
+      const store = [];
+
+      // 1. Fenced code blocks  ```lang\ncode\n```
+      let s = String(content).replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+        this._tok(store, this._renderCodeBlock(code || "", (lang || "").trim()))
+      );
+
+      // 2. Inline code `...`
+      s = s.replace(/`([^`\n]+)`/g, (_, code) =>
+        this._tok(store, `<code class="erp-ai-code-inline">${this._escapeHtml(code)}</code>`)
+      );
+
+      // 3. Paragraphs
+      const html = s.split(/\n{2,}/).map((chunk) => this._renderBlock(chunk, store)).filter(Boolean).join("");
+
+      return this._restoreAll(html, store);
+    }
+
+    _renderCodeBlock(code, lang) {
+      const highlighted = this._syntaxHighlight(code.replace(/\n$/, ""), lang);
+      const langLabel = lang ? `<span class="erp-ai-code-lang">${this._escapeHtml(lang)}</span>` : "";
+      const copyId = `copy-${Math.random().toString(36).slice(2, 9)}`;
+      return `
+        <div class="erp-ai-code-block">
+          <div class="erp-ai-code-block__header">
+            ${langLabel}
+            <button class="erp-ai-code-block__copy" data-copy-target="${copyId}" type="button" title="Copy code">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+              Copy
+            </button>
+          </div>
+          <pre class="erp-ai-code-block__pre"><code id="${copyId}" class="erp-ai-code-block__code language-${this._escapeHtml(lang || "text")}">${highlighted}</code></pre>
+        </div>`;
+    }
+
+    _syntaxHighlight(code, lang) {
+      const escaped = this._escapeHtml(code);
+      const l = (lang || "").toLowerCase();
+
+      if (l === "python" || l === "py") return this._hlPython(escaped);
+      if (l === "javascript" || l === "js" || l === "ts" || l === "typescript") return this._hlJS(escaped);
+      if (l === "json") return this._hlJSON(escaped);
+      if (l === "sql") return this._hlSQL(escaped);
+      if (l === "bash" || l === "sh" || l === "shell") return this._hlBash(escaped);
+      if (l === "html" || l === "xml") return this._hlHTML(escaped);
+      if (l === "css" || l === "scss") return this._hlCSS(escaped);
+      return escaped;
+    }
+
+    _hlPython(code) {
+      const kw = /\b(def|class|import|from|return|if|elif|else|for|while|try|except|finally|with|as|pass|break|continue|and|or|not|in|is|lambda|yield|raise|del|global|nonlocal|True|False|None|async|await)\b/g;
+      const builtins = /\b(print|len|range|str|int|float|list|dict|set|tuple|bool|type|isinstance|hasattr|getattr|setattr|enumerate|zip|map|filter|sorted|reversed|sum|min|max|abs|round|open|super|property|staticmethod|classmethod)\b/g;
+      const strings = /(&#39;&#39;&#39;[\s\S]*?&#39;&#39;&#39;|&quot;&quot;&quot;[\s\S]*?&quot;&quot;&quot;|&#39;[^&#39;\n]*&#39;|&quot;[^&quot;\n]*&quot;)/g;
+      const comments = /(#[^\n]*)/g;
+      const nums = /\b(\d+\.?\d*)\b/g;
+      const decorators = /(@\w+)/g;
+      return code
+        .replace(strings, '<span class="hl-string">$1</span>')
+        .replace(comments, '<span class="hl-comment">$1</span>')
+        .replace(kw, '<span class="hl-keyword">$1</span>')
+        .replace(builtins, '<span class="hl-builtin">$1</span>')
+        .replace(nums, '<span class="hl-number">$1</span>')
+        .replace(decorators, '<span class="hl-decorator">$1</span>');
+    }
+
+    _hlJS(code) {
+      const kw = /\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|typeof|instanceof|class|extends|super|import|export|default|from|async|await|try|catch|finally|throw|of|in|null|undefined|true|false|void|delete)\b/g;
+      const strings = /(&quot;[^&quot;\n]*&quot;|&#39;[^&#39;\n]*&#39;|`[^`]*`)/g;
+      const comments = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)/g;
+      const nums = /\b(\d+\.?\d*)\b/g;
+      const methods = /\.([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
+      return code
+        .replace(strings, '<span class="hl-string">$1</span>')
+        .replace(comments, '<span class="hl-comment">$1</span>')
+        .replace(kw, '<span class="hl-keyword">$1</span>')
+        .replace(nums, '<span class="hl-number">$1</span>')
+        .replace(methods, '.<span class="hl-method">$1</span>(');
+    }
+
+    _hlJSON(code) {
+      const keys = /(&quot;[^&quot;]*&quot;)\s*:/g;
+      const strings = /:\s*(&quot;[^&quot;]*&quot;)/g;
+      const nums = /:\s*(-?\d+\.?\d*)/g;
+      const bools = /:\s*(true|false|null)/g;
+      return code
+        .replace(keys, '<span class="hl-key">$1</span>:')
+        .replace(strings, ': <span class="hl-string">$1</span>')
+        .replace(nums, ': <span class="hl-number">$1</span>')
+        .replace(bools, ': <span class="hl-keyword">$1</span>');
+    }
+
+    _hlSQL(code) {
+      const kw = /\b(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|GROUP BY|ORDER BY|HAVING|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|DROP|ALTER|INDEX|DISTINCT|AS|AND|OR|NOT|IN|LIKE|IS|NULL|LIMIT|OFFSET|COUNT|SUM|AVG|MIN|MAX|UNION|ALL)\b/gi;
+      const strings = /(&quot;[^&quot;]*&quot;|&#39;[^&#39;]*&#39;)/g;
+      const nums = /\b(\d+)\b/g;
+      return code
+        .replace(strings, '<span class="hl-string">$1</span>')
+        .replace(kw, '<span class="hl-keyword">$1</span>')
+        .replace(nums, '<span class="hl-number">$1</span>');
+    }
+
+    _hlBash(code) {
+      const commands = /\b(echo|ls|cd|grep|awk|sed|cat|rm|cp|mv|mkdir|chmod|curl|wget|pip|python|python3|node|npm|yarn|git|docker|bench|frappe)\b/g;
+      const flags = /\s(-{1,2}[a-zA-Z0-9-]+)/g;
+      const strings = /(&quot;[^&quot;]*&quot;|&#39;[^&#39;]*&#39;)/g;
+      const comments = /(#[^\n]*)/g;
+      const vars = /(\$\{?[A-Z_][A-Z0-9_]*\}?)/g;
+      return code
+        .replace(strings, '<span class="hl-string">$1</span>')
+        .replace(comments, '<span class="hl-comment">$1</span>')
+        .replace(commands, '<span class="hl-keyword">$1</span>')
+        .replace(flags, ' <span class="hl-flag">$1</span>')
+        .replace(vars, '<span class="hl-variable">$1</span>');
+    }
+
+    _hlHTML(code) {
+      const tags = /(&lt;\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s[^&gt;]*)?\/?&gt;)/g;
+      const attrs = /(\s[a-zA-Z:_][a-zA-Z0-9:_-]*)=/g;
+      const strings = /=(&quot;[^&quot;]*&quot;)/g;
+      const comments = /(&lt;!--[\s\S]*?--&gt;)/g;
+      return code
+        .replace(comments, '<span class="hl-comment">$1</span>')
+        .replace(tags, '<span class="hl-tag">$1</span>')
+        .replace(attrs, '<span class="hl-attr">$1</span>=')
+        .replace(strings, '=<span class="hl-string">$1</span>');
+    }
+
+    _hlCSS(code) {
+      const selectors = /([.#]?[a-zA-Z][a-zA-Z0-9_-]*)\s*\{/g;
+      const props = /([a-zA-Z-]+)\s*:/g;
+      const values = /:\s*([^;{}\n]+)/g;
+      const comments = /(\/\*[\s\S]*?\*\/)/g;
+      return code
+        .replace(comments, '<span class="hl-comment">$1</span>')
+        .replace(selectors, '<span class="hl-selector">$1</span> {')
+        .replace(props, '<span class="hl-prop">$1</span>:')
+        .replace(values, ': <span class="hl-value">$1</span>');
+    }
+
+    _renderBlock(chunk, store) {
       const trimmed = String(chunk || "").trim();
       if (!trimmed) return "";
 
-      if (/^#{1,3}\s/.test(trimmed)) {
-        const level = Math.min(6, Math.max(3, (trimmed.match(/^#+/) || ["###"])[0].length + 2));
-        return `<h${level} class="erp-ai-assistant-message__heading">${this._renderInline(trimmed.replace(/^#{1,3}\s*/, ""))}</h${level}>`;
+      // Already a sentinel token — pass through
+      if (/^\x02\d+\x03$/.test(trimmed)) return trimmed;
+
+      // Headings
+      if (/^#{1,6}\s/.test(trimmed)) {
+        const level = Math.min(6, Math.max(2, (trimmed.match(/^#+/) || ["##"])[0].length));
+        const text = trimmed.replace(/^#{1,6}\s*/, "");
+        return `<h${level} class="erp-ai-heading erp-ai-heading--${level}">${this._renderInline(text, store)}</h${level}>`;
       }
 
-      const lines = trimmed.split("\n").map((line) => line.trimEnd());
-      if (this._looksLikeMarkdownTable(lines)) {
-        return this._renderTable(lines);
+      const lines = trimmed.split("\n").map((l) => l.trimEnd());
+
+      // Table
+      if (this._looksLikeMarkdownTable(lines)) return this._renderTable(lines, store);
+
+      // Horizontal rule
+      if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) return `<hr class="erp-ai-hr">`;
+
+      const isBullet = (l) => /^\s*([-*+])\s+/.test(l);
+      const isNum    = (l) => /^\s*\d+[.)]\s+/.test(l);
+
+      if (lines.every((l) => isBullet(l) || /^\s{2,}/.test(l))) return this._renderList(lines, "ul", store);
+      if (lines.every((l) => isNum(l)    || /^\s{2,}/.test(l))) return this._renderList(lines, "ol", store);
+
+      // Blockquote
+      if (lines.every((l) => /^\s*>/.test(l))) {
+        const body = lines.map((l) => l.replace(/^\s*>\s?/, "")).join("\n");
+        return `<blockquote class="erp-ai-quote">${this._renderInline(body, store)}</blockquote>`;
       }
 
-      if (lines.every((line) => /^\s*([-*])\s+/.test(line))) {
-        const items = lines
-          .map((line) => line.replace(/^\s*[-*]\s+/, ""))
-          .map((line) => `<li>${this._renderInline(line)}</li>`)
-          .join("");
-        return `<ul class="erp-ai-assistant-message__list">${items}</ul>`;
-      }
+      return `<p class="erp-ai-paragraph">${this._renderInline(lines.join("\n"), store)}</p>`;
+    }
 
-      if (lines.every((line) => /^\s*\d+\.\s+/.test(line))) {
-        const items = lines
-          .map((line) => line.replace(/^\s*\d+\.\s+/, ""))
-          .map((line) => `<li>${this._renderInline(line)}</li>`)
-          .join("");
-        return `<ol class="erp-ai-assistant-message__list">${items}</ol>`;
+    _renderList(lines, tag, store) {
+      const items = [];
+      let current = null;
+      for (const line of lines) {
+        if (/^\s*([-*+]|\d+[.)])\s+/.test(line)) {
+          if (current !== null) items.push(current);
+          current = line.replace(/^\s*([-*+]|\d+[.)]) /, "");
+        } else if (current !== null) {
+          current += " " + line.trim();
+        }
       }
-
-      if (trimmed.startsWith(">")) {
-        const body = lines.map((line) => line.replace(/^\s*>\s?/, "")).join("\n");
-        return `<blockquote class="erp-ai-assistant-message__quote">${this._renderInline(body)}</blockquote>`;
-      }
-
-      return `<p class="erp-ai-assistant-message__paragraph">${this._renderInline(lines.join("\n"))}</p>`;
+      if (current !== null) items.push(current);
+      const lis = items.map((item) => `<li class="erp-ai-list__item">${this._renderInline(item, store)}</li>`).join("");
+      return `<${tag} class="erp-ai-list erp-ai-list--${tag}">${lis}</${tag}>`;
     }
 
     _looksLikeMarkdownTable(lines) {
@@ -676,87 +887,85 @@
       return hasPipes && separator.test(lines[1]);
     }
 
-    _renderTable(lines) {
+    _renderTable(lines, store) {
       const rows = lines
-        .map((line) => line.trim())
+        .map((l) => l.trim())
         .filter(Boolean)
-        .map((line) => line.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim()));
-
-      if (rows.length < 2) {
-        return `<p class="erp-ai-assistant-message__paragraph">${this._renderInline(lines.join("\n"))}</p>`;
-      }
+        .map((l) => l.replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim()));
+      if (rows.length < 2) return `<p class="erp-ai-paragraph">${this._renderInline(lines.join("\n"), store)}</p>`;
 
       const headers = rows[0];
       const bodyRows = rows.slice(2);
-      const thead = `<thead><tr>${headers.map((cell) => `<th>${this._renderInline(cell)}</th>`).join("")}</tr></thead>`;
-      const tbody = `<tbody>${bodyRows.map((row) => `<tr>${headers.map((_, index) => `<td>${this._renderInline(row[index] || "")}</td>`).join("")}</tr>`).join("")}</tbody>`;
-      return `<div class="erp-ai-assistant-message__table-wrap"><table class="erp-ai-assistant-message__table">${thead}${tbody}</table></div>`;
+      const aligns = (rows[1] || []).map((c) => {
+        if (/^:.*:$/.test(c)) return "center";
+        if (/^:/.test(c)) return "left";
+        if (/:$/.test(c)) return "right";
+        return "";
+      });
+      const th = headers.map((cell, i) => `<th class="erp-ai-table__th"${aligns[i] ? ` style="text-align:${aligns[i]}"` : ""}>${this._renderInline(cell, store)}</th>`).join("");
+      const trs = bodyRows.map((row) => {
+        const tds = headers.map((_, i) => `<td class="erp-ai-table__td"${aligns[i] ? ` style="text-align:${aligns[i]}"` : ""}>${this._renderInline(row[i] || "", store)}</td>`).join("");
+        return `<tr class="erp-ai-table__tr">${tds}</tr>`;
+      }).join("");
+      return `<div class="erp-ai-table-wrap"><table class="erp-ai-table"><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table></div>`;
     }
 
-    _renderInline(text) {
-      const tokens = [];
+    _renderInline(text, store) {
+      // store is the shared sentinel array from _renderRichText
+      // We use the same store so sentinels survive _escapeHtml (they use \x02/\x03, not HTML chars)
       let value = String(text || "");
 
-      value = value.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/)[^\s)]+|data:image\/[^\s)]+)\)/g, (_, alt, url) => {
-        const token = `__ERP_AI_INLINE_${tokens.length}__`;
-        tokens.push(this._renderInlineImage(url, alt));
-        return token;
-      });
+      // Inline images ![alt](url)
+      value = value.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/)[^\s)]+|data:image\/[^\s)]+)\)/g,
+        (_, alt, url) => this._tok(store, this._renderInlineImage(url, alt)));
 
-      value = value.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, (_, label, url) => {
-        const token = `__ERP_AI_INLINE_${tokens.length}__`;
-        tokens.push(this._renderAnchor(url, label));
-        return token;
-      });
+      // Links [label](url)
+      value = value.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g,
+        (_, label, url) => this._tok(store, this._renderAnchor(url, label)));
 
-      value = value.replace(/`([^`]+)`/g, (_, code) => {
-        const token = `__ERP_AI_INLINE_${tokens.length}__`;
-        tokens.push(`<code class="erp-ai-assistant-message__inline-code">${this._escapeHtml(code)}</code>`);
-        return token;
-      });
+      // Bold **text** or __text__
+      value = value.replace(/\*\*(.+?)\*\*|__(.+?)__/g,
+        (_, a, b) => this._tok(store, `<strong class="erp-ai-bold">${this._escapeHtml(a || b)}</strong>`));
 
+      // Italic *text* or _text_ (avoid matching bold markers)
+      value = value.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g,
+        (_, a) => this._tok(store, `<em class="erp-ai-italic">${this._escapeHtml(a)}</em>`));
+
+      // Strikethrough ~~text~~
+      value = value.replace(/~~(.+?)~~/g,
+        (_, inner) => this._tok(store, `<s>${this._escapeHtml(inner)}</s>`));
+
+      // Escape remaining HTML (sentinels \x02N\x03 pass through untouched)
       value = this._escapeHtml(value);
       value = value.replace(/\n/g, "<br>");
-      value = value.replace(
-        /(https?:\/\/[^\s<]+)/g,
-        (url) => {
-          const cleanUrl = this._decodeHtml(url);
-          if (this._isImageUrl(cleanUrl)) {
-            const token = `__ERP_AI_INLINE_${tokens.length}__`;
-            tokens.push(this._renderInlineImage(cleanUrl, this._filenameFromUrl(cleanUrl)));
-            return token;
-          }
-          const token = `__ERP_AI_INLINE_${tokens.length}__`;
-          tokens.push(this._renderAnchor(cleanUrl, cleanUrl));
-          return token;
-        }
-      );
 
-      return this._restoreTokens(value, tokens);
+      // Auto-link bare URLs (after escaping so we match &amp; etc.)
+      value = value.replace(/(https?:\/\/[^\s<"]+)/g, (url) => {
+        const clean = this._decodeHtml(url);
+        if (this._isImageUrl(clean)) return this._tok(store, this._renderInlineImage(clean, this._filenameFromUrl(clean)));
+        return this._tok(store, this._renderAnchor(clean, clean));
+      });
+
+      return value; // sentinels resolved by _restoreAll at the top level
     }
 
     _renderAnchor(url, label) {
       const safeUrl = this._escapeHtml(url);
       const safeLabel = this._escapeHtml(label || url);
-      return `<a class="erp-ai-assistant-message__link" href="${safeUrl}" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`;
+      const isInternal = String(url || "").startsWith("/");
+      return `<a class="erp-ai-link" href="${safeUrl}"${isInternal ? "" : ' target="_blank" rel="noopener noreferrer"'}>${safeLabel}</a>`;
     }
 
     _renderInlineImage(url, alt) {
       const safeUrl = this._escapeHtml(url);
       const safeAlt = this._escapeHtml(alt || "Image");
-      return `
-        <figure class="erp-ai-assistant-message__media">
-          <a href="${safeUrl}" target="_blank" rel="noopener noreferrer">
-            <img class="erp-ai-assistant-message__image" src="${safeUrl}" alt="${safeAlt}" loading="lazy" />
-          </a>
-          <figcaption class="erp-ai-assistant-message__caption">${safeAlt}</figcaption>
-        </figure>
-      `;
+      return `<figure class="erp-ai-figure"><a href="${safeUrl}" target="_blank" rel="noopener noreferrer"><img class="erp-ai-figure__img" src="${safeUrl}" alt="${safeAlt}" loading="lazy"></a>${alt ? `<figcaption class="erp-ai-figure__caption">${safeAlt}</figcaption>` : ""}</figure>`;
     }
 
+    // Legacy _restoreTokens kept for any callers that still use it
     _restoreTokens(text, tokens) {
       return tokens.reduce(
-        (output, tokenHtml, index) => output.replaceAll(`__ERP_AI_INLINE_${index}__`, tokenHtml).replaceAll(`__ERP_AI_BLOCK_${index}__`, tokenHtml),
+        (out, html, i) => out.replaceAll(`__ERPAI_INL_${i}__`, html).replaceAll(`__ERPAI_BLOCK_${i}__`, html),
         text
       );
     }
@@ -766,46 +975,67 @@
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     _decodeHtml(value) {
-      const textarea = document.createElement("textarea");
-      textarea.innerHTML = String(value || "");
-      return textarea.value;
+      const ta = document.createElement("textarea");
+      ta.innerHTML = String(value || "");
+      return ta.value;
     }
 
     _isImageUrl(url) {
-      const value = String(url || "").toLowerCase();
-      return value.startsWith("data:image/") || /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/.test(value);
+      const v = String(url || "").toLowerCase();
+      return v.startsWith("data:image/") || /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/.test(v);
     }
 
     _filenameFromUrl(url) {
       try {
-        const parsed = new URL(url, window.location.origin);
-        const name = parsed.pathname.split("/").filter(Boolean).pop();
-        return name || "Image";
-      } catch (error) {
+        const p = new URL(url, window.location.origin);
+        return p.pathname.split("/").filter(Boolean).pop() || "Image";
+      } catch {
         return "Image";
       }
     }
 
+    // ─── Copy button wiring (called after messages render) ─────────────────────
+    _wireCopyButtons(container) {
+      container.querySelectorAll(".erp-ai-code-block__copy").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const targetId = btn.dataset.copyTarget;
+          const codeEl = targetId ? document.getElementById(targetId) : null;
+          const text = codeEl ? (codeEl.innerText || codeEl.textContent || "") : "";
+          const ok = await this._copyText(text);
+          if (ok) {
+            btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"></polyline></svg> Copied!`;
+            btn.classList.add("is-copied");
+            setTimeout(() => {
+              btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg> Copy`;
+              btn.classList.remove("is-copied");
+            }, 1800);
+          }
+        });
+      });
+    }
+
     _parseAttachmentPackage(raw) {
-      if (!raw) return { attachments: [], exports: {} };
+      if (!raw) return { attachments: [], exports: {}, copilot: null };
       try {
         const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
         if (Array.isArray(parsed)) {
-          return { attachments: parsed.filter((item) => item && item.file_url), exports: {} };
+          return { attachments: parsed.filter((item) => item && item.file_url), exports: {}, copilot: null };
         }
-        if (parsed && Array.isArray(parsed.attachments)) {
+        if (parsed && typeof parsed === "object") {
           return {
-            attachments: parsed.attachments.filter((item) => item && item.file_url),
+            attachments: Array.isArray(parsed.attachments) ? parsed.attachments.filter((item) => item && item.file_url) : [],
             exports: parsed.exports && typeof parsed.exports === "object" ? parsed.exports : {},
+            copilot: parsed.copilot && typeof parsed.copilot === "object" ? parsed.copilot : null,
           };
         }
-        return { attachments: [], exports: {} };
+        return { attachments: [], exports: {}, copilot: null };
       } catch (error) {
-        return { attachments: [], exports: {} };
+        return { attachments: [], exports: {}, copilot: null };
       }
     }
 
@@ -819,26 +1049,79 @@
       }
     }
 
+    _parseToolEventString(value) {
+      const text = String(value || "").trim();
+      if (!text) return null;
+      const match = text.match(/^([a-zA-Z0-9_]+)\s*(.*)$/);
+      if (!match) {
+        return { label: text, countable: false };
+      }
+
+      const toolName = match[1];
+      const argsText = String(match[2] || "").trim();
+      const labelMap = {
+        list_documents: "Fetching records",
+        get_doctype_info: "Reading DocType structure",
+        create_document: "Creating document",
+        update_document: "Updating document",
+        run_python_code: "Running bulk operation",
+        generate_report: "Generating report",
+        submit_document: "Submitting document",
+        run_workflow: "Running workflow action",
+        search_link: "Searching linked records",
+      };
+
+      let suffix = "";
+      const doctypeMatch = argsText.match(/['"]doctype['"]\s*:\s*['"]([^'"]+)['"]/i);
+      const reportMatch = argsText.match(/['"]report_name['"]\s*:\s*['"]([^'"]+)['"]/i);
+      if (doctypeMatch?.[1]) {
+        suffix = doctypeMatch[1];
+      } else if (reportMatch?.[1]) {
+        suffix = reportMatch[1];
+      }
+
+      const baseLabel = labelMap[toolName] || toolName.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+      return {
+        label: suffix ? `${baseLabel} \u2014 ${suffix}` : baseLabel,
+        countable: Object.prototype.hasOwnProperty.call(labelMap, toolName),
+      };
+    }
+
     _renderToolEventRow(events) {
-      const textEvents = events.filter((item) => typeof item === "string" && String(item || "").trim());
+      const textEvents = events
+        .filter((item) => typeof item === "string" && String(item || "").trim())
+        .map((item) => this._parseToolEventString(item))
+        .filter(Boolean);
       const structuredEvents = events.filter((item) => item && typeof item === "object" && !Array.isArray(item));
+      if (!textEvents.length && !structuredEvents.length) {
+        return null;
+      }
       const wrap = document.createElement("details");
-      wrap.className = "erp-ai-assistant-message__tools";
+      wrap.className = "erp-ai-assistant-message__activity";
       wrap.open = false;
-      const items = textEvents.slice(-8).map((item) => `<li>${this._escapeHtml(item)}</li>`).join("");
+      const commandCount = textEvents.filter((item) => item.countable).length || textEvents.length;
       wrap.innerHTML = `
-        <summary class="erp-ai-assistant-message__tools-summary">Tool activity</summary>
+        <summary class="erp-ai-assistant-message__activity-head">
+          <span class="erp-ai-assistant-message__activity-status">\u2713</span>
+          <span class="erp-ai-assistant-message__activity-summary">Ran ${commandCount} command${commandCount === 1 ? "" : "s"}</span>
+        </summary>
+        <div class="erp-ai-assistant-message__activity-steps">
+          ${textEvents.map((item) => `
+            <div class="erp-ai-assistant-message__activity-step">
+              <span class="erp-ai-assistant-message__activity-step-icon">\u2713</span>
+              <span class="erp-ai-assistant-message__activity-step-label">${this._escapeHtml(item.label)}</span>
+            </div>
+          `).join("")}
+        </div>
         <div class="erp-ai-assistant-message__tool-blocks"></div>
-        <ul class="erp-ai-assistant-message__tools-list">${items}</ul>
       `;
       const blocks = wrap.querySelector(".erp-ai-assistant-message__tool-blocks");
       structuredEvents.forEach((item) => {
         const card = this._renderStructuredToolEvent(item);
         if (card) blocks.appendChild(card);
       });
-      const list = wrap.querySelector(".erp-ai-assistant-message__tools-list");
-      if (!items) {
-        list.remove();
+      if (!blocks.childElementCount) {
+        blocks.remove();
       }
       return wrap;
     }
@@ -900,6 +1183,92 @@
         return wrap;
       }
       return null;
+    }
+
+    _renderCopilotBlock(copilot) {
+      if (!copilot || typeof copilot !== "object") return null;
+      const summary = copilot.summary && typeof copilot.summary === "object" ? copilot.summary : null;
+      const actions = Array.isArray(copilot.actions) ? copilot.actions.filter((item) => item && item.label && item.prompt) : [];
+      const issues = Array.isArray(copilot.issues) ? copilot.issues.filter(Boolean) : [];
+      const insights = Array.isArray(copilot.insights) ? copilot.insights.filter(Boolean) : [];
+      const suggestions = Array.isArray(copilot.suggestions) ? copilot.suggestions.filter(Boolean) : [];
+      if (!summary && !actions.length && !issues.length && !insights.length && !suggestions.length) return null;
+
+      const section = document.createElement("section");
+      section.className = "erp-ai-assistant-copilot";
+
+      if (summary) {
+        const summaryRows = Array.isArray(summary.rows) ? summary.rows.filter((r) => r && r.label) : [];
+        const card = document.createElement("div");
+        card.className = "erp-ai-assistant-copilot__card";
+        card.innerHTML = `
+          <div class="erp-ai-assistant-copilot__head">
+            <strong>${this._escapeHtml(summary.title || "ERP Copilot")}</strong>
+            ${summary.badge ? `<span class="erp-ai-assistant-copilot__badge">${this._escapeHtml(summary.badge)}</span>` : ""}
+          </div>
+          <div class="erp-ai-assistant-copilot__grid">
+            ${summaryRows.map((row) => `<div class="erp-ai-assistant-copilot__kv"><span>${this._escapeHtml(row.label)}</span><strong>${this._escapeHtml(row.value || "—")}</strong></div>`).join("")}
+          </div>`;
+        section.appendChild(card);
+      }
+
+      if (issues.length) {
+        const card = document.createElement("div");
+        card.className = "erp-ai-assistant-copilot__card";
+        card.innerHTML = `<div class="erp-ai-assistant-copilot__title">Key issues</div><ul class="erp-ai-assistant-copilot__list">${issues.map((item) => `<li>${this._escapeHtml(item)}</li>`).join("")}</ul>`;
+        section.appendChild(card);
+      }
+
+      if (actions.length) {
+        const card = document.createElement("div");
+        card.className = "erp-ai-assistant-copilot__card";
+        card.innerHTML = `<div class="erp-ai-assistant-copilot__title">Recommended actions</div><div class="erp-ai-assistant-copilot__actions"></div>`;
+        const actionsWrap = card.querySelector(".erp-ai-assistant-copilot__actions");
+        actions.forEach((item) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = `erp-ai-assistant-btn${item.style === "primary" ? " erp-ai-assistant-btn--primary" : ""}`;
+          btn.textContent = item.label;
+          btn.addEventListener("click", () => {
+            if (this.elements.textarea) {
+              this.elements.textarea.value = item.prompt;
+              this.sendPrompt();
+            }
+          });
+          actionsWrap.appendChild(btn);
+        });
+        section.appendChild(card);
+      }
+
+      if (insights.length) {
+        const card = document.createElement("div");
+        card.className = "erp-ai-assistant-copilot__card";
+        card.innerHTML = `<div class="erp-ai-assistant-copilot__title">Insights</div><div class="erp-ai-assistant-copilot__notes">${insights.map((item) => `<p>${this._escapeHtml(item)}</p>`).join("")}</div>`;
+        section.appendChild(card);
+      }
+
+      if (suggestions.length) {
+        const card = document.createElement("div");
+        card.className = "erp-ai-assistant-copilot__card";
+        card.innerHTML = `<div class="erp-ai-assistant-copilot__title">Try next</div><div class="erp-ai-assistant-copilot__suggestions"></div>`;
+        const suggestionsWrap = card.querySelector(".erp-ai-assistant-copilot__suggestions");
+        suggestions.forEach((item) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "erp-ai-assistant-btn";
+          btn.textContent = item;
+          btn.addEventListener("click", () => {
+            if (this.elements.textarea) {
+              this.elements.textarea.value = item;
+              this.sendPrompt();
+            }
+          });
+          suggestionsWrap.appendChild(btn);
+        });
+        section.appendChild(card);
+      }
+
+      return section;
     }
 
     _renderAttachmentRow(attachments) {
@@ -993,7 +1362,13 @@
         this._renderPendingConversation(conversationName);
         this.awaitingQueueAck[conversationName] = true;
 
+        // ── Mandatory context injection ──────────────────────────────────────
+        // Always resolve and send page context. If the route is empty (e.g.
+        // the user opened the assistant before navigating anywhere), we still
+        // send the current hash/route so the backend can log the context gap.
         const context = this.getCurrentContext();
+        const routeStr = context.route || window.location.hash.replace(/^#\/?/, "") || "unknown";
+
         const imagePayload = images.map((item) => ({
           name: item.name,
           type: item.type,
@@ -1013,18 +1388,26 @@
           args: {
             conversation: conversationName,
             prompt,
-            doctype: context.doctype,
-            docname: context.docname,
-            route: context.route,
+            doctype: context.doctype || "",
+            docname: context.docname || "",
+            route: routeStr,
             model: this.elements.modelSelect?.value || undefined,
             images: imagePayload.length ? JSON.stringify(imagePayload) : undefined,
           },
           callback: (response) => {
             const payload = response?.message || {};
+            logAssistantDebug(payload);
             if (payload.queued) {
               this.awaitingQueueAck[conversationName] = false;
               this._startProgressPolling(conversationName);
               return;
+            }
+            if (String(payload.reply || "").trim()) {
+              this._queueOptimisticAssistantMessage(conversationName, payload.reply, {
+                toolEvents: payload.tool_events,
+                attachments: payload.attachments,
+              });
+              this._renderPendingConversation(conversationName);
             }
             this._finishPromptRun(conversationName);
           },
@@ -1042,7 +1425,6 @@
         this.pendingPromptRequest = request;
       });
     }
-
     stopPrompt() {
       if (!this.isGenerating) {
         return;
@@ -1078,7 +1460,10 @@
       const body = text ? `${text}${imageNote}` : imageNote.trim();
 
       userBubble.innerHTML = `
-        <div class="erp-ai-assistant-message__meta">👤 You <span class="erp-ai-assistant-message__time">• ${timeStr}</span></div>
+        <div class="erp-ai-assistant-message__meta">
+          <span class="erp-ai-assistant-message__role">You</span>
+          <span class="erp-ai-assistant-message__time">${timeStr}</span>
+        </div>
         <div class="erp-ai-assistant-message__body">${this._formatMessageContent(body)}</div>
       `;
       if (imageCount) {
@@ -1161,9 +1546,10 @@
       return serverMessages.concat(pendingMessages, optimisticAssistantMessages);
     }
 
-    _queueOptimisticAssistantMessage(conversationName, replyText) {
+    _queueOptimisticAssistantMessage(conversationName, replyText, options) {
       const content = String(replyText || "").trim();
       if (!conversationName || !content) return;
+      const settings = options || {};
       const existing = Array.isArray(this.optimisticAssistantMessages[conversationName])
         ? this.optimisticAssistantMessages[conversationName].slice()
         : [];
@@ -1175,8 +1561,8 @@
         role: "assistant",
         content,
         creation: new Date().toISOString(),
-        tool_events: "[]",
-        attachments_json: null,
+        tool_events: JSON.stringify(Array.isArray(settings.toolEvents) ? settings.toolEvents : []),
+        attachments_json: settings.attachments ? JSON.stringify(settings.attachments) : null,
       });
       this.optimisticAssistantMessages[conversationName] = existing;
     }
@@ -1190,39 +1576,93 @@
       indicator.className = "erp-ai-assistant-message is-assistant erp-ai-assistant-message--typing";
       indicator.id = "erp-ai-assistant-typing";
       indicator.innerHTML = `
-        <div class="erp-ai-assistant-message__meta">🤖 Assistant <span class="erp-ai-assistant-message__time">• working</span></div>
+        <div class="erp-ai-assistant-message__meta">
+          <span class="erp-ai-assistant-message__role">Assistant</span>
+          <span class="erp-ai-assistant-message__time erp-ai-thinking-label">Thinking…</span>
+        </div>
         <div class="erp-ai-assistant-progress">
-          <div class="erp-ai-assistant-progress__head">
-            <span class="erp-ai-assistant-progress__spinner" aria-hidden="true"></span>
-            <span>Responding</span>
-          </div>
-          <div class="erp-ai-assistant-progress__steps"></div>
           <div class="erp-ai-assistant-progress__partial" style="display:none;"></div>
+          <details class="erp-ai-assistant-progress__log">
+            <summary class="erp-ai-assistant-progress__head">
+              <span class="erp-ai-assistant-progress__spinner" aria-hidden="true"></span>
+              <span class="erp-ai-assistant-progress__summary">Running...</span>
+            </summary>
+            <div class="erp-ai-assistant-progress__steps"></div>
+          </details>
         </div>
       `;
 
       this.elements.messages.appendChild(indicator);
-      this._updateTypingSteps(Array.isArray(steps) ? steps : ["Preparing response"], "");
+      this._updateTypingSteps(Array.isArray(steps) ? steps : ["Preparing response"], "", { done: false });
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
     }
 
-    _updateTypingSteps(steps, partialText) {
+    _mapProgressStepLabel(step) {
+      const text = String(step || "").trim();
+      const lowered = text.toLowerCase();
+      if (!text) return "Working...";
+      if (lowered === "preparing request" || lowered === "preparing response") return "Starting...";
+      if (lowered === "thinking") return "Thinking...";
+      if (lowered === "verifying erp evidence") return "Verifying results...";
+      if (lowered === "response ready") return "Done";
+      if (lowered.startsWith("tool: get doctype info")) return "Read document structure";
+      if (lowered.startsWith("tool: list documents")) return "Fetched records from ERP";
+      if (lowered.startsWith("tool: create document")) return "Created document in ERP";
+      if (lowered.startsWith("tool: run python code")) return "Ran bulk operation";
+      if (lowered.startsWith("tool: generate report")) return "Generated report";
+      if (lowered.startsWith("tool: update document")) return "Updated document";
+      if (lowered.startsWith("tool failed:")) return `Failed: ${text.replace(/^tool failed:\s*/i, "")}`;
+      if (lowered.startsWith("tool:")) return text.replace(/^tool:\s*/i, "");
+      return text;
+    }
+
+    _summarizeProgressSteps(steps, done) {
+      const items = Array.isArray(steps) ? steps.filter(Boolean) : [];
+      const commandCount = items.filter((item) => /^tool:/i.test(String(item || "").trim())).length;
+      if (commandCount) {
+        return `${done ? "Ran" : "Running"} ${commandCount} command${commandCount === 1 ? "" : "s"}${done ? "" : "..."}`;
+      }
+      const stepCount = items.length || 1;
+      return `${done ? "Completed" : "Running"} ${stepCount} step${stepCount === 1 ? "" : "s"}${done ? "" : "..."}`;
+    }
+
+    _updateTypingSteps(steps, partialText, options) {
+      const settings = options || {};
+      const done = !!settings.done;
       const indicator = document.getElementById("erp-ai-assistant-typing");
       if (!indicator) return;
       const wrap = indicator.querySelector(".erp-ai-assistant-progress__steps");
       const partial = indicator.querySelector(".erp-ai-assistant-progress__partial");
+      const summary = indicator.querySelector(".erp-ai-assistant-progress__summary");
+      const spinner = indicator.querySelector(".erp-ai-assistant-progress__spinner");
       if (!wrap) return;
 
       const normalized = Array.isArray(steps)
         ? steps.map((item) => String(item || "").trim()).filter(Boolean)
         : [];
       const finalSteps = normalized.length ? normalized : ["Preparing response"];
+      indicator.classList.toggle("is-done", done);
+      if (summary) {
+        summary.textContent = this._summarizeProgressSteps(finalSteps, done);
+      }
+      if (spinner) {
+        spinner.style.display = done ? "none" : "inline-block";
+      }
 
       wrap.innerHTML = "";
-      finalSteps.slice(-4).forEach((step) => {
+      finalSteps.slice(-6).forEach((step, index, items) => {
         const row = document.createElement("div");
         row.className = "erp-ai-assistant-progress__step";
-        row.textContent = step;
+        const icon = document.createElement("span");
+        icon.className = "erp-ai-assistant-progress__step-icon";
+        icon.textContent = done || index < items.length - 1 ? "\u2713" : "\u27f3";
+        icon.textContent = done || index < items.length - 1 ? "✓" : "⟳";
+        icon.textContent = done || index < items.length - 1 ? "\u2713" : "\u27f3";
+        const label = document.createElement("span");
+        label.className = "erp-ai-assistant-progress__step-label";
+        label.textContent = this._mapProgressStepLabel(step);
+        row.appendChild(icon);
+        row.appendChild(label);
         wrap.appendChild(row);
       });
       if (partial) {
@@ -1251,7 +1691,7 @@
             if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) {
               return;
             }
-            this._updateTypingSteps(steps, progress.partial_text || "");
+            this._updateTypingSteps(steps, progress.partial_text || "", { done: !!progress.done });
             if (progress.done) {
               this._stopProgressPolling();
               if (progress.error) {
@@ -1264,6 +1704,7 @@
                 args: { conversation: conversationName },
                 callback: (resultResponse) => {
                   const result = resultResponse?.message || {};
+                  logAssistantDebug(result);
                   if (result.done && String(result.reply || "").trim()) {
                     this._queueOptimisticAssistantMessage(conversationName, result.reply);
                     this._renderPendingConversation(conversationName);
@@ -1285,7 +1726,7 @@
       pollProgress();
       this.progressPollTimer = window.setInterval(() => {
         pollProgress();
-      }, 1200);
+      }, 800);
     }
 
     _stopProgressPolling() {

@@ -29,6 +29,7 @@ from .file_tools import export_doctype_list_excel as export_doctype_list_excel_t
 from .fac_client import test_fac_connection as test_fac_connection_internal
 from .resource_registry import get_resource_catalog_summary, list_resource_specs, read_resource
 from .tool_registry import get_tool_catalog_summary, list_tool_specs
+from .copilot_response import build_copilot_package
 
 
 def _build_router_attachment_package(result: dict[str, Any]) -> dict[str, Any]:
@@ -185,7 +186,7 @@ def run_workflow_action(doctype: str, record: str, action: str) -> dict[str, Any
 
 
 @frappe.whitelist()
-def list_erp_documents(doctype: str, filters: dict[str, Any] | str | None = None, limit: int = 20) -> dict[str, Any]:
+def list_erp_documents(doctype: str, filters: dict[str, Any] | str | None = None, limit: int = 500) -> dict[str, Any]:
     return list_erp_documents_tool(doctype=doctype, filters=filters, limit=limit)
 
 
@@ -210,7 +211,7 @@ def describe_erp_schema(doctype: str) -> dict[str, Any]:
 
 
 @frappe.whitelist()
-def search_erp_documents(query: str, doctype: str | None = None, limit: int = 10) -> dict[str, Any]:
+def search_erp_documents(query: str, doctype: str | None = None, limit: int = 500) -> dict[str, Any]:
     return search_erp_documents_tool(query=query, doctype=doctype, limit=limit)
 
 
@@ -516,6 +517,7 @@ def handle_prompt(
 
     reply_text = _result_to_reply_text(routed)
     attachments = _build_router_attachment_package(routed)
+    attachments["copilot"] = build_copilot_package(prompt=prompt_text, context=context, payload=routed, reply_text=reply_text)
     assistant_message = add_message(
         conversation_name,
         "assistant",

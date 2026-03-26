@@ -1,0 +1,180 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "format:AILOG-{YYYY}-{MM}-{DD}-{######}",
+ "creation": "2026-03-24 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "user",
+  "conversation",
+  "prompt_preview",
+  "col1",
+  "action_type",
+  "risk_level",
+  "col2",
+  "provider",
+  "model",
+  "section_tools",
+  "tools_used",
+  "affected_records",
+  "section_tokens",
+  "tokens_in",
+  "tokens_out",
+  "duration_ms",
+  "section_meta",
+  "route",
+  "doctype_context",
+  "docname_context",
+  "error_message",
+  "confirmed_destructive"
+ ],
+ "fields": [
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "label": "User",
+   "options": "User",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "conversation",
+   "fieldtype": "Link",
+   "label": "Conversation",
+   "options": "AI Conversation",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "prompt_preview",
+   "fieldtype": "Small Text",
+   "label": "Prompt Preview"
+  },
+  {
+   "fieldname": "col1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "action_type",
+   "fieldtype": "Select",
+   "label": "Action Type",
+   "options": "\nquery\nwrite\ndestructive\nworkflow\nreport\nexport\nanalysis",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "risk_level",
+   "fieldtype": "Select",
+   "label": "Risk Level",
+   "options": "\nlow\nmedium\nhigh",
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "col2",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "provider",
+   "fieldtype": "Data",
+   "label": "Provider"
+  },
+  {
+   "fieldname": "model",
+   "fieldtype": "Data",
+   "label": "Model"
+  },
+  {
+   "fieldname": "section_tools",
+   "fieldtype": "Section Break",
+   "label": "Tools & Records"
+  },
+  {
+   "fieldname": "tools_used",
+   "fieldtype": "Code",
+   "label": "Tools Used (JSON)",
+   "options": "JSON"
+  },
+  {
+   "fieldname": "affected_records",
+   "fieldtype": "Code",
+   "label": "Affected Records (JSON)",
+   "options": "JSON"
+  },
+  {
+   "fieldname": "section_tokens",
+   "fieldtype": "Section Break",
+   "label": "Performance"
+  },
+  {
+   "fieldname": "tokens_in",
+   "fieldtype": "Int",
+   "label": "Tokens In"
+  },
+  {
+   "fieldname": "tokens_out",
+   "fieldtype": "Int",
+   "label": "Tokens Out"
+  },
+  {
+   "fieldname": "duration_ms",
+   "fieldtype": "Int",
+   "label": "Duration (ms)"
+  },
+  {
+   "fieldname": "section_meta",
+   "fieldtype": "Section Break",
+   "label": "Context"
+  },
+  {
+   "fieldname": "route",
+   "fieldtype": "Data",
+   "label": "Route"
+  },
+  {
+   "fieldname": "doctype_context",
+   "fieldtype": "Data",
+   "label": "DocType Context"
+  },
+  {
+   "fieldname": "docname_context",
+   "fieldtype": "Data",
+   "label": "Document Context"
+  },
+  {
+   "fieldname": "error_message",
+   "fieldtype": "Small Text",
+   "label": "Error Message"
+  },
+  {
+   "fieldname": "confirmed_destructive",
+   "fieldtype": "Check",
+   "label": "Destructive Action Confirmed"
+  }
+ ],
+ "in_create": 0,
+ "is_submittable": 0,
+ "modified": "2026-03-24 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "ERP AI Assistant",
+ "name": "AI Audit Log",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 0,
+   "export": 1,
+   "print": 0,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 0,
+   "write": 0
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "track_changes": 0
+}

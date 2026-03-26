@@ -4,6 +4,8 @@ from typing import Any
 import frappe
 import requests
 
+from .resource_registry import read_resource
+
 DEFAULT_FAC_MCP_TIMEOUT = 30.0
 
 
@@ -80,9 +82,7 @@ def _extract_remote_tool_definitions(result: Any) -> dict[str, dict[str, Any]]:
         name = str(tool.get("name") or "").strip()
         if not name:
             continue
-        input_schema = tool.get("inputSchema")
-        if not isinstance(input_schema, dict):
-            input_schema = {"type": "object", "properties": {}}
+        input_schema = _tool_input_schema(tool)
         annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else None
         normalized_schema = _normalize_input_schema(input_schema)
         definitions[name] = {
@@ -117,6 +117,25 @@ def _extract_remote_tool_result(result: Any) -> Any:
         return text
 
 
+def _extract_remote_resource_result(result: Any) -> Any:
+    payload = result or {}
+    if not isinstance(payload, dict):
+        return payload
+    contents = payload.get("contents")
+    if not isinstance(contents, list) or not contents:
+        return payload
+    first = contents[0] if isinstance(contents[0], dict) else None
+    if not isinstance(first, dict):
+        return payload
+    text = str(first.get("text") or "").strip()
+    if not text:
+        return payload
+    try:
+        return frappe.parse_json(text)
+    except Exception:
+        return text
+
+
 def _registry_tool_definitions(registry: Any, user: str | None = None) -> dict[str, dict[str, Any]]:
     try:
         tools = registry.get_available_tools(user=user or frappe.session.user)
@@ -130,9 +149,7 @@ def _registry_tool_definitions(registry: Any, user: str | None = None) -> dict[s
         name = str(tool.get("name") or "").strip()
         if not name:
             continue
-        input_schema = tool.get("inputSchema")
-        if not isinstance(input_schema, dict):
-            input_schema = {"type": "object", "properties": {}}
+        input_schema = _tool_input_schema(tool)
         annotations = tool.get("annotations") if isinstance(tool.get("annotations"), dict) else None
         normalized_schema = _normalize_input_schema(input_schema)
         definitions[name] = {
@@ -160,6 +177,34 @@ def _normalize_input_schema(input_schema: Any) -> dict[str, Any]:
         schema = dict(schema)
         schema["additionalProperties"] = False
     return schema
+
+
+def _tool_input_schema(tool: Any) -> dict[str, Any]:
+    if not isinstance(tool, dict):
+        return {"type": "object", "properties": {}}
+
+    input_schema = tool.get("inputSchema")
+    if not isinstance(input_schema, dict):
+        input_schema = tool.get("input_schema")
+    if isinstance(input_schema, dict):
+        return input_schema
+
+    parameters = tool.get("parameters")
+    if not isinstance(parameters, dict):
+        return {"type": "object", "properties": {}}
+
+    if parameters.get("type") == "object" and isinstance(parameters.get("properties"), dict):
+        return parameters
+
+    # Claude Desktop tool listings may expose a flat parameters map instead of JSON Schema.
+    return {
+        "type": "object",
+        "properties": {
+            str(name): spec if isinstance(spec, dict) else {"type": "string"}
+            for name, spec in parameters.items()
+            if str(name).strip()
+        },
+    }
 
 
 def _schema_summary(input_schema: dict[str, Any]) -> str:
@@ -327,6 +372,36 @@ def dispatch_tool(name: str, arguments: dict[str, Any], user: str | None = None)
     except Exception:
         raise RuntimeError(
             "FAC-native tool execution failed because no FAC tool backend was available for this request."
+        )
+
+
+def read_fac_resource(
+    name: str,
+    *,
+    context: dict[str, Any] | None = None,
+    arguments: dict[str, Any] | None = None,
+    user: str | None = None,
+) -> Any:
+    registry, local_definitions = _local_fac_available(user=user)
+    if registry and local_definitions:
+        if user:
+            frappe.set_user(user)
+        return read_resource(name, context=context or {}, arguments=arguments or {})
+
+    try:
+        return _extract_remote_resource_result(
+            _remote_mcp_request(
+                "resources/read",
+                {
+                    "name": name,
+                    "context": context or {},
+                    "arguments": arguments or {},
+                },
+            )
+        )
+    except Exception:
+        raise RuntimeError(
+            "FAC-native resource read failed because no FAC resource backend was available for this request."
         )
 
 

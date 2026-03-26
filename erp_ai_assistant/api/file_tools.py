@@ -1,4 +1,5 @@
 import json
+import json
 import re
 from typing import Any
 
@@ -6,9 +7,7 @@ import frappe
 from frappe import _
 from frappe.utils.file_manager import save_file
 
-from .catalog import SAFE_ERP_ALIASES as SAFE_EXPORT_ALIASES
-from .catalog import SAFE_ERP_DOCTYPES as SAFE_EXPORT_DOCTYPES
-from .catalog import get_safe_doctype_config
+from .erp_tools import MUTATION_DOCTYPE_BLOCKLIST, resolve_doctype_name_internal
 from .export import _build_excel_bytes, _slugify_filename
 
 
@@ -33,7 +32,20 @@ def _require_doctype_permission(doctype: str, ptype: str) -> None:
 
 
 def _resolve_safe_export_target(target: str | None) -> dict[str, Any] | None:
-    return get_safe_doctype_config(target)
+    resolved_doctype = resolve_doctype_name_internal(target or "")
+    if not resolved_doctype or resolved_doctype in MUTATION_DOCTYPE_BLOCKLIST:
+        return None
+    if not frappe.db.exists("DocType", resolved_doctype):
+        return None
+    meta = frappe.get_meta(resolved_doctype)
+    if getattr(meta, "istable", 0):
+        return None
+    return {
+        "doctype": resolved_doctype,
+        "title": f"{resolved_doctype} List",
+        "fields": _default_export_fields(resolved_doctype),
+        "filter_fields": _filterable_export_fields(resolved_doctype),
+    }
 
 
 def _normalize_field_hint(value: Any) -> str:
@@ -70,6 +82,75 @@ def _field_label(fieldname: str, field: Any | None, doctype: str) -> str:
     if label:
         return label
     return fieldname.replace("_", " ").title()
+
+
+def _default_export_fields(doctype: str) -> list[str]:
+    preferred = [
+        "name",
+        "status",
+        "docstatus",
+        "company",
+        "posting_date",
+        "transaction_date",
+        "customer",
+        "supplier",
+        "party_name",
+        "employee",
+        "employee_name",
+        "item_code",
+        "item_name",
+        "warehouse",
+        "set_warehouse",
+        "outstanding_amount",
+        "grand_total",
+        "modified",
+    ]
+    meta = frappe.get_meta(doctype)
+    title_field = str(getattr(meta, "title_field", "") or "").strip()
+    if title_field:
+        preferred.insert(1, title_field)
+    meta_fields = _exportable_meta_fields(doctype)
+    selected: list[str] = []
+    for fieldname in preferred:
+        if fieldname == "name" and fieldname not in selected:
+            selected.append(fieldname)
+            continue
+        if fieldname in meta_fields and fieldname not in selected:
+            selected.append(fieldname)
+        if len(selected) >= 8:
+            return selected
+    for fieldname in meta_fields.keys():
+        if fieldname not in selected:
+            selected.append(fieldname)
+        if len(selected) >= 8:
+            break
+    return selected or ["name"]
+
+
+def _filterable_export_fields(doctype: str) -> set[str]:
+    allowed_types = {
+        "Data",
+        "Link",
+        "Select",
+        "Date",
+        "Datetime",
+        "Check",
+        "Int",
+        "Long Int",
+        "Float",
+        "Currency",
+        "Percent",
+        "Small Text",
+        "Text",
+        "Read Only",
+    }
+    fields = {"name", "owner", "modified_by", "creation", "modified", "docstatus"}
+    for field in frappe.get_meta(doctype).fields:
+        fieldname = str(field.fieldname or "").strip()
+        fieldtype = str(field.fieldtype or "").strip()
+        if fieldname and fieldtype in allowed_types:
+            fields.add(fieldname)
+    return fields
 
 
 def _resolve_export_fields(doctype: str, requested_fields: list[str] | None, default_fields: list[str]) -> tuple[list[str], dict[str, str]]:

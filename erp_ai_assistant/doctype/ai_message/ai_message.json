@@ -1,50 +1,58 @@
 {
-  "doctype": "DocType",
-  "name": "AI Message",
-  "module": "ERP AI Assistant",
-  "custom": 0,
-  "istable": 0,
-  "track_changes": 0,
-  "autoname": "hash",
-  "fields": [
-    {
-      "fieldname": "conversation",
-      "fieldtype": "Link",
-      "label": "Conversation",
-      "options": "AI Conversation",
-      "reqd": 1
-    },
-    {
-      "fieldname": "role",
-      "fieldtype": "Select",
-      "label": "Role",
-      "options": "user\nassistant\nsystem\ntool",
-      "reqd": 1
-    },
-    {
-      "fieldname": "content",
-      "fieldtype": "Long Text",
-      "label": "Content",
-      "reqd": 1
-    },
-    {
-      "fieldname": "tool_events",
-      "fieldtype": "Long Text",
-      "label": "Tool Events"
-    },
-    {
-      "fieldname": "attachments_json",
-      "fieldtype": "Long Text",
-      "label": "Attachments JSON"
-    }
-  ],
-  "permissions": [
-    {
-      "role": "System Manager",
-      "read": 1,
-      "write": 1,
-      "create": 1,
-      "delete": 1
-    }
-  ]
+ "doctype": "DocType",
+ "name": "AI Message",
+ "module": "ERP AI Assistant",
+ "custom": 0,
+ "istable": 0,
+ "track_changes": 0,
+ "autoname": "hash",
+ "fields": [
+  {
+   "fieldname": "conversation",
+   "fieldtype": "Link",
+   "label": "Conversation",
+   "options": "AI Conversation",
+   "reqd": 1
+  },
+  {
+   "fieldname": "role",
+   "fieldtype": "Select",
+   "label": "Role",
+   "options": "user\nassistant\nsystem\ntool",
+   "reqd": 1
+  },
+  {
+   "fieldname": "content",
+   "fieldtype": "Long Text",
+   "label": "Content",
+   "reqd": 1
+  },
+  {
+   "fieldname": "tool_events",
+   "fieldtype": "Long Text",
+   "label": "Tool Events"
+  },
+  {
+   "fieldname": "attachments_json",
+   "fieldtype": "Long Text",
+   "label": "Attachments JSON"
+  }
+ ],
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1
+  },
+  {
+   "role": "All",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 0,
+   "if_owner": 1
+  }
+ ]
 }

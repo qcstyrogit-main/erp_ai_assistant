@@ -28,6 +28,161 @@ def _error(message: str, *, error_type: str = "validation_error", extra: dict[st
     return payload
 
 
+def _as_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_bank_account_value(value: Any) -> str | None:
+    account = str(value or "").strip()
+    if not account:
+        return None
+    if frappe.db.exists("Bank Account", account):
+        linked_account = frappe.db.get_value("Bank Account", account, "account")
+        return str(linked_account or "").strip() or None
+    if frappe.db.exists("Account", account):
+        return account
+    return None
+
+
+def _is_bank_or_cash_account(account: Any) -> bool:
+    resolved = _resolve_bank_account_value(account)
+    if not resolved:
+        return False
+    account_type = str(frappe.db.get_value("Account", resolved, "account_type") or "").strip()
+    return account_type in {"Bank", "Cash"}
+
+
+def _extract_payment_entry_reference(values: dict[str, Any]) -> tuple[str, str]:
+    references = values.get("references")
+    if isinstance(references, list):
+        for row in references:
+            if not isinstance(row, dict):
+                continue
+            ref_doctype = str(row.get("reference_doctype") or row.get("voucher_type") or "").strip()
+            ref_name = str(row.get("reference_name") or row.get("voucher_no") or "").strip()
+            if ref_doctype and ref_name:
+                return ref_doctype, ref_name
+
+    explicit_doctype = str(
+        values.get("reference_doctype")
+        or values.get("against_voucher_type")
+        or values.get("source_doctype")
+        or values.get("linked_invoice_doctype")
+        or ""
+    ).strip()
+    explicit_name = str(
+        values.get("reference_name")
+        or values.get("against_voucher")
+        or values.get("source_name")
+        or values.get("linked_invoice")
+        or ""
+    ).strip()
+    if explicit_doctype and explicit_name:
+        return explicit_doctype, explicit_name
+
+    for key, doctype in (
+        ("sales_invoice", "Sales Invoice"),
+        ("purchase_invoice", "Purchase Invoice"),
+        ("sales_order", "Sales Order"),
+        ("purchase_order", "Purchase Order"),
+    ):
+        name = str(values.get(key) or "").strip()
+        if name:
+            return doctype, name
+
+    fallback_name = str(values.get("invoice") or values.get("invoice_name") or "").strip()
+    if fallback_name:
+        party_type = str(values.get("party_type") or "").strip().lower()
+        payment_type = str(values.get("payment_type") or "").strip().lower()
+        if party_type == "supplier" or payment_type == "pay":
+            return "Purchase Invoice", fallback_name
+        return "Sales Invoice", fallback_name
+
+    return "", ""
+
+
+def _extract_payment_entry_bank_account(values: dict[str, Any], payment_type: str) -> str | None:
+    candidates: list[Any] = [
+        values.get("bank_account"),
+        values.get("bank"),
+        values.get("company_bank_account"),
+    ]
+    if payment_type == "Receive":
+        candidates.extend([values.get("paid_to"), values.get("paid_from")])
+    elif payment_type == "Pay":
+        candidates.extend([values.get("paid_from"), values.get("paid_to")])
+    else:
+        candidates.extend([values.get("paid_to"), values.get("paid_from")])
+
+    for candidate in candidates:
+        if _is_bank_or_cash_account(candidate):
+            return _resolve_bank_account_value(candidate)
+
+    for candidate in candidates:
+        resolved = _resolve_bank_account_value(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _create_payment_entry_from_reference(values: dict[str, Any]) -> dict[str, Any] | None:
+    reference_doctype, reference_name = _extract_payment_entry_reference(values)
+    if not reference_doctype or not reference_name:
+        return None
+
+    from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
+
+    payment_type = str(values.get("payment_type") or "").strip() or None
+    paid_amount = _as_float(values.get("paid_amount"))
+    if paid_amount is None:
+        paid_amount = _as_float(values.get("received_amount"))
+    bank_account = _extract_payment_entry_bank_account(values, payment_type or "")
+    reference_date = values.get("reference_date") or values.get("posting_date") or nowdate()
+
+    pe = get_payment_entry(
+        reference_doctype,
+        reference_name,
+        party_amount=paid_amount,
+        bank_account=bank_account,
+        payment_type=payment_type,
+        reference_date=reference_date,
+    )
+
+    posting_date = values.get("posting_date")
+    if posting_date:
+        pe.posting_date = getdate(posting_date)
+    if values.get("reference_date"):
+        pe.reference_date = getdate(values.get("reference_date"))
+    if values.get("mode_of_payment"):
+        pe.mode_of_payment = values.get("mode_of_payment")
+    if values.get("reference_no"):
+        pe.reference_no = str(values.get("reference_no")).strip()
+    if values.get("remarks"):
+        pe.remarks = str(values.get("remarks")).strip()
+
+    pe.insert()
+    return {
+        "ok": True,
+        "type": "document",
+        "doctype": pe.doctype,
+        "name": pe.name,
+        "url": get_url_to_form(pe.doctype, pe.name),
+        "message": f"{pe.doctype} created successfully",
+        "data": {
+            "reference_doctype": reference_doctype,
+            "reference_name": reference_name,
+            "payment_type": pe.payment_type,
+            "paid_from": pe.paid_from,
+            "paid_to": pe.paid_to,
+        },
+    }
+
+
 def _parse_json_arg(value: Any, default: Any) -> Any:
     if value in (None, "", []):
         return default
@@ -173,9 +328,13 @@ def resolve_doctype_name_internal(doctype_or_hint: str) -> str | None:
         return None
     if frappe.db.exists("DocType", hint):
         return hint
-    safe_match = _resolve_safe_doctype(hint)
-    if safe_match:
-        return safe_match[0]
+    config = _safe_doctype_config(hint)
+    if config:
+        return str(config.get("doctype") or "").strip() or None
+    matched = resolve_safe_doctype_from_text(hint)
+    if matched:
+        _key, resolved_config = matched
+        return str(resolved_config.get("doctype") or "").strip() or None
     rows = frappe.get_all(
         "DocType",
         filters={"istable": 0},
@@ -200,23 +359,185 @@ def _resolve_safe_doctype(doctype_or_hint: str) -> tuple[str, dict[str, Any]] | 
     if matched:
         _key, resolved_config = matched
         return str(resolved_config.get("doctype") or "").strip(), resolved_config
+    resolved_doctype = resolve_doctype_name_internal(str(doctype_or_hint or "").strip())
+    if resolved_doctype and _is_general_mutation_allowed(resolved_doctype):
+        return resolved_doctype, _dynamic_doctype_config(resolved_doctype)
     return None
 
 
-def _sanitize_filters(filters: Any, allowed_fields: set[str]) -> dict[str, Any]:
+def _listable_meta_fields(doctype: str) -> list[str]:
+    preferred = [
+        "name",
+        "title",
+        "status",
+        "docstatus",
+        "company",
+        "posting_date",
+        "transaction_date",
+        "delivery_date",
+        "supplier",
+        "customer",
+        "party_name",
+        "employee",
+        "employee_name",
+        "item_code",
+        "item_name",
+        "warehouse",
+        "set_warehouse",
+        "territory",
+        "outstanding_amount",
+        "grand_total",
+        "modified",
+    ]
+    meta = frappe.get_meta(doctype)
+    fields: list[str] = []
+    title_field = str(getattr(meta, "title_field", "") or "").strip()
+    if title_field:
+        preferred.insert(1, title_field)
+    blocked_types = {
+        "Section Break",
+        "Column Break",
+        "Tab Break",
+        "HTML",
+        "Button",
+        "Image",
+        "Attach Image",
+        "Table",
+        "Table MultiSelect",
+        "Fold",
+        "Heading",
+        "Password",
+        "Code",
+        "Text Editor",
+        "Long Text",
+        "Small Text",
+    }
+    available_fields = {
+        str(field.fieldname or "").strip(): str(field.fieldtype or "").strip()
+        for field in meta.fields
+        if str(field.fieldname or "").strip()
+    }
+    for fieldname in preferred:
+        if fieldname == "name" and fieldname not in fields:
+            fields.append(fieldname)
+            continue
+        if fieldname in available_fields and available_fields.get(fieldname) not in blocked_types and fieldname not in fields:
+            fields.append(fieldname)
+        if len(fields) >= 8:
+            return fields
+    for fieldname, fieldtype in available_fields.items():
+        if fieldtype in blocked_types or fieldname in fields:
+            continue
+        fields.append(fieldname)
+        if len(fields) >= 8:
+            break
+    return fields or ["name"]
+
+
+def _filterable_fields_for_doctype(doctype: str) -> set[str]:
+    meta = frappe.get_meta(doctype)
+    allowed_types = {
+        "Data",
+        "Link",
+        "Select",
+        "Date",
+        "Datetime",
+        "Check",
+        "Int",
+        "Long Int",
+        "Float",
+        "Currency",
+        "Percent",
+        "Small Text",
+        "Text",
+        "Read Only",
+    }
+    fields = {"name", "owner", "modified_by", "creation", "modified", "docstatus"}
+    for field in meta.fields:
+        fieldname = str(field.fieldname or "").strip()
+        fieldtype = str(field.fieldtype or "").strip()
+        if fieldname and fieldtype in allowed_types:
+            fields.add(fieldname)
+    return fields
+
+
+def _dynamic_doctype_config(doctype: str) -> dict[str, Any]:
+    return {
+        "doctype": doctype,
+        "title": f"{doctype} List",
+        "fields": _listable_meta_fields(doctype),
+        "filter_fields": _filterable_fields_for_doctype(doctype),
+        "search_fields": _searchable_fields_for_doctype(doctype, {}),
+    }
+
+
+def _resolve_doctype_from_query_text(text: str) -> tuple[str, dict[str, Any]] | None:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return None
+    matched = resolve_safe_doctype_from_text(normalized)
+    if matched:
+        _key, resolved_config = matched
+        resolved_doctype = str(resolved_config.get("doctype") or "").strip()
+        if resolved_doctype:
+            return resolved_doctype, resolved_config
+    rows = frappe.get_all(
+        "DocType",
+        filters={"istable": 0},
+        fields=["name"],
+        limit_page_length=20,
+        order_by="name asc",
+    )
+    best_match = None
+    for row in rows:
+        doctype = str(row.get("name") or "").strip()
+        if not doctype or doctype in MUTATION_DOCTYPE_BLOCKLIST:
+            continue
+        if re.search(rf"\b{re.escape(doctype.lower())}\b", normalized):
+            if best_match is None or len(doctype) > len(best_match):
+                best_match = doctype
+    if best_match:
+        return best_match, _dynamic_doctype_config(best_match)
+    return None
+
+
+def _sanitize_filters(filters: Any, allowed_fields: set[str] | None = None) -> dict[str, Any]:
     parsed = _parse_json_arg(filters, {}) or {}
     if not isinstance(parsed, dict):
         return {}
+    if not allowed_fields:
+        return {key: value for key, value in parsed.items() if value not in (None, "", [])}
     return {key: value for key, value in parsed.items() if key in allowed_fields and value not in (None, "", [])}
 
 
 def _searchable_fields_for_doctype(doctype: str, config: dict[str, Any]) -> list[str]:
     candidates = list(config.get("search_fields") or [])
     meta = frappe.get_meta(doctype)
+    search_fields_raw = str(getattr(meta, "search_fields", "") or "").strip()
+    if search_fields_raw:
+        candidates.extend([part.strip() for part in search_fields_raw.split(",") if part.strip()])
     title_field = str(getattr(meta, "title_field", "") or "").strip()
     if title_field:
         candidates.append(title_field)
-    candidates.append("name")
+    candidates.extend(
+        [
+            "name",
+            "title",
+            "customer",
+            "customer_name",
+            "supplier",
+            "supplier_name",
+            "party_name",
+            "item_code",
+            "item_name",
+            "employee",
+            "employee_name",
+            "company",
+            "remarks",
+            "description",
+            "subject",
+        ]
+    )
     unique: list[str] = []
     for fieldname in candidates:
         if fieldname and fieldname not in unique and meta.has_field(fieldname):
@@ -900,17 +1221,15 @@ def list_erp_doctypes_internal(search: str | None = None, module: str | None = N
         filters=filters,
         fields=["name", "module", "custom", "issingle", "is_submittable"],
         order_by="modified desc",
-        limit_page_length=max(1, min(int(limit or 100), 500)),
+        limit_page_length=max(1, min(int(limit or 20), 500)),
     )
     search_text = str(search or "").strip().lower()
     if search_text:
         rows = [row for row in rows if search_text in str(row.get("name") or "").lower() or search_text in str(row.get("module") or "").lower()]
 
     answer_lines = ["Available DocTypes", ""]
-    for row in rows[:40]:
+    for row in rows:
         answer_lines.append(f"- {row.get('name')} ({row.get('module') or 'Core'})")
-    if len(rows) > 40:
-        answer_lines.append(f"...and {len(rows) - 40} more doctypes.")
     return {
         "ok": True,
         "type": "answer",
@@ -979,6 +1298,11 @@ def create_erp_document_internal(doctype: str, values: dict[str, Any] | str) -> 
     parsed_values = _parse_json_arg(values, values)
     if not isinstance(parsed_values, dict) or not parsed_values:
         return {"ok": False, "type": "document", "message": _("Field values are required to create {0}.").format(resolved_doctype)}
+
+    if resolved_doctype == "Payment Entry":
+        payment_entry_result = _create_payment_entry_from_reference(parsed_values)
+        if payment_entry_result is not None:
+            return payment_entry_result
 
     payload, ignored_fields, ambiguous_link = _normalize_mutation_values(resolved_doctype, parsed_values)
     payload["doctype"] = resolved_doctype
@@ -1296,7 +1620,7 @@ def list_erp_documents_internal(doctype: str, filters: dict[str, Any] | None = N
         filters=safe_filters,
         fields=fields,
         order_by="modified desc",
-        limit_page_length=max(1, min(int(limit or 20), 100)),
+        limit_page_length=max(1, min(int(limit or 20), 5000)),
     )
     return {
         "ok": True,
@@ -1337,10 +1661,7 @@ def search_erp_documents_internal(query: str, doctype: str | None = None, limit:
     if doctype:
         resolved = _resolve_safe_doctype(doctype)
     else:
-        resolved = resolve_safe_doctype_from_text(query_text)
-        if resolved:
-            _key, config = resolved
-            resolved = (str(config.get("doctype") or "").strip(), config)
+        resolved = _resolve_doctype_from_query_text(query_text)
     if not resolved:
         return _error(_("Unsupported ERP document type."), error_type="unsupported_doctype")
     resolved_doctype, config = resolved
@@ -1362,7 +1683,7 @@ def search_erp_documents_internal(query: str, doctype: str | None = None, limit:
         or_filters=filters,
         fields=base_fields,
         order_by="modified desc",
-        limit_page_length=max(1, min(int(limit or 10), 50)),
+        limit_page_length=max(1, min(int(limit or 20), 1000)),
     )
     return {
         "ok": True,

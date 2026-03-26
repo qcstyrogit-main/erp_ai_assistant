@@ -1,167 +1,267 @@
 # ERP AI Assistant
 
-Installable Frappe/ERPNext app that adds an assistant UI inside ERPNext and runs it in a FAC-native way.
+Frappe/ERPNext app that adds an AI copilot to Desk and the website, stores chat history in DocTypes, and executes ERP actions through Frappe Assistant Core (FAC) when available.
 
-## What It Is
+## Overview
 
-This app is now designed to work with Frappe Assistant Core (FAC) as the primary tool backend.
+This app provides three connected layers:
 
-Current runtime behavior:
-- assistant prompt goes to the configured model provider
-- FAC provides the live tool catalog for the session
-- FAC executes tools directly
-- same-site FAC registry is the primary path
-- remote MCP is optional fallback only
+- UI surfaces for Desk and web users
+- provider-backed LLM orchestration for chat, tool calling, and image prompts
+- ERP tool execution through FAC local registry first, then optional remote MCP fallback
 
-This means the assistant should use the tools FAC actually exposes, not a static hardcoded tool list.
+The current codebase is not only a chat widget. It also includes:
 
-## Main Capabilities
+- `AI Provider Settings` for provider and MCP configuration
+- `AI Conversation` and `AI Message` DocTypes for chat persistence
+- deterministic ERP helper APIs and internal tool/resource registries
+- queued prompt execution with progress polling
+- export/file generation helpers for Excel and PDF outputs
 
-- Desk floating assistant bubble
-- Desk workspace entry
-- website assistant page
-- conversation and message DocTypes
-- provider-backed chat with FAC tool calling
-- FAC connection test from `AI Provider Settings`
-- optional remote MCP configuration
-- export/file artifact support when FAC or app tools expose it
+## Main Features
 
-## FAC-Native Flow
+- Floating Desk assistant bubble injected from app hooks
+- Full-page Desk workspace at `/app/assistant-workspace`
+- Website assistant page at `/assistant`
+- Conversation history with pin, rename, delete, and pending-action continuation support
+- Context-aware prompting using current route, DocType, and document name
+- Image input support in the Desk bubble and workspace/web assistant
+- Provider support for OpenAI, OpenAI-compatible APIs, and Anthropic
+- Model selection from configured allowed/default models
+- FAC-native tool discovery and execution
+- Internal tool and resource catalogs for ERP operations and metadata reads
+- Attachment/export handling for generated files
+- Connection test buttons for both AI provider and FAC MCP backend
 
-Normal assistant execution is now:
+## Runtime Architecture
+
+Normal request flow:
 
 `User Prompt`
--> `Provider Chat`
--> `FAC Tool Discovery`
--> `FAC Tool Execution`
--> `Assistant Response`
+-> `Desk/Web UI`
+-> `erp_ai_assistant.api.assistant.handle_prompt`
+-> `erp_ai_assistant.api.ai.enqueue_prompt`
+-> `Queued LLM run`
+-> `FAC local registry or remote MCP`
+-> `AI Message / attachments / tool events`
 
-Important notes:
-- the assistant is FAC-native at runtime
-- it uses the local FAC registry first when FAC is installed on the same site
-- it does not rely on the old deterministic parser/router as the normal prompt path
-- actual assistant capability depends on the tools FAC exposes
+Tool backend resolution order:
 
-Example:
-- if FAC does not expose `update_document`, the assistant should not pretend it can update documents
+1. Local FAC registry, if `frappe_assistant_core` is installed on the same site and exposes tools
+2. Remote FAC/MCP server configured in `AI Provider Settings`
+3. Internal fallback catalogs for direct API access and metadata/resource reads
 
-## App Name
+Important behavior:
 
-- Python module: `erp_ai_assistant`
-- Bench install target: `erp_ai_assistant`
+- Local FAC is preferred over remote MCP.
+- Remote MCP is optional, not required for same-site FAC deployments.
+- Actual assistant capability depends on the tools FAC exposes at runtime.
+- Prompts are queued with `frappe.enqueue(...)`, and the UI polls `get_prompt_progress` and `get_prompt_result`.
 
-## Install
+## Project Structure
 
-From your Bench folder:
+Key areas in the repository:
+
+- `erp_ai_assistant/hooks.py`: app metadata, Desk asset injection, workspace app launcher
+- `erp_ai_assistant/api/ai.py`: LLM orchestration, prompt queueing, progress/result cache, model resolution
+- `erp_ai_assistant/api/assistant.py`: whitelisted assistant endpoints and deterministic routing bridge
+- `erp_ai_assistant/api/fac_client.py`: local FAC registry and remote MCP client
+- `erp_ai_assistant/api/tool_registry.py`: internal tool catalog
+- `erp_ai_assistant/api/resource_registry.py`: internal resource catalog
+- `erp_ai_assistant/api/chat.py`: conversation/message persistence APIs
+- `erp_ai_assistant/api/provider_settings.py`: settings and env/site-config resolution
+- `erp_ai_assistant/api/auth.py`: workspace visibility and optional session helpers
+- `erp_ai_assistant/public/js/assistant_bubble.js`: Desk floating assistant
+- `erp_ai_assistant/public/js/web_assistant.js`: shared full-page assistant client
+- `erp_ai_assistant/public/js/ai_provider_settings.js`: connection test buttons on settings form
+- `erp_ai_assistant/doctype/ai_provider_settings/*`: single DocType for provider/FAC config
+- `erp_ai_assistant/doctype/ai_conversation/*`: conversation DocType
+- `erp_ai_assistant/doctype/ai_message/*`: message DocType
+- `docs/fac_tool_blueprint.md`: recommended FAC business-tool roadmap
+- `docs/PRODUCTION_REFACTOR_NOTES.md`: hardening/refactor notes
+
+## Installation
+
+From your Bench directory:
 
 ```bash
-bench get-app --branch main erp_ai_assistant D:/ai_assistant
-bench --site <your-site> install-app erp_ai_assistant
-bench --site <your-site> migrate
+bench get-app erp_ai_assistant <repo-url-or-path>
+bench --site <site-name> install-app erp_ai_assistant
+bench --site <site-name> migrate
 bench build
 bench restart
 ```
 
-If the app is already present in your bench, skip `get-app`.
+If the app already exists in the bench, skip `bench get-app`.
 
-## Usage
+## Requirements
 
-- Desk bubble loads automatically from `hooks.py`
-- Desk workspace route: `/app/assistant-workspace`
-- website route: `/assistant`
-- configure provider credentials in `AI Provider Settings`
+- Frappe bench running Python 3.10+
+- This app installed on the target site
+- An AI provider credential configured in `AI Provider Settings` or via site config/environment variables
+- Optional: `frappe_assistant_core` installed on the same site for local FAC-native tool execution
 
-## AI Provider Settings
+## Configuration
 
-Open `AI Provider Settings` and configure:
-- provider
-- model
-- provider base URL / path if using OpenAI-compatible APIs
+Open `AI Provider Settings` and configure the active provider.
 
-FAC-related fields:
-- `FAC MCP URL`
-- `FAC MCP Authorization`
-- `FAC MCP Timeout (Seconds)`
+Supported providers:
 
-Important:
-- if FAC is installed on the same ERP site, the assistant will prefer the local FAC registry
-- manual FAC MCP authorization is not required for the local same-site path
-- remote MCP settings are mainly for fallback or external FAC servers
+- `OpenAI`
+- `OpenAI Compatible`
+- `Anthropic`
 
-## Test FAC Connection
+Important settings:
 
-`AI Provider Settings` includes a `Test MCP Connection` button.
+- `provider`
+- `tool_choice_mode`
+- `openai_default_model`
+- `openai_models`
+- `openai_vision_model`
+- `openai_api_key`
+- `openai_base_url`
+- `openai_responses_path`
+- `enable_openai_mcp`
+- `openai_mcp_servers_json`
+- `anthropic_default_model`
+- `anthropic_models`
+- `anthropic_vision_model`
+- `anthropic_api_key`
+- `anthropic_auth_token`
+- `anthropic_base_url`
+- `anthropic_messages_path`
+- `fac_mcp_url`
+- `fac_mcp_authorization`
+- `fac_mcp_timeout`
 
-What it verifies:
-- whether local FAC registry is available
-- whether remote MCP fallback is reachable
-- current tool count
-- currently exposed tool names
+Notes:
 
-Expected good result for same-site FAC:
-- connected
-- mode is effectively local FAC registry
-- no manual authorization required
+- Use `https://api.openai.com` with `/v1/responses` for native OpenAI.
+- OpenAI-compatible providers can point to custom bases such as NVIDIA-compatible endpoints and often use `/v1/chat/completions`.
+- Vision models are selected automatically when image attachments are included.
+- `Tool Choice Mode` is only for providers/proxies that need an explicit OpenAI-style or Anthropic-style tool-call format.
 
-## Example Prompts
+## Environment And Site Config Fallbacks
 
-Read and search:
-- `how many active employees`
-- `show me sales invoices for customer ANICA`
-- `pull out Macdenver Conti Magbojos details`
-- `list available tools`
-- `list available resources`
+When settings are blank, the app also reads from site config or environment variables.
 
-Create and workflow:
-- `create customer with customer name Aqua Flask`
-- `create new employee with name Juan Dela Cruz`
-- `create sales order for customer ABC with items ITEM-001 qty 2`
-- `submit sales order SO-0001`
-- `cancel sales invoice SINV-0001`
-- `approve leave application HR-LAP-0001`
+Common keys:
 
-Exports:
-- `export employee list to excel`
-- `export employee list to excel with fields employee id, employee name, department`
-- `generate pdf for sales invoice SINV-0001`
+- `ERP_AI_PROVIDER`
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`
+- `OPENAI_MODEL`
+- `OPENAI_MODELS`
+- `OPENAI_VISION_MODEL`
+- `OPENAI_RESPONSES_PATH`
+- `ERP_AI_OPENAI_MCP_ENABLED`
+- `ERP_AI_OPENAI_MCP_SERVERS`
+- `ERP_AI_FAC_MCP_URL`
+- `ERP_AI_FAC_MCP_AUTHORIZATION`
+- `ERP_AI_FAC_MCP_TIMEOUT`
+- `ANTHROPIC_API_KEY`
+- `ANTHROPIC_AUTH_TOKEN`
+- `ANTHROPIC_BASE_URL`
+- `ANTHROPIC_MESSAGES_PATH`
+- `ANTHROPIC_MODEL`
+- `ANTHROPIC_MODELS`
+- `ANTHROPIC_VISION_MODEL`
+- `ERP_AI_TOOL_CHOICE_MODE`
 
-## Important Limitation
+The runtime also honors advanced LLM tuning keys in `api/ai.py`, including timeout, token, streaming, temperature, top-p, conversation-history, and tool-round limits.
 
-The assistant can only do what FAC exposes.
+## UI Surfaces
 
-If your FAC tool catalog does not expose a tool such as `update_document`, then prompts like:
+Desk bubble:
 
-`Update employee Macdenver Conti Magbojos birthday to April 30, 1993`
+- injected globally through `app_include_js`
+- available to authenticated Desk users
+- supports conversation search, pinning, deleting, image attach/paste, model selection, stop action, and progress display
 
-may still not complete as a real update.
+Desk workspace:
 
-That is a FAC capability issue, not an ERP AI Assistant connection issue.
+- route: `/app/assistant-workspace`
+- app icon appears in the apps screen
+- uses the shared web assistant client in Desk mode
 
-## Recommended FAC Tool Roadmap
+Website assistant:
 
-For this app to behave like a strong ERP assistant, FAC should expose business-level tools instead of relying only on generic CRUD primitives.
+- route: `/assistant`
+- uses the same shared web assistant styling and interaction model
 
-Recommended priority:
-- `find_one_document`
+## Stored Data
+
+`AI Provider Settings`:
+
+- single DocType
+- writable by `System Manager`
+- stores provider credentials, models, and FAC MCP connection data
+
+`AI Conversation`:
+
+- stores title, status, pin state, and pending action state
+- currently permissioned for `System Manager` in the DocType definition
+- API layer also restricts access to owner or `System Manager`
+
+`AI Message`:
+
+- stores role, content, tool events, and attachments JSON
+- linked to `AI Conversation`
+
+## Tooling Model
+
+The assistant can work with both FAC-exposed tools and the app's internal catalogs.
+
+Internal tool categories include:
+
+- system
+- read
+- write
+- workflow
+- resource
+- report
+- file
+- destructive
+
+Examples of internal tools:
+
+- `get_document`
+- `list_documents`
+- `create_document`
 - `update_document`
-- `export_doctype_records`
-- `create_report`
-- `get_report_definition`
-- `update_report`
-- `run_report`
-- `export_report`
+- `delete_document`
+- `get_doctype_info`
+- `search_documents`
+- `generate_report`
+- `create_sales_order`
+- `create_purchase_order`
+- `create_quotation`
+- `submit_erp_document`
+- `cancel_erp_document`
+- `run_workflow_action`
+- `export_doctype_list_excel`
+- `generate_document_pdf`
 
-Detailed tool contract:
-- [docs/fac_tool_blueprint.md](/d:/frappe_docker/development/frappe-bench/apps/erp_ai_assistant/docs/fac_tool_blueprint.md)
+Internal resources include:
 
-Why this matters:
-- `create_document` alone is too low-level for reliable report creation
-- generic search tools are too broad for deterministic ERP actions
-- explicit business tools let FAC validate inputs and confirm real success
+- `current_document`
+- `doctype_schema`
+- `available_doctypes`
+- `current_page_context`
+- `pending_assistant_action`
 
-## Public API Endpoints
+Security-related behavior in the internal registry:
 
-Assistant:
+- permission-aware document listing
+- document/doctype access checks before read or write
+- explicit confirmation required for destructive deletion
+- draft-first submission flow for document creation
+- generic global search blocked without a target DocType
+
+## Public API
+
+Main assistant endpoints:
+
 - `erp_ai_assistant.api.assistant.handle_prompt`
 - `erp_ai_assistant.api.assistant.ping_assistant`
 - `erp_ai_assistant.api.assistant.answer_erp_query`
@@ -173,55 +273,106 @@ Assistant:
 - `erp_ai_assistant.api.assistant.test_fac_mcp_connection`
 - `erp_ai_assistant.api.assistant.test_ai_provider_connection`
 
-MCP/FAC-style proxy:
+Conversation endpoints:
+
+- `erp_ai_assistant.api.chat.list_conversations`
+- `erp_ai_assistant.api.chat.get_conversation`
+- `erp_ai_assistant.api.chat.create_conversation`
+- `erp_ai_assistant.api.chat.rename_conversation`
+- `erp_ai_assistant.api.chat.toggle_pin`
+- `erp_ai_assistant.api.chat.delete_conversation`
+
+Queued prompt endpoints:
+
+- `erp_ai_assistant.api.ai.enqueue_prompt`
+- `erp_ai_assistant.api.ai.get_prompt_progress`
+- `erp_ai_assistant.api.ai.get_prompt_result`
+- `erp_ai_assistant.api.ai.get_available_models`
+
+Authentication/helpers:
+
+- `erp_ai_assistant.api.auth.who_am_i`
+- `erp_ai_assistant.api.auth.session_login`
+- `erp_ai_assistant.api.auth.session_logout`
+
+MCP/FAC proxy endpoint:
+
 - `erp_ai_assistant.api.fac_proxy.handle_mcp`
 
 Supported MCP-style operations:
+
 - `tools/list`
 - `tools/call`
 - `resources/list`
 - `resources/read`
 
-## Environment Variable / Site Config Fallbacks
+## Connection Testing
 
-The app also reads these when provider settings are not filled:
+The `AI Provider Settings` form adds two custom buttons:
 
-- `ERP_AI_PROVIDER`
-- `OPENAI_API_KEY`
-- `OPENAI_BASE_URL`
-- `OPENAI_MODEL`
-- `OPENAI_MODELS`
-- `OPENAI_RESPONSES_PATH`
-- `ANTHROPIC_API_KEY`
-- `ANTHROPIC_AUTH_TOKEN`
-- `ANTHROPIC_BASE_URL`
-- `ANTHROPIC_MESSAGES_PATH`
-- `ANTHROPIC_MODEL`
-- `ANTHROPIC_MODELS`
-- `ANTHROPIC_VISION_MODEL`
-- `ERP_AI_OPENAI_MCP_ENABLED`
-- `ERP_AI_OPENAI_MCP_SERVERS`
-- `ERP_AI_FAC_MCP_URL`
-- `ERP_AI_FAC_MCP_AUTHORIZATION`
-- `ERP_AI_FAC_MCP_TIMEOUT`
+- `Test AI Provider`
+- `Test MCP Connection`
 
-## Important Files
+These validate:
 
-- `erp_ai_assistant/hooks.py`
-- `erp_ai_assistant/api/assistant.py`
-- `erp_ai_assistant/api/ai.py`
-- `erp_ai_assistant/api/fac_client.py`
-- `erp_ai_assistant/api/fac_proxy.py`
-- `erp_ai_assistant/api/provider_settings.py`
-- `erp_ai_assistant/api/resource_registry.py`
-- `erp_ai_assistant/public/js/assistant_bubble.js`
-- `erp_ai_assistant/public/js/web_assistant.js`
-- `erp_ai_assistant/public/js/ai_provider_settings.js`
+- provider endpoint reachability
+- selected model and compatibility profile
+- whether credentials are configured
+- FAC connection mode and visible tool count
 
-## Notes
+For same-site FAC deployments, a successful MCP test should usually report `mode: local_registry`.
 
-- runtime is FAC-native
-- same-site FAC local registry is preferred over remote MCP
-- remote MCP is optional fallback
-- provider quality still matters for tool selection and reasoning
-- final business capability depends on FAC’s exposed tools, not on static assistant assumptions
+## Example Prompts
+
+Read and discovery:
+
+- `how many active employees`
+- `show me sales invoices for customer ANICA`
+- `list available tools`
+- `list available resources`
+- `show me the schema for Sales Order`
+
+Create and update:
+
+- `create customer with customer name Aqua Flask`
+- `create new employee with name Juan Dela Cruz`
+- `create sales order for customer ABC with items ITEM-001 qty 2`
+- `update employee EMP-0001 department to Finance`
+
+Workflow and export:
+
+- `submit sales order SO-0001`
+- `cancel sales invoice SINV-0001`
+- `approve leave application HR-LAP-0001`
+- `export employee list to excel`
+- `generate pdf for sales invoice SINV-0001`
+
+## Operational Notes
+
+- The assistant should only claim capabilities exposed by the current FAC catalog or internal tools actually available.
+- If FAC does not expose a business tool such as `update_document`, the model may not be able to complete that action reliably through FAC alone.
+- The current codebase still contains deterministic ERP helper routes alongside the FAC-native LLM path.
+- `api/ai.py` is the main runtime file and is large; `docs/PRODUCTION_REFACTOR_NOTES.md` already recommends splitting it further.
+- The optional `session_login` wrapper is disabled by default. Enable it only with `erp_ai_enable_session_login = 1` if you explicitly need it.
+
+## FAC Tool Roadmap
+
+For stronger ERP behavior, FAC should expose business-safe tools such as:
+
+- `find_one_document`
+- `update_document`
+- `export_doctype_records`
+- `create_report`
+- `get_report_definition`
+- `update_report`
+- `run_report`
+- `export_report`
+
+Reference:
+
+- [docs/fac_tool_blueprint.md](/d:/frappe_docker/development/frappe-bench/apps/erp_ai_assistant/docs/fac_tool_blueprint.md)
+- [docs/PRODUCTION_REFACTOR_NOTES.md](/d:/frappe_docker/development/frappe-bench/apps/erp_ai_assistant/docs/PRODUCTION_REFACTOR_NOTES.md)
+
+## License
+
+MIT

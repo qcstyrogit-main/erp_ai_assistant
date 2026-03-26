@@ -1,46 +1,55 @@
 {
-  "doctype": "DocType",
-  "name": "AI Conversation",
-  "module": "ERP AI Assistant",
-  "custom": 0,
-  "istable": 0,
-  "track_changes": 1,
-  "autoname": "hash",
-  "fields": [
-    {
-      "fieldname": "title",
-      "fieldtype": "Data",
-      "label": "Title",
-      "reqd": 1
-    },
-    {
-      "fieldname": "status",
-      "fieldtype": "Select",
-      "label": "Status",
-      "options": "Open\nArchived",
-      "default": "Open"
-    },
-    {
-      "fieldname": "is_pinned",
-      "fieldtype": "Check",
-      "label": "Pinned",
-      "default": "0"
-    },
-    {
-      "fieldname": "pending_action_json",
-      "fieldtype": "Long Text",
-      "label": "Pending Action JSON",
-      "hidden": 1,
-      "read_only": 1
-    }
-  ],
-  "permissions": [
-    {
-      "role": "System Manager",
-      "read": 1,
-      "write": 1,
-      "create": 1,
-      "delete": 1
-    }
-  ]
+ "doctype": "DocType",
+ "name": "AI Conversation",
+ "module": "ERP AI Assistant",
+ "custom": 0,
+ "istable": 0,
+ "track_changes": 1,
+ "autoname": "hash",
+ "fields": [
+  {
+   "fieldname": "title",
+   "fieldtype": "Long Text",
+   "label": "Title",
+   "reqd": 1
+  },
+  {
+   "fieldname": "status",
+   "fieldtype": "Select",
+   "label": "Status",
+   "options": "Open\nArchived",
+   "default": "Open"
+  },
+  {
+   "fieldname": "is_pinned",
+   "fieldtype": "Check",
+   "label": "Pinned",
+   "default": "0"
+  },
+  {
+   "fieldname": "pending_action_json",
+   "fieldtype": "Long Text",
+   "label": "Pending Action JSON",
+   "hidden": 1,
+   "read_only": 1
+  }
+ ],
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "export": 1
+  },
+  {
+   "role": "All",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 0,
+   "if_owner": 1
+  }
+ ]
 }

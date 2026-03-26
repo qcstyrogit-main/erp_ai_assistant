@@ -21,6 +21,7 @@ from .erp_tools import (
     update_erp_document_internal,
 )
 from .file_tools import export_doctype_list_excel_internal, export_employee_list_excel_internal, generate_document_pdf_internal
+from .security import clamp_limit, ensure_doctype_access, ensure_document_access, permission_summary, require_destruction_confirmation
 
 
 def _tool_ping_assistant(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -109,7 +110,7 @@ def _tool_search_erp_documents(arguments: dict[str, Any]) -> dict[str, Any]:
     return search_erp_documents_internal(
         query=arguments.get("query"),
         doctype=arguments.get("doctype"),
-        limit=arguments.get("limit", 10),
+        limit=arguments.get("limit", 20),
     )
 
 
@@ -159,8 +160,9 @@ def _tool_run_workflow_action(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_get_document(arguments: dict[str, Any]) -> dict[str, Any]:
+    ensure_doctype_access(arguments["doctype"], "read")
     doc = frappe.get_doc(arguments["doctype"], arguments["name"])
-    doc.check_permission("read")
+    ensure_document_access(doc, "read")
     data = doc.as_dict()
     fields = arguments.get("fields")
     if fields:
@@ -170,41 +172,60 @@ def _tool_get_document(arguments: dict[str, Any]) -> dict[str, Any]:
         "doctype": arguments["doctype"],
         "name": arguments["name"],
         "data": data,
+        "permissions": permission_summary(arguments["doctype"]),
         "message": f"{arguments['doctype']} '{arguments['name']}' retrieved successfully",
     }
 
-
 def _tool_list_documents(arguments: dict[str, Any]) -> dict[str, Any]:
     doctype = arguments["doctype"]
+    ensure_doctype_access(doctype, "read")
     filters = arguments.get("filters") or {}
-    fields = arguments.get("fields") or ["name"]
-    limit = arguments.get("limit", 20)
+    fields = arguments.get("fields") or ["name", "modified"]
+    limit = clamp_limit(arguments.get("limit", 20))
     order_by = arguments.get("order_by") or "modified desc"
 
-    data = frappe.get_all(
+    data = frappe.get_list(
         doctype,
         filters=filters,
         fields=fields,
         limit_page_length=limit,
         order_by=order_by,
     )
-    total_count = frappe.db.count(doctype, filters=filters)
     return {
         "success": True,
         "doctype": doctype,
         "data": data,
         "count": len(data),
-        "total_count": total_count,
-        "has_more": total_count > len(data),
+        "returned_limit": limit,
         "filters_applied": filters,
-        "message": f"Found {len(data)} {doctype} records",
+        "permissions": permission_summary(doctype),
+        "message": f"Found {len(data)} permitted {doctype} records",
     }
-
 
 def _tool_create_document(arguments: dict[str, Any]) -> dict[str, Any]:
     doctype = arguments["doctype"]
+    ensure_doctype_access(doctype, "create")
     data = dict(arguments["data"])
     data["doctype"] = doctype
+
+    if doctype == "Payment Entry":
+        result = create_erp_document_internal(doctype=doctype, values=data)
+        if not result.get("ok"):
+            return {
+                "success": False,
+                "doctype": doctype,
+                "message": str(result.get("message") or "Payment Entry creation failed"),
+                "error": str(result.get("message") or "Payment Entry creation failed"),
+            }
+        return {
+            "success": True,
+            "name": result.get("name"),
+            "doctype": result.get("doctype") or doctype,
+            "docstatus": 0,
+            "submitted": False,
+            "can_submit": True,
+            "message": f"{doctype} '{result.get('name')}' created successfully as draft",
+        }
 
     doc = frappe.get_doc(data)
     if arguments.get("validate_only"):
@@ -217,8 +238,20 @@ def _tool_create_document(arguments: dict[str, Any]) -> dict[str, Any]:
         }
 
     doc.insert()
+    submitted = False
     if arguments.get("submit") and getattr(doc, "docstatus", 0) == 0 and hasattr(doc, "submit"):
+        if not arguments.get("confirmed_submit"):
+            return {
+                "success": True,
+                "name": doc.name,
+                "doctype": doc.doctype,
+                "docstatus": doc.docstatus,
+                "submitted": False,
+                "message": f"{doctype} was created as draft. Re-run with confirmed_submit=true to submit.",
+            }
+        ensure_document_access(doc, "submit")
         doc.submit()
+        submitted = True
 
     return {
         "success": True,
@@ -227,15 +260,15 @@ def _tool_create_document(arguments: dict[str, Any]) -> dict[str, Any]:
         "docstatus": doc.docstatus,
         "owner": doc.owner,
         "creation": doc.creation,
-        "submitted": doc.docstatus == 1,
+        "submitted": submitted,
         "can_submit": hasattr(doc, "submit"),
         "message": f"{doctype} '{doc.name}' created successfully as {'submitted' if doc.docstatus == 1 else 'draft'}",
     }
 
-
 def _tool_update_document(arguments: dict[str, Any]) -> dict[str, Any]:
+    ensure_doctype_access(arguments["doctype"], "write")
     doc = frappe.get_doc(arguments["doctype"], arguments["name"])
-    doc.check_permission("write")
+    ensure_document_access(doc, "write")
     for key, value in (arguments.get("data") or {}).items():
         doc.set(key, value)
     doc.save()
@@ -249,10 +282,13 @@ def _tool_update_document(arguments: dict[str, Any]) -> dict[str, Any]:
         "data": doc.as_dict(),
     }
 
-
 def _tool_delete_document(arguments: dict[str, Any]) -> dict[str, Any]:
     doctype = arguments["doctype"]
     name = arguments["name"]
+    ensure_doctype_access(doctype, "delete")
+    doc = frappe.get_doc(doctype, name)
+    ensure_document_access(doc, "delete")
+    require_destruction_confirmation(arguments, action=f"Deleting {doctype} '{name}'")
     frappe.delete_doc(doctype, name)
     return {
         "success": True,
@@ -261,12 +297,13 @@ def _tool_delete_document(arguments: dict[str, Any]) -> dict[str, Any]:
         "message": f"{doctype} '{name}' deleted successfully",
     }
 
-
 def _tool_get_doctype_info(arguments: dict[str, Any]) -> dict[str, Any]:
+    ensure_doctype_access(arguments["doctype"], "read")
     meta = frappe.get_meta(arguments["doctype"])
     return {
         "doctype": meta.name,
         "module": meta.module,
+        "permissions": permission_summary(meta.name),
         "fields": [
             {
                 "fieldname": field.fieldname,
@@ -279,36 +316,39 @@ def _tool_get_doctype_info(arguments: dict[str, Any]) -> dict[str, Any]:
         ],
     }
 
-
 def _tool_search_documents(arguments: dict[str, Any]) -> Any:
     if arguments.get("doctype") and arguments.get("txt"):
+        ensure_doctype_access(arguments["doctype"], "read")
         return frappe.call(
             "frappe.desk.search.search_link",
             doctype=arguments["doctype"],
             txt=arguments["txt"],
             filters=arguments.get("filters"),
-            page_length=arguments.get("page_length", 10),
+            page_length=clamp_limit(arguments.get("page_length", 10), default=10, maximum=50),
         )
 
     query = arguments.get("query")
     if not query:
         raise ValueError("search_documents requires either (doctype + txt) or query")
 
-    return frappe.get_all(
-        "Global Search",
-        filters={"content": ["like", f"%{query}%"]},
-        fields=["doctype", "name", "title", "content"],
-        limit_page_length=arguments.get("page_length", 20),
+    if not arguments.get("doctype"):
+        raise frappe.ValidationError("For production safety, generic global search requires a doctype.")
+
+    ensure_doctype_access(arguments["doctype"], "read")
+    return frappe.get_list(
+        arguments["doctype"],
+        filters=arguments.get("filters") or {},
+        fields=["name", "modified"],
+        limit_page_length=clamp_limit(arguments.get("page_length", 20), default=20, maximum=50),
         order_by="modified desc",
     )
-
 
 def _tool_generate_report(arguments: dict[str, Any]) -> Any:
     report_name = arguments["report_name"]
     filters = arguments.get("filters") or {}
+    if not frappe.has_permission("Report", ptype="read"):
+        raise frappe.PermissionError("User does not have permission to run reports.")
     return frappe.get_attr("frappe.desk.query_report.run")(report_name=report_name, filters=filters)
-
-
 INTERNAL_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     "ping_assistant": {
         "description": "Check whether the ERP AI Assistant backend is ready",
@@ -398,31 +438,31 @@ INTERNAL_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "handler": _tool_create_purchase_order,
     },
     "create_erp_document": {
-        "description": "Create a document using metadata-aware field mapping for allowed ERP doctypes",
+        "description": "Create a document using metadata-aware field mapping for ERP doctypes permitted by site permissions",
         "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "values": {"type": "object"}}, "required": ["doctype", "values"]},
         "category": "write",
         "handler": _tool_create_erp_document,
     },
     "update_erp_document": {
-        "description": "Safely update an allowed ERP document field using metadata-aware field resolution",
+        "description": "Safely update an ERP document field using metadata-aware field resolution and site permissions",
         "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "record": {"type": "string"}, "field": {"type": "string"}, "value": {}}, "required": ["doctype", "record", "field", "value"]},
         "category": "write",
         "handler": _tool_update_erp_document,
     },
     "list_erp_documents": {
-        "description": "List documents from the safe ERP catalog",
+        "description": "List ERP documents using metadata-driven fields and site permissions",
         "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "filters": {"type": "object"}, "limit": {"type": "integer", "default": 20}}, "required": ["doctype"]},
         "category": "read",
         "handler": _tool_list_erp_documents,
     },
     "list_erp_doctypes": {
         "description": "List DocTypes available in this ERP instance",
-        "inputSchema": {"type": "object", "properties": {"search": {"type": "string"}, "module": {"type": "string"}, "limit": {"type": "integer", "default": 100}}},
+        "inputSchema": {"type": "object", "properties": {"search": {"type": "string"}, "module": {"type": "string"}, "limit": {"type": "integer", "default": 200}}},
         "category": "resource",
         "handler": _tool_list_erp_doctypes,
     },
     "get_erp_document": {
-        "description": "Get a single document from the safe ERP catalog",
+        "description": "Get a single ERP document using site permissions",
         "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "name": {"type": "string"}}, "required": ["doctype", "name"]},
         "category": "read",
         "handler": _tool_get_erp_document,
@@ -440,13 +480,13 @@ INTERNAL_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "handler": _tool_describe_erp_schema,
     },
     "search_erp_documents": {
-        "description": "Search documents from the safe ERP catalog",
+        "description": "Search ERP documents using metadata-driven search fields and site permissions",
         "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "doctype": {"type": "string"}, "limit": {"type": "integer", "default": 10}}, "required": ["query"]},
         "category": "read",
         "handler": _tool_search_erp_documents,
     },
     "export_doctype_list_excel": {
-        "description": "Generate an Excel file for a safe ERP doctype list",
+        "description": "Generate an Excel file for an ERP DocType list using metadata and site permissions",
         "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "filters": {"type": "object"}, "fields": {"type": "array", "items": {"type": "string"}}}, "required": ["doctype"]},
         "category": "file",
         "handler": _tool_export_doctype_list_excel,
@@ -494,8 +534,8 @@ INTERNAL_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "handler": _tool_list_documents,
     },
     "create_document": {
-        "description": "Create a Frappe document",
-        "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "data": {"type": "object"}, "submit": {"type": "boolean", "default": False}, "validate_only": {"type": "boolean", "default": False}}, "required": ["doctype", "data"]},
+        "description": "Create a Frappe document, defaulting to draft-first behavior",
+        "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "data": {"type": "object"}, "submit": {"type": "boolean", "default": False}, "confirmed_submit": {"type": "boolean", "default": False}, "validate_only": {"type": "boolean", "default": False}}, "required": ["doctype", "data"]},
         "category": "write",
         "handler": _tool_create_document,
     },
@@ -506,8 +546,8 @@ INTERNAL_TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "handler": _tool_update_document,
     },
     "delete_document": {
-        "description": "Delete a Frappe document",
-        "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "name": {"type": "string"}}, "required": ["doctype", "name"]},
+        "description": "Delete a Frappe document after explicit confirmation",
+        "inputSchema": {"type": "object", "properties": {"doctype": {"type": "string"}, "name": {"type": "string"}, "confirmed": {"type": "boolean", "default": False}, "confirmation_text": {"type": "string"}}, "required": ["doctype", "name"]},
         "category": "destructive",
         "handler": _tool_delete_document,
     },

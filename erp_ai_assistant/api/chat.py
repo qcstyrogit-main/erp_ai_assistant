@@ -44,11 +44,13 @@ def list_conversations(search: str | None = None):
     if not _chat_storage_ready():
         return []
 
-    filters = {"owner": frappe.session.user}
+    # System Managers can see all conversations; everyone else only sees their own.
+    is_system_manager = "System Manager" in frappe.get_roles(frappe.session.user)
+    filters = {} if is_system_manager else {"owner": frappe.session.user}
     rows = frappe.get_all(
         "AI Conversation",
         filters=filters,
-        fields=["name", "title", "is_pinned", "modified", "status"],
+        fields=["name", "title", "is_pinned", "modified", "status", "owner"],
         order_by="is_pinned desc, modified desc",
     )
     if search:
