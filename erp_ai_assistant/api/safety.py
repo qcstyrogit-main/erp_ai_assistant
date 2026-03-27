@@ -16,6 +16,10 @@ MEDIUM_RISK_TOOLS = {
     "create_erp_document",
     "update_document",
     "update_erp_document",
+    # Transaction-creating tools — have financial/stock impact; require doctype-level risk gate
+    "create_sales_order",
+    "create_purchase_order",
+    "create_quotation",
 }
 
 HIGH_RISK_DOCTYPES = {

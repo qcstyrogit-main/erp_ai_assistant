@@ -1,6 +1,6 @@
 app_name = "erp_ai_assistant"
 app_title = "ERP AI Assistant"
-app_publisher = "OpenAI"
+app_publisher = "ERP AI Assistant"
 app_description = "FAC-backed ERP copilot for ERPNext/Frappe"
 app_email = "support@example.com"
 app_license = "MIT"

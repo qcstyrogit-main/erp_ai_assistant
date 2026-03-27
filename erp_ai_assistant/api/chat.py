@@ -142,7 +142,6 @@ def delete_conversation(name: str):
     return {"ok": True}
 
 
-@frappe.whitelist()
 def add_message(
     conversation: str,
     role: str,

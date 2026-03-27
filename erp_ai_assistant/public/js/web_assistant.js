@@ -956,6 +956,44 @@
       this.stopProgressPolling();
       this.showProgress(["Preparing response"], "", { stage: "working", done: false });
       if (!conversationName) return;
+
+      // ── Realtime listener (Socket.IO) ─────────────────────────────────────
+      const realtimeHandler = (data) => {
+        if (!data || String(data.conversation || "").trim() !== conversationName) return;
+        const steps = Array.isArray(data.steps) ? data.steps : [];
+        const stage = String(data.stage || "").trim().toLowerCase();
+        if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) return;
+        this.showProgress(steps, data.partial_text || "", { stage, done: !!data.done });
+        if (data.done) {
+          this.stopProgressPolling();
+          if (data.error) {
+            this.finishPromptRun(null, { keepMessages: true });
+            this.renderSystemMessage(data.error || "Request failed");
+            this.updateStatus("Request failed.");
+            return;
+          }
+          frappe.call({
+            method: "erp_ai_assistant.api.ai.get_prompt_result",
+            args: { conversation: conversationName },
+            callback: (resultResponse) => {
+              const result = resultResponse?.message || {};
+              logAssistantDebug(result);
+              if (result.done && String(result.reply || "").trim()) {
+                this.queueOptimisticAssistantMessage(conversationName, result.reply);
+                this.renderMessages(this.getConversationMessages(conversationName));
+              }
+              this.finishPromptRun(conversationName);
+            },
+            error: () => this.finishPromptRun(conversationName),
+          });
+        }
+      };
+
+      this._realtimeProgressHandler = realtimeHandler;
+      this._realtimeProgressConversation = conversationName;
+      try { frappe.realtime.on("erp_ai_progress", realtimeHandler); } catch (e) { /* polling covers it */ }
+
+      // ── Polling fallback (800 ms) ─────────────────────────────────────────
       const pollProgress = () => {
         if (this.progressPollPending) return;
         this.progressPollPending = true;
@@ -1007,6 +1045,11 @@
         this.progressPollTimer = null;
       }
       this.progressPollPending = false;
+      if (this._realtimeProgressHandler) {
+        try { frappe.realtime.off("erp_ai_progress", this._realtimeProgressHandler); } catch (e) { /* ignore */ }
+        this._realtimeProgressHandler = null;
+        this._realtimeProgressConversation = null;
+      }
       this.hideProgress();
     }
 

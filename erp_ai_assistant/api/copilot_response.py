@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 import re
 import frappe
-from frappe.utils import getdate, nowdate, formatdate
+from frappe.utils import getdate, nowdate, formatdate, fmt_money
 
 
 COMMON_SUMMARY_FIELDS = [
@@ -50,12 +50,13 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _as_money(value: Any) -> str:
+def _as_money(value: Any, currency: str | None = None) -> str:
     if value in (None, ""):
         return "—"
     try:
         number = float(value)
-        return f"₱{number:,.2f}"
+        site_currency = currency or frappe.db.get_default("currency") or "USD"
+        return fmt_money(number, currency=site_currency)
     except Exception:
         return str(value)
 

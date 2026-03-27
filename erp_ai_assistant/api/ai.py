@@ -24,6 +24,28 @@ from .rate_limit import check_rate_limit
 
 from .tool_aliases import resolve_tool_name as _resolve_tool_name
 
+# ── Config module (PRODUCTION_REFACTOR_NOTES.md Step 1) ─────────────────────
+# All configuration helpers have been extracted to ai_config.py.
+# The definitions below (lines ~40–283) remain as local copies for now so that
+# existing code inside this file continues to work without changes.
+# In the next cleanup pass, delete the in-file copies and replace with:
+#   from .ai_config import _cfg, _cfg_int, _cfg_float, _cfg_bool, _llm_*, DEFAULT_*
+from .ai_config import (  # noqa: F401 — re-exported for external callers
+    DEFAULT_ANTHROPIC_MAX_TOKENS,
+    DEFAULT_ANTHROPIC_MAX_TOOL_ROUNDS,
+    DEFAULT_ANTHROPIC_REQUEST_TIMEOUT,
+    DEFAULT_ANTHROPIC_STREAM,
+    DEFAULT_ANTHROPIC_TEMPERATURE,
+    DEFAULT_ANTHROPIC_TOP_P,
+    DEFAULT_ANTHROPIC_VISION_MODEL,
+    DEFAULT_CONVERSATION_HISTORY_LIMIT,
+    DEFAULT_FORCE_TOOL_USE,
+    DEFAULT_OPENAI_MODEL,
+    DEFAULT_OPENAI_RESPONSES_PATH,
+    DEFAULT_VERIFY_PASS,
+)
+
+
 # Kept for backward compatibility — callers that do TOOL_NAME_MAP.get(name, name)
 # will now get the registry-resolved value.
 class _ToolNameMap:
@@ -546,8 +568,12 @@ def _is_sample_data_request(prompt: str, context: Optional[dict[str, Any]] = Non
     if any(term in text for term in strong_indicators):
         return True
 
-    if "realistic" in text and "create" in text and ("records" in text or "rows" in text):
+    if "realistic" in text and "create" in text and (
+        any(qualifier in text for qualifier in ("sample", "dummy", "mock", "fake", "test", "fictional", "placeholder"))
+        and ("records" in text or "rows" in text or "data" in text)
+    ):
         return True
+
 
     return False
 
@@ -1367,29 +1393,48 @@ def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = Non
     target_doctype = _resolved_prompt_doctype(prompt, current)
     intent = _resolved_erp_intent(prompt, current)
     user_execution_context = _build_user_execution_context(prompt, current)
+
+    # ── Base sections — always included ─────────────────────────────────────
     lines = [
         _system_identity_rules(),
         _system_tool_use_rules(),
         _system_erp_fac_rules(),
         _system_resource_rules(),
         _system_tool_trigger_rules(),
-        _system_data_validation_rules(),
-        _system_bulk_execution_rules(),
         _system_response_format_rules(),
-        _system_doctype_specific_rules(),
         _system_role_and_scope_rules(prompt, current),
         _tool_catalog_summary(prompt, current),
         _resource_catalog_summary(prompt, current),
         _tool_access_summary(prompt, current),
     ]
-    # sample_data_mode no longer bypasses FAC tools — creation intent always uses tools
+
+    # ── Conditional sections — only when relevant ────────────────────────────
+    # Data-validation rules: only needed for write/create/update/workflow/bulk
+    # intents where the risk of bad field values is real.  Skipping for reads
+    # and reports saves ~1 KB on the majority of queries.
+    _write_intents = {"create", "update", "workflow", "bulk", "bulk_create", "delete"}
+    if intent in _write_intents or _has_write_intent(prompt):
+        lines.append(_system_data_validation_rules())
+
+    # Bulk-execution rules: only when the prompt is actually a bulk operation.
+    # (They are also dynamically appended below with a document count, so the
+    # static copy in the base list was redundant on non-bulk requests.)
+    if bulk_mode:
+        lines.append(_system_bulk_execution_rules())
+
+    # Doctype-specific rules: only when a doctype is already resolved from
+    # context or the prompt.  On General/home views this block is ~2 KB of
+    # irrelevant Material-Request / Sales-Invoice guidance.
+    if target_doctype or current.get("doctype"):
+        lines.append(_system_doctype_specific_rules())
+
+    # ── Dynamic context appends ──────────────────────────────────────────────
     if bulk_mode:
         _bulk_prompt_text = str(prompt or "").strip().lower()
         _bulk_create_verbs = ("create", "add", "insert", "generate", "make", "build")
         if any(v in _bulk_prompt_text for v in _bulk_create_verbs):
             _n_docs = 0
-            import re as _re_bulk
-            _m_bulk = _re_bulk.search(r"\b(\d+)\b", str(prompt or ""))
+            _m_bulk = re.search(r"\b(\d+)\b", str(prompt or ""))
             if _m_bulk:
                 _n_docs = int(_m_bulk.group(1))
             lines.append(
@@ -1419,6 +1464,7 @@ def _erp_tool_system_prompt(prompt: str, context: Optional[dict[str, Any]] = Non
     )
     lines.append(f"Current context: doctype={current.get('doctype')}, docname={current.get('docname')}, route={current.get('route')}.")
     return " ".join(line.strip() for line in lines if str(line or "").strip())
+
 
 
 def _request_focus_summary(prompt: str, context: Optional[dict[str, Any]] = None) -> str:
@@ -1468,8 +1514,15 @@ def _llm_user_prompt(prompt: str, context: Optional[dict[str, Any]] = None) -> s
         "Ask only for the minimum missing information if the request is blocked. "
         "Summarize tool results clearly using Markdown formatting. "
         "Do not reveal internal reasoning, raw tool output, JSON, XML, or hidden tags such as <think>. "
-        "Never generate fictional, placeholder, or invented ERP data — always use live FAC tools to fetch and create real values."
+        "Never generate fictional, placeholder, or invented ERP data — always use live FAC tools to fetch and create real values. "
+        # ── Accuracy rules (mirrors verify-pass) ──────────────────────────────
+        "ACCURACY RULES: "
+        "(1) State which FAC tool produced each fact you report (e.g. 'list_documents returned 5 invoices'). "
+        "(2) Quote all numbers, totals, amounts, and dates VERBATIM from tool output — never round or estimate. "
+        "(3) If a value was not present in any tool result, say so explicitly rather than inferring it. "
+        "Prior [Model-only] history messages should be treated as unverified context, not as authoritative ERP data."
     ).strip()
+
 
 
 def _tool_priority_key(name: str) -> tuple[int, str]:
@@ -1693,16 +1746,26 @@ def _resource_runtime_manifest(prompt: str, context: Optional[dict[str, Any]] = 
 
 
 def _verification_prompt(tool_events: list[str]) -> str:
-    recent = tool_events[-5:]
+    recent = tool_events[-8:]
     recent_lines = "\n".join(f"- {event}" for event in recent) or "- none"
     return (
-        "Verification pass required before final answer.\n"
-        "1) Re-check whether your current conclusion is fully supported by tool results.\n"
-        "2) If evidence is missing or inconsistent, call additional tools now.\n"
-        "3) If evidence is sufficient, return the final answer with concrete values and avoid guesses.\n"
-        "Recent tool activity:\n"
+        "Verification pass — review your answer against the tool evidence before replying.\n\n"
+        "Rules you MUST follow:\n"
+        "1. **Numeric precision**: Every number, total, count, amount, quantity, or date in your response "
+        "must be quoted VERBATIM from the tool output above. Do NOT round, estimate, or paraphrase numeric values.\n"
+        "2. **Cite your source**: For every factual claim, state which tool produced it "
+        '(e.g. "list_documents returned 12 open orders" not just "there are 12 open orders").\n'
+        "3. **No inference on absent data**: If a field, value, or record was NOT present in any tool result, "
+        "say so explicitly. Do NOT invent, extrapolate, or assume values that were not returned.\n"
+        "4. **Correct prior contradictions**: If your earlier response in this conversation conflicts with the "
+        "tool results you now have, the tool results take priority. Correct the discrepancy explicitly.\n\n"
+        "Action:\n"
+        "- If evidence is insufficient or inconsistent → call the missing tools now.\n"
+        "- If evidence is complete → return the final verified answer, following all 4 rules above.\n\n"
+        "Recent tool results:\n"
         f"{recent_lines}"
     )
+
 
 
 def _no_tools_available_response(prompt: str, context: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -1773,6 +1836,7 @@ def _progress_update(
         "model": progress.get("model"),
         "partial_text": partial_text if partial_text is not None else progress.get("partial_text"),
         "updated_at": frappe.utils.now(),
+        "conversation": conversation,
     }
     progress["partial_text"] = payload.get("partial_text")
     expires_in_sec = 300 if done else 900
@@ -1781,6 +1845,21 @@ def _progress_update(
         json.dumps(payload, default=str),
         expires_in_sec=expires_in_sec,
     )
+    # ── Realtime push (Socket.IO) ────────────────────────────────────────────
+    # Publish to the specific user so the frontend can react instantly without
+    # waiting for the next poll tick.  The Redis cache write above is the
+    # fallback for clients that are polling but not yet subscribed.
+    try:
+        frappe.publish_realtime(
+            event="erp_ai_progress",
+            message=payload,
+            user=user,
+            after_commit=False,
+        )
+    except Exception:
+        pass  # realtime is best-effort; polling fallback remains active
+
+
 
 
 def _set_prompt_result(
@@ -2508,35 +2587,83 @@ def _append_related_links(text: str, prompt: str, payload: Any, all_payloads: li
     if any(v in _prompt_lower for v in _write_verbs):
         return base
 
-    lines = [base] if base else []
-    lines.extend(["", "Open links:"])
-    for label, url, _kind in combined_targets:
-        lines.append(f"- [{label}]({url})")
-    return "\n".join(lines).strip()
+    return base
 
 
 def _is_erp_intent(prompt: str, context: dict[str, Any]) -> bool:
     text = (prompt or "").strip().lower()
     if _is_instructional_request(prompt) or _is_sample_data_request(prompt, context):
         return False
+
+    # ── Fast paths ────────────────────────────────────────────────────────────
+    # Active document context → always ERP regardless of wording
+    if _has_active_document_context(context):
+        return True
     if _resolved_prompt_doctype(prompt, context):
         return True
+
     if not text:
         return False
+
+    # ── Document reference codes (PO-XXXX, SI-XXXX, etc.) ────────────────────
+    # Users type these directly without any ERP noun context.
+    import re as _re_intent
+    doc_code_pattern = (
+        r"\b(?:po|so|si|pi|pr|dn|qtn|mr|mtn|hr|lr|jv|pe|acc|inv|crm|ser|bat)"
+        r"[-/]\d{4,}"
+    )
+    if _re_intent.search(doc_code_pattern, text):
+        return True
+
+    # ── Indirect / conversational ERP phrasing ───────────────────────────────
+    indirect_phrases = (
+        "pull up", "can you check", "can you get", "can you find", "can you show",
+        "look up", "look for", "tell me about", "what is the", "what are the",
+        "how many", "how much", "what's the status", "what's the balance",
+        "give me", "fetch", "retrieve", "display", "open the", "show the",
+        "outstanding", "balance", "overdue", "aging", "pending", "due date",
+        "total", "amount", "quantity", "available", "on hand",
+    )
+    if any(phrase in text for phrase in indirect_phrases):
+        # Only treat as ERP if there's also a data noun nearby
+        erp_nouns_short = (
+            "customer", "supplier", "employee", "item", "invoice", "order",
+            "quotation", "payment", "balance", "stock", "warehouse", "report",
+            "sales", "purchase", "account", "record",
+        )
+        if any(noun in text for noun in erp_nouns_short):
+            return True
+
+    # ── Follow-up pronoun queries (short completions after context is set) ────
+    # e.g. "And that invoice?", "What about it?", "Show me those records"
+    tokens = text.split()
+    if len(tokens) <= 8:
+        follow_up_pronouns = ("it", "that", "this", "those", "these", "the document",
+                              "the record", "the invoice", "the order", "the entry")
+        if any(phrase in text for phrase in follow_up_pronouns):
+            if context.get("doctype") or context.get("route"):
+                return True
+
+    # ── Expanded ERP keyword list ─────────────────────────────────────────────
     erp_markers = (
         "customer", "supplier", "employee", "item", "invoice", "order",
         "quotation", "lead", "opportunity", "report", "dashboard", "chart",
         "doctype", "workflow", "erp", "sales", "purchase", "stock",
         "accounts", "hr",
-        # additional markers for broader intent detection
         "material request", "material transfer", "material issue",
         "stock entry", "journal entry", "payment entry",
         "delivery note", "purchase receipt", "purchase order", "sales order",
         "warehouse", "company", "entries", "records", "documents",
         "create", "update", "submit", "approve", "reject",
         "export", "excel", "pdf", "word", "csv", "download",
+        # Additional high-confidence ERP terms
+        "ledger", "trial balance", "profit and loss", "balance sheet",
+        "payroll", "attendance", "leave", "expense", "asset", "depreciation",
+        "batch", "serial no", "bom", "production", "work order",
+        "cost center", "project", "task", "timesheet",
     )
     return any(marker in text for marker in erp_markers)
+
 
 
 def _fallback_model_candidates(selected_model: str | None = None) -> list[str]:
@@ -2722,14 +2849,40 @@ def _tool_round_limit_response(
             "tool_events": tool_events,
             "payload": rendered_payload,
         }
+    # ── Build a state summary from completed tool events ───────────────────
+    completed_steps = []
+    for raw_event in tool_events:
+        try:
+            ev = json.loads(raw_event) if isinstance(raw_event, str) else raw_event
+            tool_label = str(ev.get("tool") or ev.get("name") or "").strip()
+            status = str(ev.get("status") or "ok").strip().lower()
+            if tool_label and status == "ok":
+                completed_steps.append(tool_label)
+        except Exception:
+            pass
+
+    if completed_steps:
+        step_list = "\n".join(f"  • {s}" for s in completed_steps[-10:])
+        summary = (
+            f"The request could not be fully completed — the AI reached the maximum "
+            f"tool-call limit ({max_tool_rounds} rounds).\n\n"
+            f"**Completed steps ({len(completed_steps)}):**\n{step_list}\n\n"
+            "The remaining steps were not executed. No further changes were made after the limit was reached.\n\n"
+            "**Suggestion:** Break the request into smaller parts, or increase the tool-call limit in AI Provider Settings."
+        )
+    else:
+        summary = (
+            f"The request could not be completed — the AI loop reached the configured "
+            f"tool-call limit ({max_tool_rounds} rounds) before producing a final answer.\n\n"
+            "No ERP records were changed after this point.\n\n"
+            "**Suggestion:** Try a more specific prompt, or increase the tool-call limit in AI Provider Settings."
+        )
     return {
-        "text": (
-            f"I could not finish that request cleanly because the AI loop hit the configured tool-call limit ({max_tool_rounds}). "
-            "Please retry with a slightly narrower prompt."
-        ),
+        "text": summary,
         "tool_events": tool_events,
         "payload": None,
     }
+
 
 
 def _llm_chat_configured() -> bool:
@@ -2774,7 +2927,7 @@ def _conversation_history_for_llm(conversation_name: str, limit: int | None = No
     messages = frappe.get_all(
         "AI Message",
         filters={"conversation": conversation_name},
-        fields=["role", "content", "attachments_json"],
+        fields=["role", "content", "attachments_json", "tool_events"],
         order_by="creation desc",
         limit_page_length=max(1, effective_limit),
     )
@@ -2788,15 +2941,22 @@ def _conversation_history_for_llm(conversation_name: str, limit: int | None = No
             continue
         history_text = _merge_history_content_and_attachment_notes(content, attachment_notes)
         if role == "user":
-            history.append(
-                {
-                    "role": "user",
-                    "content": history_text,
-                }
-            )
+            history.append({"role": "user", "content": history_text})
         elif role == "assistant":
-            history.append({"role": "assistant", "content": history_text})
+            # ── Grounding tag ─────────────────────────────────────────────────
+            # Mark whether this response was backed by live ERP tool results.
+            # The LLM uses this to distinguish authoritative data from its own
+            # prior inferences, preventing cascading hallucination across turns.
+            tool_events_raw = row.get("tool_events") or ""
+            try:
+                tool_events_list = json.loads(tool_events_raw) if tool_events_raw else []
+            except Exception:
+                tool_events_list = []
+            is_tool_grounded = bool(tool_events_list)
+            grounding_prefix = "[Tool-grounded] " if is_tool_grounded else "[Model-only] "
+            history.append({"role": "assistant", "content": grounding_prefix + history_text})
     return history
+
 
 
 def _rerun_last_exportable_tool(

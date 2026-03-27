@@ -1,4 +1,4 @@
-/* ERP AI Assistant Styles - Modern UI */
+/* ERP AI Assistant Styles – Modern UI  */
 
 :root {
   --ai-primary: #d97757;
@@ -15,69 +15,86 @@
   --ai-shadow-lg: rgba(15, 23, 42, 0.22);
   --ai-border-radius: 16px;
   --ai-border-radius-lg: 24px;
-  --ai-transition: all 180ms cubic-bezier(0.4, 0, 0.2, 1);
+  --ai-transition: all 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  /* How many px the closed tab peeks out from the right edge */
+  --ai-tab-peek: 40px;
+  /* Full width of the extended tab (icon + label) */
+  --ai-tab-width: 140px;
 }
+
+/* ── Edge tab ──────────────────────────────────────────────────────────────── */
+/* The tab lives on the right edge, vertically centred.                        */
+/* Collapsed → only --ai-tab-peek width visible.                               */
+/* Hovered   → fully slides in.                                                */
+/* Drawer open → fades out completely (JS sets opacity 0 / pointer-events none)*/
 
 #erp-ai-assistant-bubble {
   position: fixed;
-  right: 24px;
-  bottom: 24px;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%) translateX(calc(var(--ai-tab-width) - var(--ai-tab-peek)));
   z-index: 1040;
   border: 0;
-  border-radius: var(--ai-border-radius-lg);
-  background: linear-gradient(135deg, var(--ai-primary), var(--ai-primary-dark));
+  border-radius: 14px 0 0 14px;       /* only left corners rounded – right sits flush with edge */
+  background: linear-gradient(160deg, var(--ai-primary), var(--ai-primary-dark));
   color: #fffaf5;
-  box-shadow: 0 14px 34px var(--ai-shadow);
-  display: inline-flex;
+  box-shadow: -4px 4px 24px var(--ai-shadow);
+  width: var(--ai-tab-width);
+  padding: 18px 12px;
+  display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 12px;
-  padding: 16px 20px;
-  font-weight: 600;
-  font-size: 14px;
-  line-height: 1.4;
+  justify-content: center;
+  gap: 10px;
   cursor: pointer;
-  transition: var(--ai-transition);
+  transition: transform 220ms cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 180ms ease,
+              box-shadow 180ms ease;
   user-select: none;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Pointer only on the visible peek area when collapsed */
+  pointer-events: all;
 }
 
+/* Slide fully in on hover */
 #erp-ai-assistant-bubble:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 16px 40px rgba(31, 41, 55, 0.28);
+  transform: translateY(-50%) translateX(0);
+  box-shadow: -6px 6px 32px rgba(31, 41, 55, 0.32);
 }
 
 #erp-ai-assistant-bubble:active {
-  transform: translateY(0);
-  box-shadow: 0 12px 30px rgba(31, 41, 55, 0.20);
+  box-shadow: -2px 2px 16px rgba(31, 41, 55, 0.28);
 }
 
-#erp-ai-assistant-bubble.is-hidden {
-  opacity: 0 !important;
-  pointer-events: none !important;
-  transform: translateY(12px) !important;
-  visibility: hidden !important;
-  display: none !important;
-}
+/* When drawer is open, JS sets opacity:0 / pointer-events:none inline */
 
 .erp-ai-assistant-bubble__icon {
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.20);
   font-size: 12px;
-  font-weight: 700;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+  font-weight: 800;
+  letter-spacing: 0;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+  flex-shrink: 0;
 }
 
 .erp-ai-assistant-bubble__label {
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: 0.5px;
+  writing-mode: vertical-rl;           /* rotated text for vertical tab */
+  text-orientation: mixed;
+  transform: rotate(180deg);           /* flip so it reads top-to-bottom */
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  white-space: nowrap;
+  opacity: 0.92;
 }
+
 
 #erp-ai-assistant-drawer {
   position: fixed;
@@ -116,50 +133,7 @@
   overflow: hidden;
 }
 
-.erp-ai-assistant-bubble__icon {
-  width: 28px;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 50%;
-  background: rgba(255, 255, 255, 0.16);
-  font-size: 12px;
-}
 
-#erp-ai-assistant-drawer {
-  position: fixed;
-  top: 16px;
-  right: 16px;
-  bottom: 16px;
-  width: min(980px, calc(100vw - 32px));
-  z-index: 1050;
-  display: flex;
-  background: #f6efe5;
-  border-radius: 24px;
-  overflow: hidden;
-  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.22);
-  transform: translateX(calc(100% + 40px));
-  transition: transform 180ms ease;
-  min-height: 0;
-}
-
-#erp-ai-assistant-drawer.is-open {
-  transform: translateX(0);
-}
-
-.erp-ai-assistant-drawer__sidebar {
-  flex: 0 0 280px;
-  background: #1f2937;
-  color: #f9f6f1;
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  min-height: 0;
-  min-width: 0;
-  border-right: 1px solid rgba(255, 255, 255, 0.08);
-}
 
 #erp-ai-assistant-drawer .erp-ai-assistant-drawer__sidebar {
   font-size: 14px;

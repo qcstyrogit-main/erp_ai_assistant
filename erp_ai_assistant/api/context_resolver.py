@@ -20,6 +20,7 @@ def build_request_context(
     docname: str | None = None,
     route: str | None = None,
     user: str | None = None,
+    target_module: str | None = None,
     base: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     context = dict(base or {})
@@ -31,4 +32,7 @@ def build_request_context(
         context["route"] = route
     if user is not None:
         context["user"] = user
+    if target_module is not None:
+        context["target_module"] = target_module
     return context
+

@@ -89,15 +89,19 @@
     }
 
     render() {
+      // ── Edge tab (replaces round floating bubble) ─────────────────────────────────
+      // The tab is a vertical pill affixed to the right edge.
+      // It peeks +4px when collapsed to signal its presence without blocking content.
+      // On hover it reveals the full label; on click it opens the drawer.
       const bubble = document.createElement("button");
       bubble.id = "erp-ai-assistant-bubble";
       bubble.className = "erp-ai-assistant-bubble";
+      bubble.setAttribute("aria-label", "Open AI Assistant");
+      bubble.setAttribute("title", "AI Assistant — click to open (Ctrl+Enter)");
       bubble.innerHTML = `
-        <span class="erp-ai-assistant-bubble__icon">AI</span>
+        <span class="erp-ai-assistant-bubble__icon" aria-hidden="true">AI</span>
         <span class="erp-ai-assistant-bubble__label">AI Assistant</span>
       `;
-      bubble.setAttribute("aria-label", "Open AI Assistant");
-      bubble.setAttribute("title", "AI Assistant\nClick to open\nCtrl+Enter: Quick open");
 
       const drawer = document.createElement("div");
       drawer.id = "erp-ai-assistant-drawer";
@@ -257,11 +261,18 @@
     toggleDrawer(forceState) {
       this.drawerOpen = typeof forceState === "boolean" ? forceState : !this.drawerOpen;
       this.elements.drawer?.classList.toggle("is-open", this.drawerOpen);
-      this.elements.bubble?.classList.toggle("is-hidden", this.drawerOpen);
+      // Edge tab: hide completely when drawer is open, restore when closed
       if (this.elements.bubble) {
-        this.elements.bubble.style.display = this.drawerOpen ? "none" : "inline-flex";
+        if (this.drawerOpen) {
+          this.elements.bubble.setAttribute("aria-hidden", "true");
+          this.elements.bubble.style.pointerEvents = "none";
+          this.elements.bubble.style.opacity = "0";
+        } else {
+          this.elements.bubble.removeAttribute("aria-hidden");
+          this.elements.bubble.style.pointerEvents = "";
+          this.elements.bubble.style.opacity = "";
+        }
       }
-
       if (this.drawerOpen) {
         this.updateContextHint();
         this.refreshHistory();
@@ -1677,6 +1688,55 @@
 
       if (!conversationName) return;
 
+      // ── Realtime listener (Socket.IO) ─────────────────────────────────────
+      // The backend calls frappe.publish_realtime("erp_ai_progress", ...) on
+      // every _progress_update call.  If Socket.IO is connected we handle the
+      // event instantly, making the UI feel streaming.  The poll loop below
+      // runs in parallel as a reliable fallback (e.g. WS disconnect, mobile).
+      const realtimeHandler = (data) => {
+        if (!data || String(data.conversation || "").trim() !== conversationName) return;
+        const steps = Array.isArray(data.steps) ? data.steps : [];
+        const stage = String(data.stage || "").trim().toLowerCase();
+        if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) return;
+        this._updateTypingSteps(steps, data.partial_text || "", { done: !!data.done });
+        if (data.done) {
+          this._stopProgressPolling();
+          if (data.error) {
+            this._finishPromptRun(null, { keepMessages: true });
+            frappe.show_alert({ message: data.error || "Assistant request failed", indicator: "red" });
+            return;
+          }
+          frappe.call({
+            method: "erp_ai_assistant.api.ai.get_prompt_result",
+            args: { conversation: conversationName },
+            callback: (resultResponse) => {
+              const result = resultResponse?.message || {};
+              if (result.done && String(result.reply || "").trim()) {
+                this._queueOptimisticAssistantMessage(conversationName, result.reply, {
+                  toolEvents: result.tool_events,
+                  attachments: result.attachments,
+                });
+                this._renderPendingConversation(conversationName);
+              }
+              this._finishPromptRun(conversationName);
+            },
+            error: () => {
+              this._finishPromptRun(conversationName);
+            },
+          });
+        }
+      };
+
+      // Store handler reference so _stopProgressPolling can remove it.
+      this._realtimeProgressHandler = realtimeHandler;
+      this._realtimeProgressConversation = conversationName;
+      try {
+        frappe.realtime.on("erp_ai_progress", realtimeHandler);
+      } catch (e) {
+        // frappe.realtime may not exist in all deployments — polling covers it.
+      }
+
+      // ── Polling fallback (800 ms) ─────────────────────────────────────────
       const pollProgress = () => {
         if (this.progressPollPending) return;
         this.progressPollPending = true;
@@ -1729,13 +1789,25 @@
       }, 800);
     }
 
+
     _stopProgressPolling() {
       if (this.progressPollTimer) {
         clearInterval(this.progressPollTimer);
         this.progressPollTimer = null;
       }
       this.progressPollPending = false;
+      // Clean up the realtime listener registered in _startProgressPolling.
+      if (this._realtimeProgressHandler) {
+        try {
+          frappe.realtime.off("erp_ai_progress", this._realtimeProgressHandler);
+        } catch (e) {
+          // ignore — realtime may not be available
+        }
+        this._realtimeProgressHandler = null;
+        this._realtimeProgressConversation = null;
+      }
     }
+
 
     _hideTypingIndicator() {
       const indicator = document.getElementById("erp-ai-assistant-typing");
