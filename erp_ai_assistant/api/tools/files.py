@@ -7,7 +7,7 @@ import frappe
 from frappe import _
 from frappe.utils.file_manager import save_file
 
-from .erp_tools import MUTATION_DOCTYPE_BLOCKLIST, resolve_doctype_name_internal
+from ..erp_tools import MUTATION_DOCTYPE_BLOCKLIST, resolve_doctype_name_internal
 from .export import _build_excel_bytes, _slugify_filename
 
 

@@ -1,501 +1,238 @@
 (function () {
-  window.__ERP_AI_WEB_ASSISTANT_BUILD__ = "2026-03-24-response-render-fix-v2";
+  window.__ERP_AI_WEB_ASSISTANT_BUILD__ = "2026-04-06-grounded-ux-v10";
 
-  function shouldShowToolActivity() {
-    try {
-      return window.localStorage?.getItem("erp_ai_assistant_debug_tools") === "1";
-    } catch (error) {
-      return false;
-    }
+  /* ── Utilities ─────────────────────────────────────────────────────────── */
+  function safeHtml(v) {
+    return String(v || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
+  function decodeHtml(v) { const t = document.createElement("textarea"); t.innerHTML = String(v || ""); return t.value; }
+  function isImageUrl(u) { const v = String(u || "").toLowerCase(); return v.startsWith("data:image/") || /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/.test(v); }
+  function filenameFromUrl(u) { try { return new URL(u, location.origin).pathname.split("/").filter(Boolean).pop() || "Image"; } catch { return "Image"; } }
+  function renderAnchor(u, l) { return `<a class="erp-web-assistant__link" href="${safeHtml(u)}" target="_blank" rel="noopener noreferrer">${safeHtml(l || u)}</a>`; }
+  function renderInlineImage(u, a) {
+    return `<figure class="erp-web-assistant__media"><a href="${safeHtml(u)}" target="_blank" rel="noopener noreferrer"><img class="erp-web-assistant__image" src="${safeHtml(u)}" alt="${safeHtml(a || "Image")}" loading="lazy" /></a><figcaption class="erp-web-assistant__caption">${safeHtml(a || "Image")}</figcaption></figure>`;
+  }
+  function upperWords(v) { return String(v || "").replace(/[_-]+/g, " ").replace(/\b\w/g, c => c.toUpperCase()).trim(); }
+  function logDebug(p) { const d = p?.debug; if (Array.isArray(d?.discovery_doctypes) && d.discovery_doctypes.length && window.console) console.info("[ERP AI] doctypes", d.discovery_doctypes); }
 
-  function logAssistantDebug(payload) {
-    const debug = payload && typeof payload === "object" ? payload.debug : null;
-    const doctypes = Array.isArray(debug?.discovery_doctypes) ? debug.discovery_doctypes : [];
-    if (!doctypes.length || !window.console) return;
-    console.info("[ERP AI Assistant] _get_discovery_doctypes()", doctypes);
-  }
-
-  function safeHtml(value) {
-    return String(value || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
-
-  function decodeHtml(value) {
-    const textarea = document.createElement("textarea");
-    textarea.innerHTML = String(value || "");
-    return textarea.value;
-  }
-
-  function isImageUrl(url) {
-    const value = String(url || "").toLowerCase();
-    return value.startsWith("data:image/") || /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/.test(value);
-  }
-
-  function filenameFromUrl(url) {
-    try {
-      const parsed = new URL(url, window.location.origin);
-      return parsed.pathname.split("/").filter(Boolean).pop() || "Image";
-    } catch (error) {
-      return "Image";
-    }
-  }
-
-  function renderAnchor(url, label) {
-    return `<a class="erp-web-assistant__link" href="${safeHtml(url)}" target="_blank" rel="noopener noreferrer">${safeHtml(label || url)}</a>`;
-  }
-
-  function renderInlineImage(url, alt) {
-    return `
-      <figure class="erp-web-assistant__media">
-        <a href="${safeHtml(url)}" target="_blank" rel="noopener noreferrer">
-          <img class="erp-web-assistant__image" src="${safeHtml(url)}" alt="${safeHtml(alt || "Image")}" loading="lazy" />
-        </a>
-        <figcaption class="erp-web-assistant__caption">${safeHtml(alt || "Image")}</figcaption>
-      </figure>
-    `;
-  }
-
-  function restoreTokens(text, tokens) {
-    return tokens.reduce(
-      (output, tokenHtml, index) => output.replaceAll(`__ERP_WEB_INLINE_${index}__`, tokenHtml).replaceAll(`__ERP_WEB_BLOCK_${index}__`, tokenHtml),
-      text
-    );
-  }
+  /* ── Markdown → HTML renderer ──────────────────────────────────────── */
+  function restoreTokens(t, tokens) { return tokens.reduce((o, h, i) => o.replaceAll(`__T${i}__`, h), t); }
 
   function renderInline(text) {
     const tokens = [];
-    let value = String(text || "");
-
-    value = value.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/)[^\s)]+|data:image\/[^\s)]+)\)/g, (_, alt, url) => {
-      const token = `__ERP_WEB_INLINE_${tokens.length}__`;
-      tokens.push(renderInlineImage(url, alt));
-      return token;
-    });
-
-    value = value.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, (_, label, url) => {
-      const token = `__ERP_WEB_INLINE_${tokens.length}__`;
-      tokens.push(renderAnchor(url, label));
-      return token;
-    });
-
-    value = value.replace(/`([^`]+)`/g, (_, code) => {
-      const token = `__ERP_WEB_INLINE_${tokens.length}__`;
-      tokens.push(`<code class="erp-web-assistant__inline-code">${safeHtml(code)}</code>`);
-      return token;
-    });
-
-    value = safeHtml(value);
-    value = value.replace(/\n/g, "<br>");
-    value = value.replace(/(https?:\/\/[^\s<]+)/g, (url) => {
-      const cleanUrl = decodeHtml(url);
-      const token = `__ERP_WEB_INLINE_${tokens.length}__`;
-      tokens.push(isImageUrl(cleanUrl) ? renderInlineImage(cleanUrl, filenameFromUrl(cleanUrl)) : renderAnchor(cleanUrl, cleanUrl));
-      return token;
-    });
-
-    return restoreTokens(value, tokens);
+    let v = String(text || "");
+    v = v.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|\/)[^\s)]+|data:image\/[^\s)]+)\)/g, (_, a, u) => { tokens.push(renderInlineImage(u, a)); return `__T${tokens.length - 1}__`; });
+    v = v.replace(/\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s)]+)\)/g, (_, l, u) => { tokens.push(renderAnchor(u, l)); return `__T${tokens.length - 1}__`; });
+    v = v.replace(/\*\*(.+?)\*\*/g, (_, b) => { tokens.push(`<strong>${safeHtml(b)}</strong>`); return `__T${tokens.length - 1}__`; });
+    v = v.replace(/`([^`]+)`/g, (_, c) => { tokens.push(`<code class="erp-web-assistant__inline-code">${safeHtml(c)}</code>`); return `__T${tokens.length - 1}__`; });
+    v = safeHtml(v).replace(/\n/g, "<br>");
+    v = v.replace(/(https?:\/\/[^\s<]+)/g, u => { const c = decodeHtml(u); tokens.push(isImageUrl(c) ? renderInlineImage(c, filenameFromUrl(c)) : renderAnchor(c, c)); return `__T${tokens.length - 1}__`; });
+    return restoreTokens(v, tokens);
   }
 
-  function looksLikeMarkdownTable(lines) {
-    if (!Array.isArray(lines) || lines.length < 2) return false;
-    const hasPipes = lines[0].includes("|") && lines[1].includes("|");
-    const separator = /^\s*\|?[\s:-]+(?:\|[\s:-]+)+\|?\s*$/;
-    return hasPipes && separator.test(lines[1]);
-  }
+  function looksLikeTable(lines) { return lines.length >= 2 && lines[0].includes("|") && lines[1].includes("|") && /^\s*\|?[\s:-]+(?:\|[\s:-]+)+\|?\s*$/.test(lines[1]); }
 
   function renderTable(lines) {
-    const rows = lines
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => line.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim()));
-
-    if (rows.length < 2) {
-      return `<p class="erp-web-assistant__paragraph">${renderInline(lines.join("\n"))}</p>`;
-    }
-
-    const headers = rows[0];
-    const bodyRows = rows.slice(2);
-    const thead = `<thead><tr>${headers.map((cell) => `<th>${renderInline(cell)}</th>`).join("")}</tr></thead>`;
-    const tbody = `<tbody>${bodyRows.map((row) => `<tr>${headers.map((_, index) => `<td>${renderInline(row[index] || "")}</td>`).join("")}</tr>`).join("")}</tbody>`;
-    return `<div class="erp-web-assistant__table-wrap"><table class="erp-web-assistant__table">${thead}${tbody}</table></div>`;
+    const rows = lines.map(l => l.trim()).filter(Boolean).map(l => l.replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => c.trim()));
+    if (rows.length < 2) return `<p class="erp-web-assistant__paragraph">${renderInline(lines.join("\n"))}</p>`;
+    const h = rows[0], b = rows.slice(2);
+    return `<div class="erp-web-assistant__table-wrap"><table class="erp-web-assistant__table"><thead><tr>${h.map(c => `<th>${renderInline(c)}</th>`).join("")}</tr></thead><tbody>${b.map(r => `<tr>${h.map((_, i) => `<td>${renderInline(r[i] || "")}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
   }
 
   function renderBlock(chunk) {
-    const trimmed = String(chunk || "").trim();
-    if (!trimmed) return "";
-
-    if (/^#{1,3}\s/.test(trimmed)) {
-      const level = Math.min(6, Math.max(3, (trimmed.match(/^#+/) || ["###"])[0].length + 2));
-      return `<h${level} class="erp-web-assistant__heading">${renderInline(trimmed.replace(/^#{1,3}\s*/, ""))}</h${level}>`;
-    }
-
-    const lines = trimmed.split("\n").map((line) => line.trimEnd());
-    if (looksLikeMarkdownTable(lines)) {
-      return renderTable(lines);
-    }
-    if (lines.every((line) => /^\s*[-*]\s+/.test(line))) {
-      return `<ul class="erp-web-assistant__list">${lines.map((line) => `<li>${renderInline(line.replace(/^\s*[-*]\s+/, ""))}</li>`).join("")}</ul>`;
-    }
-    if (lines.every((line) => /^\s*\d+\.\s+/.test(line))) {
-      return `<ol class="erp-web-assistant__list">${lines.map((line) => `<li>${renderInline(line.replace(/^\s*\d+\.\s+/, ""))}</li>`).join("")}</ol>`;
-    }
-    if (trimmed.startsWith(">")) {
-      const body = lines.map((line) => line.replace(/^\s*>\s?/, "")).join("\n");
-      return `<blockquote class="erp-web-assistant__quote">${renderInline(body)}</blockquote>`;
-    }
+    const t = String(chunk || "").trim();
+    if (!t) return "";
+    if (/^#{1,3}\s/.test(t)) { const lvl = Math.min(6, Math.max(3, (t.match(/^#+/) || ["###"])[0].length + 2)); return `<h${lvl} class="erp-web-assistant__heading">${renderInline(t.replace(/^#{1,3}\s*/, ""))}</h${lvl}>`; }
+    const lines = t.split("\n").map(l => l.trimEnd());
+    if (looksLikeTable(lines)) return renderTable(lines);
+    if (lines.every(l => /^\s*[-*]\s+/.test(l))) return `<ul class="erp-web-assistant__list">${lines.map(l => `<li>${renderInline(l.replace(/^\s*[-*]\s+/, ""))}</li>`).join("")}</ul>`;
+    if (lines.every(l => /^\s*\d+\.\s+/.test(l))) return `<ol class="erp-web-assistant__list">${lines.map(l => `<li>${renderInline(l.replace(/^\s*\d+\.\s+/, ""))}</li>`).join("")}</ol>`;
+    if (t.startsWith(">")) return `<blockquote class="erp-web-assistant__quote">${renderInline(lines.map(l => l.replace(/^\s*>\s?/, "")).join("\n"))}</blockquote>`;
     return `<p class="erp-web-assistant__paragraph">${renderInline(lines.join("\n"))}</p>`;
   }
 
   function renderRichText(content) {
     if (!content) return "";
     const tokens = [];
-    const withCodeTokens = String(content).replace(/```([\s\S]*?)```/g, (_, block) => {
-      const token = `__ERP_WEB_BLOCK_${tokens.length}__`;
-      tokens.push(`<pre class="erp-web-assistant__code-block"><code>${safeHtml(block || "")}</code></pre>`);
-      return token;
-    });
-
-    const rendered = withCodeTokens
-      .split(/\n{2,}/)
-      .map((chunk) => renderBlock(chunk))
-      .filter(Boolean)
-      .join("");
-
-    return restoreTokens(rendered, tokens);
+    const s = String(content).replace(/```([\s\S]*?)```/g, (_, b) => { tokens.push(`<pre class="erp-web-assistant__code-block"><code>${safeHtml(b || "")}</code></pre>`); return `__T${tokens.length - 1}__`; });
+    return restoreTokens(s.split(/\n{2,}/).map(renderBlock).filter(Boolean).join(""), tokens);
   }
 
-  function parseAttachmentPackage(raw) {
-    if (!raw) return { attachments: [], exports: {}, copilot: null };
-    try {
-      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      if (Array.isArray(parsed)) return { attachments: parsed.filter((item) => item && item.file_url), exports: {}, copilot: null };
-      if (parsed && typeof parsed === "object") {
-        return {
-          attachments: Array.isArray(parsed.attachments) ? parsed.attachments.filter((item) => item && item.file_url) : [],
-          exports: parsed.exports && typeof parsed.exports === "object" ? parsed.exports : {},
-          copilot: parsed.copilot && typeof parsed.copilot === "object" ? parsed.copilot : null,
-        };
-      }
-    } catch (error) {
-      return { attachments: [], exports: {}, copilot: null };
-    }
-    return { attachments: [], exports: {}, copilot: null };
+  /* ── Message header ────────────────────────────────────────────────── */
+  function renderMessageHeader(msg) {
+    const isUser = msg.role === "user";
+    const role = isUser ? "You" : "Assistant";
+    const roleClass = isUser ? "is-user-role" : "";
+    const timeLabel = msg.creation ? new Date(msg.creation).toLocaleString() : "";
+    const time = timeLabel ? `<span class="erp-web-assistant__msg-time">${safeHtml(timeLabel)}</span>` : "";
+    return `<div class="erp-web-assistant__message-head"><div class="erp-web-assistant__msg-meta"><span class="erp-web-assistant__msg-role ${roleClass}">${role}</span>${time}</div></div>`;
   }
 
-  function renderDatasetRows(headers, items) {
-    return (Array.isArray(items) ? items : []).map((row) => `<tr>${headers.map((header) => `<td>${renderInline(row && row[header] == null ? "" : String((row || {})[header] ?? ""))}</td>`).join("")}</tr>`).join("");
-  }
+  /* ── Tool events ───────────────────────────────────────────────────── */
+  function parseToolEvents(raw) { try { const p = typeof raw === "string" ? JSON.parse(raw) : raw; return Array.isArray(p) ? p.filter(Boolean) : []; } catch { return []; } }
 
-  function renderAttachmentPreview(rows, exportId) {
-    const allRows = Array.isArray(rows) ? rows.filter((row) => row && typeof row === "object") : [];
-    if (!allRows.length) return "";
-    const headers = Object.keys(allRows[0]).slice(0, 12);
-    if (!headers.length) return "";
-    const previewRows = allRows.slice(0, 25);
-    const renderRows = (items) => renderDatasetRows(headers, items);
-    return `
-      <div class="erp-web-assistant__attachment-preview">
-        <div class="erp-web-assistant__dataset-toolbar">
-          <strong>${allRows.length} row${allRows.length === 1 ? "" : "s"}</strong>
-          ${allRows.length > previewRows.length ? `<button type="button" class="erp-web-assistant__mini-btn" data-export-toggle="${safeHtml(exportId || "")}" data-state="collapsed">Show all rows</button>` : ""}
-        </div>
-        <div class="erp-web-assistant__table-wrap">
-          <table class="erp-web-assistant__table">
-            <thead><tr>${headers.map((header) => `<th>${renderInline(header)}</th>`).join("")}</tr></thead>
-            <tbody data-export-body="${safeHtml(exportId || "")}" data-preview-rows='${safeHtml(JSON.stringify(previewRows))}' data-all-rows='${safeHtml(JSON.stringify(allRows))}'>
-              ${renderRows(previewRows)}
-            </tbody>
-          </table>
-        </div>
-      </div>
-    `;
-  }
-
-  function renderExportsOnly(exports, opts) {
-    const entries = Object.entries(exports || {});
-    const showInline = !!(opts && opts.showInline);
-    if (!entries.length || !showInline) return "";
-    return `<div class="erp-web-assistant__attachments">${entries.map(([exportId, entry]) => {
-      const title = safeHtml(entry.title || "Data preview");
-      const preview = Array.isArray(entry.rows) ? renderAttachmentPreview(entry.rows, exportId) : "";
-      return `<div class="erp-web-assistant__attachment erp-web-assistant__attachment--dataset"><span class="erp-web-assistant__attachment-meta"><strong>${title}</strong><small>Full response dataset</small></span>${preview}</div>`;
-    }).join("")}</div>`;
-  }
-
-  function renderCopilotBlock(copilot) {
-    if (!copilot || typeof copilot !== "object") return "";
-    const summary = copilot.summary && typeof copilot.summary === "object" ? copilot.summary : null;
-    const actions = Array.isArray(copilot.actions) ? copilot.actions.filter((item) => item && item.label && item.prompt) : [];
-    const issues = Array.isArray(copilot.issues) ? copilot.issues.filter(Boolean) : [];
-    const insights = Array.isArray(copilot.insights) ? copilot.insights.filter(Boolean) : [];
-    const suggestions = Array.isArray(copilot.suggestions) ? copilot.suggestions.filter(Boolean) : [];
-    const summaryRows = Array.isArray(summary?.rows) ? summary.rows.filter((item) => item && item.label) : [];
-    return `
-      <section class="erp-web-assistant__copilot">
-        ${summary ? `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-head"><strong>${safeHtml(summary.title || "ERP Copilot")}</strong>${summary.badge ? `<span class="erp-web-assistant__copilot-badge">${safeHtml(summary.badge)}</span>` : ""}</div><div class="erp-web-assistant__copilot-grid">${summaryRows.map((row) => `<div class="erp-web-assistant__copilot-kv"><span>${safeHtml(row.label)}</span><strong>${safeHtml(row.value || "—")}</strong></div>`).join("")}</div></div>` : ""}
-        ${issues.length ? `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-title">Key issues</div><ul class="erp-web-assistant__copilot-list">${issues.map((item) => `<li>${renderInline(item)}</li>`).join("")}</ul></div>` : ""}
-        ${actions.length ? `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-title">Recommended actions</div><div class="erp-web-assistant__copilot-actions">${actions.map((item) => `<button type="button" class="erp-web-assistant__action-btn ${item.style === "primary" ? "is-primary" : ""}" data-copilot-prompt="${safeHtml(item.prompt)}">${safeHtml(item.label)}</button>`).join("")}</div></div>` : ""}
-        ${insights.length ? `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-title">Insights</div><div class="erp-web-assistant__copilot-notes">${insights.map((item) => `<p>${renderInline(item)}</p>`).join("")}</div></div>` : ""}
-        ${suggestions.length ? `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-title">Try next</div><div class="erp-web-assistant__copilot-suggestions">${suggestions.map((item) => `<button type="button" class="erp-web-assistant__mini-btn" data-copilot-prompt="${safeHtml(item)}">${safeHtml(item)}</button>`).join("")}</div></div>` : ""}
-      </section>`;
-  }
-
-  function renderAttachments(raw) {
-    const pkg = parseAttachmentPackage(raw);
-    const attachments = pkg.attachments;
-    const exports = pkg.exports || {};
-    const copilot = renderCopilotBlock(pkg.copilot);
-    const shouldShowInlineExports = !copilot && !!attachments.length;
-    if (!attachments.length) return `${copilot}`;
-    return `${copilot}<div class="erp-web-assistant__attachments">${attachments.map((item) => {
-      const name = safeHtml(item.filename || "download");
-      const label = safeHtml(item.label || item.file_type || "File");
-      const url = safeHtml(item.file_url);
-      const preview = exports[item.export_id] && Array.isArray(exports[item.export_id].rows)
-        ? renderAttachmentPreview(exports[item.export_id].rows, item.export_id)
-        : "";
-      const actions = `<span class="erp-web-assistant__attachment-actions"><a class="erp-web-assistant__link" href="${url}" download="${name}">Download</a></span>`;
-      if (isImageUrl(item.file_url)) {
-        return `
-          <div class="erp-web-assistant__attachment is-image">
-            <img class="erp-web-assistant__attachment-image" src="${url}" alt="${name}" loading="lazy" />
-            <span class="erp-web-assistant__attachment-meta"><strong>${name}</strong><small>${label}</small></span>
-            ${actions}
-          </div>`;
-      }
-      return `<div class="erp-web-assistant__attachment"><span class="erp-web-assistant__attachment-meta"><strong>${name}</strong><small>${label}</small></span>${actions}${preview}</div>`;
-    }).join("")}${renderExportsOnly(exports, { showInline: shouldShowInlineExports })}</div>`;
-  }
-
-  function parseToolEvents(raw) {
-    if (!raw) return [];
-    try {
-      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
-    } catch (error) {
-      return [];
-    }
-  }
-
-  function parseToolEventString(value) {
-    const text = String(value || "").trim();
-    if (!text) return null;
-    const match = text.match(/^([a-zA-Z0-9_]+)\s*(.*)$/);
-    if (!match) return { label: text, countable: false };
-    const toolName = match[1];
-    const argsText = String(match[2] || "").trim();
-    const labelMap = {
-      list_documents: "Fetched ERP records",
-      get_doctype_info: "Read document structure",
-      create_document: "Created draft",
-      update_document: "Updated record",
-      run_python_code: "Ran bulk operation",
-      generate_report: "Generated report",
-      submit_document: "Submitted document",
-      run_workflow: "Ran workflow action",
-      search_link: "Searched linked records",
-    };
-    let suffix = "";
-    const doctypeMatch = argsText.match(/['"]doctype['"]\s*:\s*['"]([^'"]+)['"]/i);
-    const reportMatch = argsText.match(/['"]report_name['"]\s*:\s*['"]([^'"]+)['"]/i);
-    if (doctypeMatch?.[1]) suffix = doctypeMatch[1];
-    else if (reportMatch?.[1]) suffix = reportMatch[1];
-    const baseLabel = labelMap[toolName] || toolName.replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
-    return { label: suffix ? `${baseLabel} — ${suffix}` : baseLabel, countable: Object.prototype.hasOwnProperty.call(labelMap, toolName) };
-  }
-
-  function mapStoredToolEvents(raw) {
-    return parseToolEvents(raw)
-      .filter((item) => typeof item === "string" && String(item || "").trim())
-      .map((item) => parseToolEventString(item))
-      .filter(Boolean);
+  function parseToolEventString(v) {
+    const t = String(v || "").trim(); if (!t) return null;
+    const m = t.match(/^([a-zA-Z0-9_]+)\s*(.*)$/);
+    if (!m) return { label: t, countable: false };
+    const map = { list_documents: "Fetched records", get_doctype_info: "Read structure", create_document: "Created draft", update_document: "Updated record", run_python_code: "Ran operation", generate_report: "Generated report", submit_document: "Submitted", run_workflow: "Ran workflow", search_link: "Searched records" };
+    let suffix = ""; const dm = m[2].match(/['"]doctype['"]\s*:\s*['"]([^'"]+)['"]/i); if (dm?.[1]) suffix = dm[1];
+    const label = map[m[1]] || m[1].replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+    return { label: suffix ? `${label} — ${suffix}` : label, countable: !!map[m[1]] };
   }
 
   function renderToolEvents(raw) {
-    if (!shouldShowToolActivity()) return "";
-    const steps = mapStoredToolEvents(raw);
+    const steps = parseToolEvents(raw).filter(i => typeof i === "string" && i.trim()).map(parseToolEventString).filter(Boolean);
     if (!steps.length) return "";
-    const count = steps.filter((item) => item.countable).length || steps.length;
-    return `
-      <details class="erp-web-assistant__activity-log">
-        <summary class="erp-web-assistant__activity-head">
-          <span class="erp-web-assistant__activity-status">✓</span>
-          <span class="erp-web-assistant__activity-summary">Ran ${count} command${count === 1 ? "" : "s"}</span>
-        </summary>
-        <div class="erp-web-assistant__activity-steps">
-          ${steps.map((item) => `<div class="erp-web-assistant__activity-step"><span class="erp-web-assistant__activity-step-icon">✓</span><span class="erp-web-assistant__activity-step-label">${safeHtml(item.label)}</span></div>`).join("")}
-        </div>
-      </details>`;
+    const count = steps.filter(i => i.countable).length || steps.length;
+    return `<details class="erp-web-assistant__activity-log"><summary class="erp-web-assistant__activity-head"><span class="erp-web-assistant__activity-status">✓</span><span>Ran ${count} step${count === 1 ? "" : "s"}</span></summary><div class="erp-web-assistant__activity-steps">${steps.map(i => `<div class="erp-web-assistant__activity-step"><span class="erp-web-assistant__activity-step-icon">✓</span><span>${safeHtml(i.label)}</span></div>`).join("")}</div></details>`;
   }
 
-  function mapProgressStepLabel(step) {
-    const text = String(step || "").trim();
-    const lowered = text.toLowerCase();
-    if (!text) return "Working...";
-    if (lowered === "preparing request" || lowered === "preparing response") return "Starting...";
-    if (lowered === "thinking") return "Thinking...";
-    if (lowered === "verifying erp evidence") return "Verifying ERP results...";
-    if (lowered === "response ready") return "Ready";
-    if (lowered.startsWith("tool failed:")) return `Failed: ${text.replace(/^tool failed:\s*/i, "")}`;
-    if (lowered.startsWith("tool:")) return parseToolEventString(text.replace(/^tool:\s*/i, ""))?.label || text.replace(/^tool:\s*/i, "");
-    return text;
+  /* ── Attachments ───────────────────────────────────────────────────── */
+  function parseAttachmentPkg(raw) {
+    if (!raw) return { attachments: [], exports: {}, copilot: null };
+    try {
+      const p = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (Array.isArray(p)) return { attachments: p.filter(i => i?.file_url), exports: {}, copilot: null };
+      if (p && typeof p === "object") return { attachments: Array.isArray(p.attachments) ? p.attachments.filter(i => i?.file_url) : [], exports: p.exports && typeof p.exports === "object" ? p.exports : {}, copilot: p.copilot && typeof p.copilot === "object" ? p.copilot : null };
+    } catch { /* ignore */ }
+    return { attachments: [], exports: {}, copilot: null };
   }
 
-  function summarizeProgressSteps(steps, done) {
-    const items = Array.isArray(steps) ? steps.filter(Boolean) : [];
-    const commandCount = items.filter((item) => /^tool:/i.test(String(item || "").trim())).length;
-    if (commandCount) return `${done ? "Completed" : "Working on"} ${commandCount} ERP step${commandCount === 1 ? "" : "s"}${done ? "" : "..."}`;
-    const stepCount = items.length || 1;
-    return `${done ? "Completed" : "Running"} ${stepCount} step${stepCount === 1 ? "" : "s"}${done ? "" : "..."}`;
+  function renderDatasetRows(h, items) { return (Array.isArray(items) ? items : []).map(r => `<tr>${h.map(k => `<td>${renderInline(r?.[k] == null ? "" : String(r[k] ?? ""))}</td>`).join("")}</tr>`).join(""); }
+
+  function renderAttachmentPreview(rows, exportId) {
+    const all = Array.isArray(rows) ? rows.filter(r => r && typeof r === "object") : [];
+    if (!all.length) return "";
+    const h = Object.keys(all[0]).slice(0, 12); if (!h.length) return "";
+    const preview = all.slice(0, 25);
+    return `<div class="erp-web-assistant__attachment-preview"><div class="erp-web-assistant__dataset-toolbar"><strong>${all.length} row${all.length === 1 ? "" : "s"}</strong>${all.length > preview.length ? `<button type="button" class="erp-web-assistant__mini-btn" data-export-toggle="${safeHtml(exportId || "")}" data-state="collapsed">Show all</button>` : ""}</div><div class="erp-web-assistant__table-wrap"><table class="erp-web-assistant__table"><thead><tr>${h.map(k => `<th>${renderInline(k)}</th>`).join("")}</tr></thead><tbody data-export-body="${safeHtml(exportId || "")}" data-preview-rows='${safeHtml(JSON.stringify(preview))}' data-all-rows='${safeHtml(JSON.stringify(all))}'>${renderDatasetRows(h, preview)}</tbody></table></div></div>`;
   }
 
-  function upperWords(value) {
-    return String(value || "").replace(/[_-]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase()).trim();
+  function renderCopilotBlock(cop) {
+    if (!cop || typeof cop !== "object") return "";
+    const s = cop.summary && typeof cop.summary === "object" ? cop.summary : null;
+    const actions = Array.isArray(cop.actions) ? cop.actions.filter(i => i?.label && i?.prompt) : [];
+    const issues = Array.isArray(cop.issues) ? cop.issues.filter(Boolean) : [];
+    const insights = Array.isArray(cop.insights) ? cop.insights.filter(Boolean) : [];
+    const suggestions = Array.isArray(cop.suggestions) ? cop.suggestions.filter(Boolean) : [];
+    const sRows = Array.isArray(s?.rows) ? s.rows.filter(i => i?.label) : [];
+    let html = '<section class="erp-web-assistant__copilot">';
+    if (s) html += `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-head"><strong>${safeHtml(s.title || "Copilot")}</strong></div><div class="erp-web-assistant__copilot-grid">${sRows.map(r => `<div class="erp-web-assistant__copilot-kv"><span>${safeHtml(r.label)}</span><strong>${safeHtml(r.value || "—")}</strong></div>`).join("")}</div></div>`;
+    if (issues.length) html += `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-title">Key issues</div><ul class="erp-web-assistant__copilot-list">${issues.map(i => `<li>${renderInline(i)}</li>`).join("")}</ul></div>`;
+    if (actions.length) html += `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-title">Actions</div><div class="erp-web-assistant__copilot-actions">${actions.map(a => `<button type="button" class="erp-web-assistant__action-btn ${a.style === "primary" ? "is-primary" : ""}" data-copilot-prompt="${safeHtml(a.prompt)}">${safeHtml(a.label)}</button>`).join("")}</div></div>`;
+    if (suggestions.length) html += `<div class="erp-web-assistant__copilot-card"><div class="erp-web-assistant__copilot-title">Try next</div><div class="erp-web-assistant__copilot-suggestions">${suggestions.map(s => `<button type="button" class="erp-web-assistant__mini-btn" data-copilot-prompt="${safeHtml(s)}">${safeHtml(s)}</button>`).join("")}</div></div>`;
+    return html + "</section>";
   }
 
-  function firstValue(values) {
-    return values.find((value) => value !== null && value !== undefined && String(value).trim()) || null;
+  function renderAttachments(raw) {
+    const pkg = parseAttachmentPkg(raw);
+    const copilot = renderCopilotBlock(pkg.copilot);
+    if (!pkg.attachments.length) return copilot;
+    const atts = pkg.attachments.map(i => {
+      const name = safeHtml(i.filename || "download"), label = safeHtml(i.label || i.file_type || "File"), url = safeHtml(i.file_url);
+      const preview = pkg.exports[i.export_id]?.rows ? renderAttachmentPreview(pkg.exports[i.export_id].rows, i.export_id) : "";
+      if (isImageUrl(i.file_url)) return `<div class="erp-web-assistant__attachment is-image"><img class="erp-web-assistant__attachment-image" src="${url}" alt="${name}" loading="lazy" /><span class="erp-web-assistant__attachment-meta"><strong>${name}</strong><small>${label}</small></span></div>`;
+      return `<div class="erp-web-assistant__attachment"><span class="erp-web-assistant__attachment-meta"><strong>${name}</strong><small>${label}</small></span><a class="erp-web-assistant__link" href="${url}" download="${name}">Download</a>${preview}</div>`;
+    }).join("");
+    return `${copilot}<div class="erp-web-assistant__attachments">${atts}</div>`;
   }
 
+  /* ── Context ───────────────────────────────────────────────────────── */
   const MODULE_KEYWORDS = [
     { name: "Sales", keywords: ["quotation", "sales order", "sales invoice", "lead", "opportunity", "customer"] },
-    { name: "Buying", keywords: ["purchase", "supplier", "material request", "request for quotation"] },
-    { name: "Stock", keywords: ["item", "warehouse", "stock", "delivery note", "batch", "serial"] },
-    { name: "Accounts", keywords: ["payment", "journal", "invoice", "account", "expense", "general ledger"] },
-    { name: "HR", keywords: ["employee", "attendance", "leave", "payroll", "expense claim"] },
-    { name: "Projects", keywords: ["project", "task", "timesheet", "issue"] },
-    { name: "Support", keywords: ["ticket", "support", "case"] },
+    { name: "Buying", keywords: ["purchase", "supplier", "material request"] },
+    { name: "Stock", keywords: ["item", "warehouse", "stock", "delivery note", "batch"] },
+    { name: "Accounts", keywords: ["payment", "journal", "invoice", "account", "expense"] },
+    { name: "HR", keywords: ["employee", "attendance", "leave", "payroll"] },
+    { name: "Projects", keywords: ["project", "task", "timesheet"] },
   ];
 
-  function inferModuleFromText(text) {
-    const lowered = String(text || "").toLowerCase();
-    for (const item of MODULE_KEYWORDS) {
-      if (item.keywords.some((keyword) => lowered.includes(keyword))) return item.name;
-    }
-    return "General";
-  }
+  function inferModule(t) { const l = String(t || "").toLowerCase(); for (const m of MODULE_KEYWORDS) if (m.keywords.some(k => l.includes(k))) return m.name; return "General"; }
 
   function resolveDeskContext() {
-    let rawRoute = [];
-    try {
-      rawRoute = window.frappe?.get_route ? frappe.get_route() : [];
-    } catch (error) {
-      rawRoute = [];
-    }
-
     let route = [];
-    if (Array.isArray(rawRoute)) {
-      route = rawRoute.filter((segment) => segment !== null && segment !== undefined).map((segment) => String(segment));
-    } else if (typeof rawRoute === "string") {
-      route = rawRoute.split("/").filter(Boolean);
+    try { route = window.frappe?.get_route ? frappe.get_route() : []; } catch { route = []; }
+    if (Array.isArray(route)) route = route.filter(s => s != null).map(String);
+    else if (typeof route === "string") route = route.split("/").filter(Boolean);
+    else route = [];
+    if (!route.length && location.hash) route = location.hash.replace(/^#/, "").split("/").filter(Boolean);
+    const [rawView, doctype, docname] = route;
+    const view = String(rawView || "").toLowerCase();
+    const form = window.cur_frm || null;
+    if (view === "form" && form?.doc && String(form.doctype || "") === String(doctype || "") && String(form.docname || "") === String(docname || "")) {
+      return { mode: "record", view: "form", doctype: form.doctype, docname: form.docname, route: route.join("/"), label: `${form.doctype} / ${form.docname}`, module: inferModule(form.doctype) };
     }
-    if (!route.length && typeof window.location?.hash === "string" && window.location.hash) {
-      route = window.location.hash.replace(/^#/, "").split("/").filter(Boolean);
-    }
-
-    const routeText = route.join("/");
-    const [rawView, doctype, docname, extra] = route;
-    const view = String(rawView || "").trim().toLowerCase();
-    const form = window.cur_frm || (typeof cur_frm !== "undefined" ? cur_frm : null);
-    const isFormRoute = view === "form";
-    const formMatches = Boolean(form && form.doc && isFormRoute && String(form.doctype || "") === String(doctype || "") && String(form.docname || "") === String(docname || ""));
-
-    if (formMatches) {
-      return {
-        mode: "record",
-        view: "form",
-        doctype: form.doctype || null,
-        docname: form.docname || null,
-        route: routeText,
-        label: `${form.doctype || "Document"} / ${form.docname || ""}`.trim(),
-        module: inferModuleFromText(form.doctype),
-      };
-    }
-    if (view === "list") {
-      return { mode: "list", view, doctype: doctype || null, docname: null, route: routeText, label: `${doctype || "List"} List`, module: inferModuleFromText(doctype || extra) };
-    }
-    if (view === "report") {
-      return { mode: "report", view, doctype: doctype || null, docname: null, route: routeText, label: doctype ? `Report / ${doctype}` : "Report", module: inferModuleFromText(doctype || extra) };
-    }
-    if (view === "workspace") {
-      return { mode: "workspace", view, doctype: null, docname: null, route: routeText, label: doctype ? `Workspace / ${doctype}` : "Workspace", module: inferModuleFromText(doctype || extra) };
-    }
-    return { mode: "general", view, doctype: isFormRoute ? doctype || null : null, docname: isFormRoute ? docname || null : null, route: routeText, label: routeText || "General workspace", module: inferModuleFromText(firstValue([doctype, extra, routeText])) };
+    if (view === "list") return { mode: "list", view, doctype, docname: null, route: route.join("/"), label: `${doctype || "List"} List`, module: inferModule(doctype) };
+    return { mode: "general", view, doctype: null, docname: null, route: route.join("/"), label: route.join("/") || "General workspace", module: inferModule(route.join(" ")) };
   }
 
-  function promptTemplate(text, context) {
-    const doctype = context?.doctype || "document";
-    const docname = context?.docname ? ` ${context.docname}` : "";
-    const target = `${doctype}${docname}`.trim();
-    if (text === "summarize") return context?.docname ? `Summarize ${target} and highlight what needs attention today.` : `Summarize what needs attention in this ${context?.label || "area"}.`;
-    if (text === "explain") return context?.docname ? `Explain the current status of ${target} and what is blocking the next step.` : `Explain the current status and next steps for this ${context?.label || "area"}.`;
-    if (text === "draft") return context?.docname ? `Create the safest draft action based on ${target}. Do not submit anything yet.` : `Create the safest draft action for this context. Do not submit anything yet.`;
-    if (text === "followups") return context?.docname ? `List the top follow-up actions for ${target} for today's work.` : "List the top follow-up actions for today's work in this context.";
-    return text;
-  }
-
-  function getSuggestionSet(context) {
-    const base = [
-      { label: "Summarize this", prompt: promptTemplate("summarize", context) },
-      { label: "Explain status", prompt: promptTemplate("explain", context) },
-      { label: "Safe next step", prompt: promptTemplate("draft", context) },
-      { label: "Follow-ups", prompt: promptTemplate("followups", context) },
+  function getSuggestions(ctx) {
+    return [
+      { label: "Summarize this", prompt: ctx?.docname ? `Summarize ${ctx.doctype} ${ctx.docname} and highlight what needs attention.` : "Summarize what needs attention in this area." },
+      { label: "Explain status", prompt: ctx?.docname ? `Explain the current status of ${ctx.doctype} ${ctx.docname}.` : "Explain the current status and next steps." },
+      { label: "Safe next step", prompt: ctx?.docname ? `Create the safest draft action based on ${ctx.doctype} ${ctx.docname}. Do not submit.` : "What's the safest next action here?" },
+      { label: "Follow-ups", prompt: ctx?.docname ? `List follow-up actions for ${ctx.doctype} ${ctx.docname}.` : "List follow-up actions for today." },
     ];
-
-    const moduleMap = {
-      Sales: [
-        { label: "Overdue invoices", prompt: "Show overdue sales invoices and suggest follow-up actions." },
-        { label: "Create quotation draft", prompt: "Create a draft quotation from the current sales context. Do not submit." },
-      ],
-      Buying: [
-        { label: "Purchase draft", prompt: "Create a draft purchase document from the current context. Do not submit." },
-        { label: "Supplier status", prompt: "Summarize supplier activity and pending actions for this context." },
-      ],
-      Stock: [
-        { label: "Low stock", prompt: "Show items below reorder level relevant to this context." },
-        { label: "Material request draft", prompt: "Create a draft material request for low-stock items only. Do not submit." },
-      ],
-      Accounts: [
-        { label: "Due payments", prompt: "Show payments due soon and explain urgency." },
-        { label: "Reconcile issue", prompt: "Explain what is preventing reconciliation or payment completion here." },
-      ],
-      HR: [
-        { label: "Attendance summary", prompt: "Summarize today's attendance and highlight exceptions." },
-        { label: "Leave check", prompt: "Show pending leave requests and recommend next actions." },
-      ],
-      Projects: [
-        { label: "Project blockers", prompt: "Summarize blockers and pending work for this project context." },
-        { label: "Task draft", prompt: "Create safe draft follow-up tasks based on this project context." },
-      ],
-      Support: [
-        { label: "Open issues", prompt: "Show open support issues that need attention first." },
-        { label: "Response draft", prompt: "Draft a helpful response based on the current issue context." },
-      ],
-      General: [
-        { label: "Today's priorities", prompt: "Summarize today's ERP priorities for me." },
-        { label: "Open approvals", prompt: "Show my pending approvals and what needs action." },
-      ],
-    };
-
-    return base.concat(moduleMap[context?.module || "General"] || moduleMap.General).slice(0, 6);
   }
 
+  /* ── Progress step labels ──────────────────────────────────────────── */
+  function mapStepLabel(s) {
+    const t = String(s || "").trim(), l = t.toLowerCase();
+    if (!t) return "Working...";
+    if (l === "preparing request" || l === "preparing response") return "Preparing...";
+    if (l === "thinking") return "Thinking...";
+    if (l === "verifying erp evidence") return "Verifying...";
+    if (l === "response ready") return "Ready";
+    if (l.startsWith("tool:")) return parseToolEventString(t.replace(/^tool:\s*/i, ""))?.label || t.replace(/^tool:\s*/i, "");
+    return t;
+  }
+
+  function summarizeSteps(steps, done) {
+    const items = Array.isArray(steps) ? steps.filter(Boolean) : [];
+    const cmds = items.filter(i => /^tool:/i.test(String(i || "").trim())).length;
+    if (cmds) return `${done ? "Completed" : "Running"} ${cmds} step${cmds === 1 ? "" : "s"}${done ? "" : "..."}`;
+    return `${done ? "Done" : "Working"}${done ? "" : "..."}`;
+  }
+
+  /* ── Date grouping ─────────────────────────────────────────────────── */
+  function dateGroup(dateStr) {
+    if (!dateStr) return "Older";
+    const d = new Date(dateStr), now = new Date();
+    const diffDays = Math.floor((now - d) / 86400000);
+    if (diffDays === 0) return "Today";
+    if (diffDays === 1) return "Yesterday";
+    if (diffDays <= 7) return "Previous 7 days";
+    return "Older";
+  }
+
+  /* ── Auto-grow textarea ────────────────────────────────────────────── */
+  function autoGrow(el) {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = Math.min(el.scrollHeight, 200) + "px";
+  }
+
+  function isCompactViewport() {
+    return window.matchMedia && window.matchMedia("(max-width: 900px)").matches;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════════════
+     ERPWebAssistant Class
+     ═══════════════════════════════════════════════════════════════════════ */
   class ERPWebAssistant {
-    constructor(root, options) {
+    constructor(root) {
       this.root = root;
-      this.options = options || {};
       this.state = { conversations: [], active: null, isDraft: false, context: resolveDeskContext() };
       this.awaitingQueueAck = {};
       this.conversationMessageCache = {};
       this.optimisticAssistantMessages = {};
       this.completionReloadTimers = {};
+      this.completionFetchLocks = {};
       this.modelStorageKey = "erp_ai_assistant_selected_model";
       this.progressPollTimer = null;
       this.progressPollPending = false;
+      this.deferProgressRemoval = false;
       this.pendingImages = [];
       this.el = {
         history: root.querySelector('[data-role="history"]'),
@@ -506,8 +243,6 @@
         imageInput: root.querySelector('[data-role="image-input"]'),
         modelSelect: root.querySelector('[data-role="model-select"]'),
         context: root.querySelector('[data-role="context"]'),
-        contextMeta: root.querySelector('[data-role="context-meta"]'),
-        quickActions: root.querySelector('[data-role="quick-actions"]'),
         suggestions: root.querySelector('[data-role="suggestions"]'),
         status: root.querySelector('[data-role="status"]'),
         moduleBadge: root.querySelector('[data-role="module-badge"]'),
@@ -515,16 +250,13 @@
         send: root.querySelector('[data-action="send"]'),
         attachImage: root.querySelector('[data-action="attach-image"]'),
         newChat: root.querySelector('[data-action="new-chat"]'),
-        focusPrompt: root.querySelector('[data-action="focus-prompt"]'),
         refreshContext: root.querySelector('[data-action="refresh-context"]'),
+        toggleSidebar: root.querySelector('[data-action="toggle-sidebar"]'),
       };
     }
 
     boot() {
-      if (!window.frappe || !frappe.call) {
-        this.renderSystemMessage("Frappe runtime not found.");
-        return;
-      }
+      if (!window.frappe || !frappe.call) { this.renderSystemMessage("Frappe runtime not found."); return; }
       this.bind();
       this.loadModelOptions();
       this.refreshContext(true);
@@ -536,97 +268,80 @@
       this.el.send?.addEventListener("click", () => this.sendPrompt());
       this.el.attachImage?.addEventListener("click", () => this.el.imageInput?.click());
       this.el.newChat?.addEventListener("click", () => this.startNewChat());
-      this.el.focusPrompt?.addEventListener("click", () => this.el.prompt?.focus());
       this.el.refreshContext?.addEventListener("click", () => this.refreshContext(true));
       this.el.search?.addEventListener("input", () => this.renderHistory());
       this.el.modelSelect?.addEventListener("change", () => this.persistSelectedModel());
-      this.el.imageInput?.addEventListener("change", async (event) => {
-        await this.ingestImageFiles(event?.target?.files);
-        if (this.el.imageInput) this.el.imageInput.value = "";
+      this.el.toggleSidebar?.addEventListener("click", () => this.toggleSidebar());
+      this.root.addEventListener("click", (e) => {
+        if (!this.root.classList.contains("mobile-sidebar-open")) return;
+        if (e.target.closest(".erp-web-assistant__sidebar")) return;
+        if (e.target.closest('[data-action="toggle-sidebar"]')) return;
+        this.closeMobileSidebar();
       });
-      this.el.prompt?.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" && !event.shiftKey) {
-          event.preventDefault();
-          this.sendPrompt();
-        }
-      });
-      this.el.prompt?.addEventListener("paste", async (event) => {
-        const items = Array.from(event.clipboardData?.items || []).filter((item) => String(item.type || "").startsWith("image/"));
+      this.el.imageInput?.addEventListener("change", async (e) => { await this.ingestImageFiles(e?.target?.files); if (this.el.imageInput) this.el.imageInput.value = ""; });
+      this.el.prompt?.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); this.sendPrompt(); } });
+      this.el.prompt?.addEventListener("input", () => autoGrow(this.el.prompt));
+      this.el.prompt?.addEventListener("paste", async (e) => {
+        const items = Array.from(e.clipboardData?.items || []).filter(i => String(i.type || "").startsWith("image/"));
         if (!items.length) return;
-        event.preventDefault();
-        const files = items.map((item) => item.getAsFile()).filter(Boolean);
-        await this.ingestImageFiles(files);
+        e.preventDefault();
+        await this.ingestImageFiles(items.map(i => i.getAsFile()).filter(Boolean));
       });
       window.addEventListener("hashchange", () => this.refreshContext());
-      document.addEventListener("visibilitychange", () => {
-        if (!document.hidden) this.refreshContext();
-      });
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) this.refreshContext(); });
       $(document).on("page-change", () => this.refreshContext());
+      window.addEventListener("resize", () => {
+        if (!isCompactViewport()) this.root.classList.remove("mobile-sidebar-open");
+      });
+    }
+
+    toggleSidebar(forceState) {
+      if (isCompactViewport()) {
+        const open = typeof forceState === "boolean" ? forceState : !this.root.classList.contains("mobile-sidebar-open");
+        this.root.classList.toggle("mobile-sidebar-open", open);
+        return;
+      }
+      const collapsed = typeof forceState === "boolean" ? forceState : !this.root.classList.contains("sidebar-collapsed");
+      this.root.classList.toggle("sidebar-collapsed", collapsed);
+    }
+
+    closeMobileSidebar() {
+      if (isCompactViewport()) this.root.classList.remove("mobile-sidebar-open");
     }
 
     startNewChat() {
       this.state.active = null;
       this.state.isDraft = true;
+      this.closeMobileSidebar();
       this.clearPendingImages();
       this.renderMessages([]);
-      if (this.el.prompt) this.el.prompt.value = "";
-      this.updateStatus("New conversation ready.");
+      if (this.el.prompt) { this.el.prompt.value = ""; autoGrow(this.el.prompt); }
       this.refreshContext();
       this.el.prompt?.focus();
     }
 
     refreshContext(forceToast) {
       this.state.context = resolveDeskContext();
-      const context = this.state.context;
-      if (this.el.context) this.el.context.textContent = context.label || "General workspace";
+      const ctx = this.state.context;
+      if (this.el.context) this.el.context.textContent = ctx.label || "General workspace";
       const pathEl = this.root.querySelector('[data-role="workspace-path"]');
-      if (pathEl) pathEl.textContent = `${upperWords(context.view || "desk")} / ${context.doctype || context.module || "General"}${context.docname ? ` / ${context.docname}` : ""}`;
-      if (this.el.moduleBadge) this.el.moduleBadge.textContent = context.module || "General";
-      if (this.el.contextMeta) {
-        const items = [
-          { label: "Mode", value: upperWords(context.mode || "general") },
-          { label: "Module", value: context.module || "General" },
-          { label: "DocType", value: context.doctype || "—" },
-          { label: "Document", value: context.docname || "—" },
-        ];
-        this.el.contextMeta.innerHTML = items.map((item) => `<div class="erp-web-assistant__context-card"><span>${safeHtml(item.label)}</span><strong>${safeHtml(item.value)}</strong></div>`).join("");
-      }
-      const suggestions = getSuggestionSet(context);
-      if (this.el.quickActions) {
-        this.el.quickActions.innerHTML = suggestions.slice(0, 6).map((item) => `<button type="button" class="erp-web-assistant__chip" data-prompt="${safeHtml(item.prompt)}">${safeHtml(item.label)}</button>`).join("");
-        Array.from(this.el.quickActions.querySelectorAll("[data-prompt]")).forEach((button) => {
-          button.addEventListener("click", () => this.applyPrompt(button.getAttribute("data-prompt") || "", true));
-        });
-      }
+      if (pathEl) pathEl.textContent = `${upperWords(ctx.view || "desk")} / ${ctx.doctype || ctx.module || "General"}${ctx.docname ? ` / ${ctx.docname}` : ""}`;
+      if (this.el.moduleBadge) this.el.moduleBadge.textContent = ctx.module || "General";
+      const suggestions = getSuggestions(ctx);
       if (this.el.suggestions) {
-        this.el.suggestions.innerHTML = suggestions.map((item) => `<button type="button" class="erp-web-assistant__suggestion" data-prompt="${safeHtml(item.prompt)}"><span>${safeHtml(item.label)}</span><small>${safeHtml(item.prompt)}</small></button>`).join("");
-        Array.from(this.el.suggestions.querySelectorAll("[data-prompt]")).forEach((button) => {
-          button.addEventListener("click", () => this.applyPrompt(button.getAttribute("data-prompt") || "", false));
-        });
-      }
-      this.updateStatus(context.docname ? `Working with ${context.doctype} ${context.docname}.` : `Working in ${context.module || "General"} context.`);
-      if (forceToast && window.frappe?.show_alert && this.options.mode === "desk") {
-        frappe.show_alert({ message: `Context refreshed: ${context.label || "General workspace"}`, indicator: "blue" });
+        this.el.suggestions.innerHTML = suggestions.map(s => `<button type="button" class="erp-web-assistant__suggestion" data-prompt="${safeHtml(s.prompt)}"><span>${safeHtml(s.label)}</span></button>`).join("");
+        this.el.suggestions.querySelectorAll("[data-prompt]").forEach(b => b.addEventListener("click", () => this.applyPrompt(b.getAttribute("data-prompt") || "", false)));
       }
     }
 
     applyPrompt(prompt, focusOnly) {
       if (!this.el.prompt) return;
       this.el.prompt.value = String(prompt || "").trim();
+      autoGrow(this.el.prompt);
       this.el.prompt.focus();
-      this.el.prompt.selectionStart = this.el.prompt.selectionEnd = this.el.prompt.value.length;
-      if (!focusOnly) this.updateStatus("Prompt loaded. Review it, then send.");
     }
 
-    handleCopilotPrompt(prompt, autoSend) {
-      if (!prompt) return;
-      this.applyPrompt(prompt, false);
-      if (autoSend) this.sendPrompt();
-    }
-
-    updateStatus(text) {
-      if (this.el.status) this.el.status.textContent = text;
-    }
+    handleCopilotPrompt(prompt) { if (prompt) this.applyPrompt(prompt, false); }
 
     loadHistory() {
       frappe.call({
@@ -634,36 +349,58 @@
         callback: (r) => {
           this.state.conversations = r.message || [];
           this.renderHistory();
-          if (this.el.conversationCount) {
-            const count = this.state.conversations.length;
-            this.el.conversationCount.textContent = `${count} chat${count === 1 ? "" : "s"}`;
-          }
+          if (this.el.conversationCount) this.el.conversationCount.textContent = `${this.state.conversations.length} chats`;
           if (!this.state.active && this.state.conversations.length) this.loadConversation(this.state.conversations[0].name);
         },
-        error: () => {
-          this.state.conversations = [];
-          this.renderHistory();
-          if (this.el.conversationCount) this.el.conversationCount.textContent = "0 chats";
-        },
+        error: () => { this.state.conversations = []; this.renderHistory(); },
       });
     }
 
     renderHistory() {
       const query = (this.el.search?.value || "").toLowerCase();
-      const rows = this.state.conversations.filter((row) => !query || String(row.title || "").toLowerCase().includes(query));
+      const rows = this.state.conversations.filter(r => !query || (r.title || "").toLowerCase().includes(query));
       this.el.history.innerHTML = "";
-      if (!rows.length) {
-        this.el.history.innerHTML = '<div class="erp-web-assistant__history-empty">No conversations yet</div>';
-        return;
-      }
-      rows.forEach((row) => {
+      if (!rows.length) { this.el.history.innerHTML = '<div class="erp-web-assistant__history-empty">No conversations yet</div>'; return; }
+
+      let lastGroup = "";
+      rows.forEach(row => {
+        const group = dateGroup(row.modified);
+        if (group !== lastGroup) {
+          lastGroup = group;
+          const label = document.createElement("div");
+          label.className = "erp-web-assistant__history-group-label";
+          label.textContent = group;
+          this.el.history.appendChild(label);
+        }
         const btn = document.createElement("button");
         btn.type = "button";
         btn.className = "erp-web-assistant__history-item";
-        if (this.state.active && this.state.active.name === row.name) btn.classList.add("is-active");
-        btn.innerHTML = `<strong>${safeHtml(row.title || "New chat")}</strong><small>${safeHtml(row.modified || "")}</small>`;
-        btn.addEventListener("click", () => this.loadConversation(row.name));
+        if (this.state.active?.name === row.name) btn.classList.add("is-active");
+        btn.innerHTML = `<strong>${safeHtml(row.title || "New chat")}</strong><small>${safeHtml((row.modified || "").slice(0, 10))}</small><div class="erp-web-assistant__history-item__actions"><button class="erp-web-assistant__history-action-btn" type="button" data-action="rename" title="Rename">✎</button><button class="erp-web-assistant__history-action-btn" type="button" data-action="delete" title="Delete">×</button></div>`;
+        btn.addEventListener("click", (e) => {
+          if (e.target.closest('[data-action="rename"]')) { this.renameConversation(row.name, row.title); return; }
+          if (e.target.closest('[data-action="delete"]')) { this.deleteConversation(row.name); return; }
+          this.loadConversation(row.name);
+        });
         this.el.history.appendChild(btn);
+      });
+    }
+
+    renameConversation(name, currentTitle) {
+      const newTitle = window.prompt("Rename conversation:", currentTitle || "");
+      if (!newTitle || newTitle === currentTitle) return;
+      frappe.call({ method: "erp_ai_assistant.api.chat.rename_conversation", args: { name, title: newTitle }, callback: () => this.loadHistory() });
+    }
+
+    deleteConversation(name) {
+      if (!window.confirm("Delete this conversation?")) return;
+      frappe.call({
+        method: "erp_ai_assistant.api.chat.delete_conversation",
+        args: { name },
+        callback: () => {
+          if (this.state.active?.name === name) { this.state.active = null; this.renderMessages([]); }
+          this.loadHistory();
+        },
       });
     }
 
@@ -676,472 +413,515 @@
           const payload = r.message || {};
           this.state.active = payload.conversation || null;
           this.state.isDraft = false;
-          this.clearPendingImages();
-          const serverMessages = Array.isArray(payload.messages) ? payload.messages : [];
-          this.conversationMessageCache[name] = serverMessages;
-          const optimisticMessages = Array.isArray(this.optimisticAssistantMessages[name])
-            ? this.optimisticAssistantMessages[name]
-            : [];
-          if (optimisticMessages.length) {
-            const lastOptimistic = optimisticMessages[optimisticMessages.length - 1];
-            const hasMatchingServerReply = serverMessages.some((row) =>
-              row
-              && row.role === "assistant"
-              && String(row.content || "").trim() === String(lastOptimistic.content || "").trim()
-            );
-            if (hasMatchingServerReply) {
-              delete this.optimisticAssistantMessages[name];
-            }
+          if (!settings.silent) this.clearPendingImages();
+          const serverMsgs = Array.isArray(payload.messages) ? payload.messages : [];
+          this.conversationMessageCache[name] = serverMsgs;
+          const opt = this.optimisticAssistantMessages[name] || [];
+          let hasMatchingServerReply = false;
+          if (opt.length) {
+            const last = opt[opt.length - 1];
+            hasMatchingServerReply = serverMsgs.some(r => r?.role === "assistant" && String(r.content || "").trim() === String(last.content || "").trim());
+            if (hasMatchingServerReply) delete this.optimisticAssistantMessages[name];
           }
-          this.renderMessages(this.getConversationMessages(name));
-          this.renderHistory();
-          if (typeof settings.onLoaded === "function") {
-            settings.onLoaded(payload, serverMessages);
+          if (!settings.silent) this.closeMobileSidebar();
+          const shouldRender = !settings.silent && (!settings.waitForOptimisticConfirmation || hasMatchingServerReply || !opt.length);
+          if (shouldRender) {
+            this.renderMessages(this.getMergedMessages(name));
+            this.renderHistory();
           }
+          if (typeof settings.onLoaded === "function") settings.onLoaded(payload, serverMsgs);
         },
       });
     }
 
-    getConversationMessages(name) {
-      const serverMessages = Array.isArray(this.conversationMessageCache[name])
-        ? this.conversationMessageCache[name]
-        : [];
-      const optimisticAssistantMessages = Array.isArray(this.optimisticAssistantMessages[name])
-        ? this.optimisticAssistantMessages[name]
-        : [];
-      if (!optimisticAssistantMessages.length) {
-        return serverMessages;
-      }
-      return serverMessages.concat(optimisticAssistantMessages);
+    getMergedMessages(name) {
+      const server = this.conversationMessageCache[name] || [];
+      const opt = this.optimisticAssistantMessages[name] || [];
+      return opt.length ? server.concat(opt) : server;
     }
 
-    queueOptimisticAssistantMessage(conversationName, replyText) {
-      const content = String(replyText || "").trim();
-      if (!conversationName || !content) return;
-      const existing = Array.isArray(this.optimisticAssistantMessages[conversationName])
-        ? this.optimisticAssistantMessages[conversationName].slice()
-        : [];
-      const last = existing.length ? existing[existing.length - 1] : null;
-      if (last && String(last.content || "").trim() === content) {
+    queueOptimistic(name, text, opts) {
+      if (!name || !String(text || "").trim()) return;
+      const existing = (this.optimisticAssistantMessages[name] || []).slice();
+      const last = existing[existing.length - 1];
+      if (last && String(last.content || "").trim() === String(text).trim()) return;
+      existing.push({ role: "assistant", content: text, creation: new Date().toISOString(), tool_events: JSON.stringify(opts?.toolEvents || []), attachments_json: opts?.attachments ? JSON.stringify(opts.attachments) : null });
+      this.optimisticAssistantMessages[name] = existing;
+    }
+
+    renderFinalReply(convName, text, opts) {
+      this.queueOptimistic(convName, text, opts);
+      const merged = this.getMergedMessages(convName);
+      const finalMsg = merged.length ? merged[merged.length - 1] : null;
+      const progress = this.el.messages.querySelector(".erp-web-assistant__msg.is-progress");
+      if (progress && finalMsg && finalMsg.role === "assistant") {
+        this._populateMessageNode(progress, finalMsg, true);
+        progress.dataset.fp = this._msgFingerprint(finalMsg, true);
+        progress.classList.remove("is-progress", "is-done");
+        this.el.messages.scrollTop = this.el.messages.scrollHeight;
         return;
       }
-      existing.push({
-        role: "assistant",
-        content,
-        creation: new Date().toISOString(),
-        tool_events: "[]",
-        attachments_json: null,
-      });
-      this.optimisticAssistantMessages[conversationName] = existing;
+      this.deferProgressRemoval = true;
+      this.renderMessages(merged);
     }
 
-    ensureConversation(callback) {
-      if (this.state.active && this.state.active.name) {
-        callback(this.state.active.name);
-        return;
-      }
-      const title = (this.el.prompt?.value || "").trim();
-      frappe.call({
-        method: "erp_ai_assistant.api.chat.create_conversation",
-        args: { title },
-        callback: (r) => {
-          this.state.active = r.message;
-          this.state.isDraft = false;
-          this.loadHistory();
-          callback(this.state.active.name);
-        },
-      });
-    }
-
-    shouldConfirmPrompt(prompt) {
-      const text = String(prompt || "").toLowerCase();
-      return [" delete ", " cancel ", " submit ", " amend "].some((word) => ` ${text} `.includes(word));
+    ensureConversation(cb) {
+      if (this.state.active?.name) { cb(this.state.active.name); return; }
+      frappe.call({ method: "erp_ai_assistant.api.chat.create_conversation", args: { title: this.el.prompt?.value || "" }, callback: (r) => { this.state.active = r.message; this.state.isDraft = false; this.loadHistory(); cb(this.state.active.name); } });
     }
 
     sendPrompt() {
       const prompt = (this.el.prompt?.value || "").trim();
       const images = this.pendingImages.slice();
       if (!prompt && !images.length) return;
-      if (prompt && this.shouldConfirmPrompt(prompt) && !window.confirm("This prompt looks like it could change records. Continue?")) {
-        return;
-      }
+      if (prompt && [" delete ", " cancel ", " submit "].some(w => ` ${prompt.toLowerCase()} `.includes(w)) && !window.confirm("This may change records. Continue?")) return;
 
       const userContent = prompt || `[Attached ${images.length} image${images.length === 1 ? "" : "s"}]`;
-      const userAttachments = { attachments: images.map((item, index) => ({ label: "Image", filename: item.name || `image-${index + 1}`, file_type: String(item.type || "image").split("/").pop(), file_url: item.dataUrl })) };
-      this.pushMessage({ role: "user", content: userContent, creation: new Date().toISOString(), attachments_json: JSON.stringify(userAttachments) });
-      if (this.el.prompt) this.el.prompt.value = "";
+      const userAtt = { attachments: images.map((i, idx) => ({ label: "Image", filename: i.name || `image-${idx + 1}`, file_type: String(i.type || "image").split("/").pop(), file_url: i.dataUrl })) };
+      this.pushMessage({ role: "user", content: userContent, creation: new Date().toISOString(), attachments_json: JSON.stringify(userAtt) });
+      if (this.el.prompt) { this.el.prompt.value = ""; autoGrow(this.el.prompt); }
       this.clearPendingImages();
-      this.updateStatus("Sending request...");
 
-      this.ensureConversation((conversationName) => {
-        this.awaitingQueueAck[conversationName] = true;
-        const context = this.state.context || resolveDeskContext();
+      this.ensureConversation((convName) => {
+        this.awaitingQueueAck[convName] = true;
+        const ctx = this.state.context || resolveDeskContext();
         frappe.call({
           method: "erp_ai_assistant.api.assistant.handle_prompt",
-          args: {
-            conversation: conversationName,
-            prompt,
-            route: context.route || (window.location.hash ? window.location.hash.slice(1) : ""),
-            doctype: context.doctype || undefined,
-            docname: context.docname || undefined,
-            model: this.el.modelSelect?.value || undefined,
-            images: images.length ? JSON.stringify(images.map((item) => ({ name: item.name, type: item.type, data_url: item.dataUrl }))) : undefined,
+          args: { conversation: convName, prompt, route: ctx.route || "", doctype: ctx.doctype || undefined, docname: ctx.docname || undefined, model: this.el.modelSelect?.value || undefined, images: images.length ? JSON.stringify(images.map(i => ({ name: i.name, type: i.type, data_url: i.dataUrl }))) : undefined },
+          callback: (resp) => {
+            const p = resp?.message || {};
+            logDebug(p);
+            if (p.queued) { this.awaitingQueueAck[convName] = false; this.startProgressPolling(convName); return; }
+            if (String(p.reply || "").trim()) this.renderFinalReply(convName, p.reply, { toolEvents: p.tool_events, attachments: p.attachments });
+            this.finishRun(convName);
           },
-          callback: (response) => {
-            const payload = response?.message || {};
-            logAssistantDebug(payload);
-            if (payload.queued) {
-              this.awaitingQueueAck[conversationName] = false;
-              this.startProgressPolling(conversationName);
-              return;
-            }
-            if (String(payload.reply || "").trim()) {
-              this.queueOptimisticAssistantMessage(conversationName, payload.reply);
-              this.renderMessages(this.getConversationMessages(conversationName));
-            }
-            this.finishPromptRun(conversationName);
-          },
-          error: (err) => {
-            delete this.awaitingQueueAck[conversationName];
-            this.finishPromptRun(null, { keepMessages: true });
-            this.renderSystemMessage(err.message || "Request failed");
-            this.updateStatus("Request failed.");
-          },
+          error: (err) => { delete this.awaitingQueueAck[convName]; this.finishRun(null, { keepMessages: true }); this.renderSystemMessage(err.message || "Request failed"); },
         });
       });
     }
 
+    /* ── Retry ─────────────────────────────────────────────────────────── */
+    retryLast() {
+      if (!this.state.active?.name) return;
+      const name = this.state.active.name;
+      const msgs = this.getMergedMessages(name);
+      // Find last user message
+      let lastUserPrompt = "";
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role === "user") { lastUserPrompt = msgs[i].content || ""; break; }
+      }
+      if (!lastUserPrompt) return;
+      // Remove optimistic assistant messages
+      delete this.optimisticAssistantMessages[name];
+      // Delete last assistant message from server
+      frappe.call({ method: "erp_ai_assistant.api.chat.delete_last_assistant_message", args: { conversation: name }, callback: () => {
+        this.el.prompt.value = lastUserPrompt;
+        autoGrow(this.el.prompt);
+        this.sendPrompt();
+      }, error: () => {
+        this.el.prompt.value = lastUserPrompt;
+        autoGrow(this.el.prompt);
+      } });
+    }
+
+    /* ── Messages rendering ───────────────────────────────────────────── */
     renderMessages(messages) {
-      this.el.messages.innerHTML = "";
       if (!messages.length) {
-        const text = this.state.isDraft ? "Start with a suggested prompt or ask about the current ERP context." : "No messages yet.";
-        this.el.messages.innerHTML = `<div class="erp-web-assistant__empty"><strong>ERP AI Desktop</strong><span>${safeHtml(text)}</span><small>Responses are designed to be grounded in ERP data, draft-safe for actions, and easier to reuse across your ERPNext system.</small></div>`;
+        // Only rebuild empty state if it isn't already showing
+        if (!this.el.messages.querySelector(".erp-web-assistant__empty")) {
+          this.el.messages.innerHTML = "";
+          const ctx = this.state.context;
+          const cards = getSuggestions(ctx);
+          this.el.messages.innerHTML = `
+            <div class="erp-web-assistant__empty">
+              <div class="erp-web-assistant__empty-icon">AI</div>
+              <strong>ERP AI Assistant</strong>
+              <span>Ask about your ERP data, create drafts, analyze reports, or get actionable insights — all grounded in live data.</span>
+              <div class="erp-web-assistant__empty-grid">
+                ${cards.map(c => `<button type="button" class="erp-web-assistant__empty-card" data-prompt="${safeHtml(c.prompt)}"><strong>${safeHtml(c.label)}</strong><small>${safeHtml(c.prompt)}</small></button>`).join("")}
+              </div>
+            </div>`;
+          this.el.messages.querySelectorAll("[data-prompt]").forEach(b => b.addEventListener("click", () => { this.applyPrompt(b.getAttribute("data-prompt")); this.sendPrompt(); }));
+        }
         return;
       }
-      messages.forEach((message) => this.pushMessage(message));
-    }
 
-    pushMessage(message) {
-      const item = document.createElement("div");
-      item.className = "erp-web-assistant__msg";
-      const isUser = message.role === "user";
-      if (isUser) item.classList.add("is-user");
-      item.innerHTML = `
-        ${renderMessageHeader(message)}
-        ${!isUser ? renderToolEvents(message.tool_events) : ""}
-        <div class="erp-web-assistant__msg-body">${renderRichText(message.content || "")}</div>
-        ${renderAttachments(message.attachments_json)}
-      `;
-      Array.from(item.querySelectorAll("[data-copilot-prompt]")).forEach((button) => {
-        button.addEventListener("click", () => this.handleCopilotPrompt(button.getAttribute("data-copilot-prompt") || "", false));
+      // Diff-aware update: only add/replace messages that have changed.
+      // Key each rendered message by a stable fingerprint so we never wipe
+      // messages that are already correctly displayed.
+      const existing = Array.from(this.el.messages.querySelectorAll(".erp-web-assistant__msg:not(.is-progress)"));
+
+      // If the existing DOM already has empty-state or count mismatch, do a clean rebuild
+      const hasEmptyState = !!this.el.messages.querySelector(".erp-web-assistant__empty");
+      if (hasEmptyState) {
+        this.el.messages.innerHTML = "";
+      }
+
+      messages.forEach((m, i) => {
+        const isLast = i === messages.length - 1;
+        const fp = this._msgFingerprint(m, isLast);
+        const domNode = existing[i];
+        if (domNode && domNode.dataset.fp === fp) {
+          // Already correct — just make sure it's in the right position
+          return;
+        }
+        if (domNode) {
+          this._populateMessageNode(domNode, m, isLast);
+          domNode.dataset.fp = fp;
+        } else {
+          const newNode = this._buildMessageNode(m, isLast);
+          newNode.dataset.fp = fp;
+          const progress = this.el.messages.querySelector(".erp-web-assistant__msg.is-progress");
+          if (progress) this.el.messages.insertBefore(newNode, progress);
+          else this.el.messages.appendChild(newNode);
+        }
       });
-      Array.from(item.querySelectorAll("[data-export-toggle]" )).forEach((button) => {
-        button.addEventListener("click", () => {
-          const exportId = button.getAttribute("data-export-toggle") || "";
-          const body = item.querySelector(`[data-export-body="${CSS.escape(exportId)}"]`);
-          if (!body) return;
-          const allRows = JSON.parse(decodeHtml(body.getAttribute("data-all-rows") || "[]"));
-          const previewRows = JSON.parse(decodeHtml(body.getAttribute("data-preview-rows") || "[]"));
-          const sample = allRows[0] || previewRows[0] || {};
-          const headers = Object.keys(sample).slice(0, 12);
-          const expanded = button.getAttribute("data-state") === "expanded";
-          const targetRows = expanded ? previewRows : allRows;
-          body.innerHTML = renderDatasetRows(headers, targetRows);
-          button.setAttribute("data-state", expanded ? "collapsed" : "expanded");
-          button.textContent = expanded ? "Show all rows" : "Show preview";
-        });
-      });
-      this.el.messages.appendChild(item);
+
+      // Remove any extra trailing nodes (e.g. after a retry removed a message)
+      const remaining = Array.from(this.el.messages.querySelectorAll(".erp-web-assistant__msg:not(.is-progress)"));
+      while (remaining.length > messages.length) {
+        remaining.pop().remove();
+      }
+
+      const progress = this.el.messages.querySelector(".erp-web-assistant__msg.is-progress");
+      if (progress && this.deferProgressRemoval) {
+        this.deferProgressRemoval = false;
+        progress.remove();
+      }
+
       this.el.messages.scrollTop = this.el.messages.scrollHeight;
     }
 
-    renderSystemMessage(text) {
-      this.el.messages.innerHTML = `<div class="erp-web-assistant__empty"><strong>ERP AI Desktop</strong><span>${safeHtml(text)}</span></div>`;
+    _msgFingerprint(msg, isLast) {
+      // A cheap stable key: role + first 120 chars of content + isLast flag
+      // isLast matters because it controls whether the Retry button is shown
+      return `${msg.role}|${String(msg.content || "").slice(0, 120)}|${String(msg.tool_events || "").slice(0, 40)}|${String(msg.attachments_json || "").slice(0, 60)}|${isLast ? "1" : "0"}`;
     }
 
-    loadModelOptions() {
-      frappe.call({
-        method: "erp_ai_assistant.api.ai.get_available_models",
-        callback: (response) => this.setModelOptions(response?.message || {}),
-        error: () => this.setModelOptions({}),
+    _buildMessageNode(msg, isLast) {
+      const item = document.createElement("div");
+      item.className = "erp-web-assistant__msg";
+      this._populateMessageNode(item, msg, isLast);
+      return item;
+    }
+
+    _populateMessageNode(item, msg, isLast) {
+      item.className = "erp-web-assistant__msg";
+      const isUser = msg.role === "user";
+      if (isUser) item.classList.add("is-user");
+
+      let actionsHtml = "";
+      if (!isUser) {
+        actionsHtml = `<div class="erp-web-assistant__msg-actions"><button class="erp-web-assistant__msg-action-btn" data-action="copy-msg" type="button">⧉ Copy</button>${isLast ? '<button class="erp-web-assistant__msg-action-btn" data-action="retry" type="button">↻ Retry</button>' : ""}</div>`;
+      }
+
+      item.innerHTML = `
+        ${renderMessageHeader(msg)}
+        ${!isUser ? renderToolEvents(msg.tool_events) : ""}
+        <div class="erp-web-assistant__msg-body">${renderRichText(msg.content || "")}</div>
+        ${renderAttachments(msg.attachments_json)}
+        ${actionsHtml}
+      `;
+
+      item.querySelectorAll("[data-copilot-prompt]").forEach(b => b.addEventListener("click", () => this.handleCopilotPrompt(b.getAttribute("data-copilot-prompt") || "")));
+      item.querySelectorAll("[data-export-toggle]").forEach(b => {
+        b.addEventListener("click", () => {
+          const eid = b.getAttribute("data-export-toggle") || "";
+          const body = item.querySelector(`[data-export-body="${CSS.escape(eid)}"]`);
+          if (!body) return;
+          const all = JSON.parse(decodeHtml(body.getAttribute("data-all-rows") || "[]"));
+          const preview = JSON.parse(decodeHtml(body.getAttribute("data-preview-rows") || "[]"));
+          const h = Object.keys((all[0] || preview[0] || {})).slice(0, 12);
+          const expanded = b.getAttribute("data-state") === "expanded";
+          body.innerHTML = renderDatasetRows(h, expanded ? preview : all);
+          b.setAttribute("data-state", expanded ? "collapsed" : "expanded");
+          b.textContent = expanded ? "Show all" : "Show preview";
+        });
       });
+      item.querySelector('[data-action="copy-msg"]')?.addEventListener("click", async (e) => {
+        const btn = e.currentTarget;
+        try { await navigator.clipboard.writeText(msg.content || ""); btn.textContent = "✓ Copied"; btn.classList.add("is-copied"); setTimeout(() => { btn.textContent = "⧉ Copy"; btn.classList.remove("is-copied"); }, 1500); } catch { btn.textContent = "! Failed"; setTimeout(() => { btn.textContent = "⧉ Copy"; }, 1500); }
+      });
+      item.querySelector('[data-action="retry"]')?.addEventListener("click", () => this.retryLast());
+    }
+
+    pushMessage(msg, isLast) {
+      // Remove progress bubble so new message appends after content (not before it)
+      const progress = this.el.messages.querySelector(".erp-web-assistant__msg.is-progress");
+      const node = this._buildMessageNode(msg, !!isLast);
+      node.dataset.fp = this._msgFingerprint(msg, !!isLast);
+      if (progress) {
+        this.el.messages.insertBefore(node, progress);
+      } else {
+        this.el.messages.appendChild(node);
+      }
+      this.el.messages.scrollTop = this.el.messages.scrollHeight;
+    }
+
+    retryLast() {
+      const conv = this.activeConversation;
+      if (!conv || !conv.name) return;
+      if (this.isGenerating) return;
+
+      const cache = this.messageCache[conv.name] || [];
+      if (!cache.length) return;
+
+      const last = cache[cache.length - 1];
+      if (last.role !== "assistant") return;
+      
+      const prevUser = cache.length > 1 ? cache[cache.length - 2] : null;
+      if (!prevUser || prevUser.role !== "user") return;
+
+      this.setGenerating(true);
+
+      frappe.call({
+        method: "erp_ai_assistant.api.chat.delete_last_assistant_message",
+        args: { conversation: conv.name },
+        callback: (r) => {
+          if (r.message && r.message.ok) {
+            this.messageCache[conv.name].pop();
+            this.renderMessages(this.getMergedMessages(conv.name));
+            if (this.el.textarea) {
+              this.el.textarea.value = prevUser.content || "";
+              this.sendPrompt();
+            }
+          } else {
+             this.setGenerating(false);
+             frappe.show_alert({ message: "Unable to retry message.", indicator: "orange" });
+          }
+        },
+        error: (err) => {
+          this.setGenerating(false);
+          frappe.show_alert({ message: err.message || "Failed to retry", indicator: "red" });
+        }
+      });
+    }
+
+    renderSystemMessage(text) {
+      this.el.messages.innerHTML = `<div class="erp-web-assistant__empty"><div class="erp-web-assistant__empty-icon">AI</div><strong>ERP AI Assistant</strong><span>${safeHtml(text)}</span></div>`;
+    }
+
+    /* ── Model selector ───────────────────────────────────────────────── */
+    loadModelOptions() {
+      frappe.call({ method: "erp_ai_assistant.api.ai.get_available_models", callback: (r) => this.setModelOptions(r?.message || {}), error: () => this.setModelOptions({}) });
     }
 
     setModelOptions(payload) {
-      const select = this.el.modelSelect;
-      if (!select) return;
+      const select = this.el.modelSelect; if (!select) return;
       const models = Array.isArray(payload.models) ? payload.models.filter(Boolean) : [];
-      const defaultModel = payload.default_model || models[0] || "";
+      const def = payload.default_model || models[0] || "";
       const persisted = localStorage.getItem(this.modelStorageKey);
-      const selected = persisted && models.includes(persisted) ? persisted : defaultModel;
+      const selected = persisted && models.includes(persisted) ? persisted : def;
       select.innerHTML = "";
-      models.forEach((model) => {
-        const option = document.createElement("option");
-        option.value = model;
-        option.textContent = model;
-        if (model === selected) option.selected = true;
-        select.appendChild(option);
-      });
-      if (!models.length) {
-        const option = document.createElement("option");
-        option.value = "";
-        option.textContent = "Default model";
-        option.selected = true;
-        select.appendChild(option);
-      }
+      models.forEach(m => { const o = document.createElement("option"); o.value = m; o.textContent = m; if (m === selected) o.selected = true; select.appendChild(o); });
+      if (!models.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "Default model"; o.selected = true; select.appendChild(o); }
       this.persistSelectedModel();
     }
 
-    persistSelectedModel() {
-      const selected = this.el.modelSelect?.value;
-      if (selected) localStorage.setItem(this.modelStorageKey, selected);
-    }
+    persistSelectedModel() { const v = this.el.modelSelect?.value; if (v) localStorage.setItem(this.modelStorageKey, v); }
 
+    /* ── Image handling ───────────────────────────────────────────────── */
     async ingestImageFiles(fileList) {
-      const files = Array.from(fileList || []);
-      for (const file of files) {
+      for (const file of Array.from(fileList || [])) {
         if (!file || !String(file.type || "").startsWith("image/")) continue;
-        if (this.pendingImages.length >= 4) {
-          frappe.show_alert({ message: "Maximum 4 images per prompt", indicator: "orange" });
-          break;
-        }
-        if (file.size > 4 * 1024 * 1024) {
-          frappe.show_alert({ message: `${file.name || "Image"} exceeds 4MB`, indicator: "orange" });
-          continue;
-        }
+        if (this.pendingImages.length >= 4) { frappe.show_alert({ message: "Max 4 images", indicator: "orange" }); break; }
+        if (file.size > 4 * 1024 * 1024) { frappe.show_alert({ message: `${file.name} exceeds 4MB`, indicator: "orange" }); continue; }
         try {
-          const dataUrl = await this.readFileAsDataUrl(file);
-          this.pendingImages.push({ name: file.name || "image", type: file.type || "image/png", size: file.size || 0, dataUrl });
-        } catch (error) {
-          frappe.show_alert({ message: "Unable to read image", indicator: "red" });
-        }
+          const dataUrl = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result || "")); r.onerror = () => rej(); r.readAsDataURL(file); });
+          this.pendingImages.push({ name: file.name || "image", type: file.type || "image/png", size: file.size, dataUrl });
+        } catch { frappe.show_alert({ message: "Unable to read image", indicator: "red" }); }
       }
       this.renderImagePreview();
     }
 
-    readFileAsDataUrl(file) {
-      return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ""));
-        reader.onerror = () => reject(new Error("read_failed"));
-        reader.readAsDataURL(file);
-      });
-    }
-
     renderImagePreview() {
-      const wrap = this.el.imagePreview;
-      if (!wrap) return;
-      wrap.innerHTML = "";
-      if (!this.pendingImages.length) return;
-      this.pendingImages.forEach((item, index) => {
-        const chip = document.createElement("button");
-        chip.type = "button";
-        chip.className = "erp-web-assistant__image-chip";
-        chip.title = item.name;
+      const w = this.el.imagePreview; if (!w) return;
+      w.innerHTML = "";
+      this.pendingImages.forEach((item, i) => {
+        const chip = document.createElement("button"); chip.type = "button"; chip.className = "erp-web-assistant__image-chip"; chip.title = item.name;
         chip.innerHTML = `<img src="${item.dataUrl}" alt="${safeHtml(item.name)}" /><span>${safeHtml(item.name)}</span><strong>×</strong>`;
-        chip.addEventListener("click", () => {
-          this.pendingImages.splice(index, 1);
-          this.renderImagePreview();
-        });
-        wrap.appendChild(chip);
+        chip.addEventListener("click", () => { this.pendingImages.splice(i, 1); this.renderImagePreview(); });
+        w.appendChild(chip);
       });
     }
 
-    clearPendingImages() {
-      this.pendingImages = [];
-      this.renderImagePreview();
-    }
+    clearPendingImages() { this.pendingImages = []; this.renderImagePreview(); }
 
-    startProgressPolling(conversationName) {
+    /* ── Progress / Streaming ─────────────────────────────────────────── */
+    startProgressPolling(convName) {
       this.stopProgressPolling();
       this.showProgress(["Preparing response"], "", { stage: "working", done: false });
-      if (!conversationName) return;
+      if (!convName) return;
 
-      // ── Realtime listener (Socket.IO) ─────────────────────────────────────
-      const realtimeHandler = (data) => {
-        if (!data || String(data.conversation || "").trim() !== conversationName) return;
+      const handler = (data) => {
+        if (!data || String(data.conversation || "") !== convName) return;
         const steps = Array.isArray(data.steps) ? data.steps : [];
-        const stage = String(data.stage || "").trim().toLowerCase();
-        if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) return;
+        const stage = String(data.stage || "").toLowerCase();
+        if (!stage && this.awaitingQueueAck[convName]) return;
         this.showProgress(steps, data.partial_text || "", { stage, done: !!data.done });
         if (data.done) {
-          this.stopProgressPolling();
-          if (data.error) {
-            this.finishPromptRun(null, { keepMessages: true });
-            this.renderSystemMessage(data.error || "Request failed");
-            this.updateStatus("Request failed.");
-            return;
-          }
-          frappe.call({
-            method: "erp_ai_assistant.api.ai.get_prompt_result",
-            args: { conversation: conversationName },
-            callback: (resultResponse) => {
-              const result = resultResponse?.message || {};
-              logAssistantDebug(result);
-              if (result.done && String(result.reply || "").trim()) {
-                this.queueOptimisticAssistantMessage(conversationName, result.reply);
-                this.renderMessages(this.getConversationMessages(conversationName));
-              }
-              this.finishPromptRun(conversationName);
-            },
-            error: () => this.finishPromptRun(conversationName),
-          });
+          if (!this.tryBeginCompletionFetch(convName)) return;
+          this.stopProgressPolling({ keepVisible: true });
+          if (data.error) { this.clearCompletionFetchLock(convName); this.finishRun(null, { keepMessages: true }); this.renderSystemMessage(data.error); return; }
+          frappe.call({ method: "erp_ai_assistant.api.ai.get_prompt_result", args: { conversation: convName }, callback: (r) => {
+            const res = r?.message || {};
+            logDebug(res);
+            if (res.done && String(res.reply || "").trim()) this.renderFinalReply(convName, res.reply, { toolEvents: res.tool_events, attachments: res.attachments });
+            this.finishRun(convName);
+          }, error: () => { this.clearCompletionFetchLock(convName); this.finishRun(convName); } });
         }
       };
 
-      this._realtimeProgressHandler = realtimeHandler;
-      this._realtimeProgressConversation = conversationName;
-      try { frappe.realtime.on("erp_ai_progress", realtimeHandler); } catch (e) { /* polling covers it */ }
+      this._rtHandler = handler;
+      try { frappe.realtime.on("erp_ai_progress", handler); } catch { /* polling covers it */ }
 
-      // ── Polling fallback (800 ms) ─────────────────────────────────────────
-      const pollProgress = () => {
+      const poll = () => {
         if (this.progressPollPending) return;
         this.progressPollPending = true;
         frappe.call({
           method: "erp_ai_assistant.api.ai.get_prompt_progress",
-          args: { conversation: conversationName },
-          callback: (response) => {
-            const progress = response?.message || {};
-            const steps = Array.isArray(progress.steps) ? progress.steps : [];
-            const stage = String(progress.stage || "").trim().toLowerCase();
-            if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) return;
-            this.showProgress(steps, progress.partial_text || "", { stage, done: !!progress.done });
-            if (progress.done) {
-              this.stopProgressPolling();
-              if (progress.error) {
-                this.finishPromptRun(null, { keepMessages: true });
-                this.renderSystemMessage(progress.error || "Request failed");
-                this.updateStatus("Request failed.");
-                return;
-              }
-              frappe.call({
-                method: "erp_ai_assistant.api.ai.get_prompt_result",
-                args: { conversation: conversationName },
-                callback: (resultResponse) => {
-                  const result = resultResponse?.message || {};
-                  logAssistantDebug(result);
-                  if (result.done && String(result.reply || "").trim()) {
-                    this.queueOptimisticAssistantMessage(conversationName, result.reply);
-                    this.renderMessages(this.getConversationMessages(conversationName));
-                  }
-                  this.finishPromptRun(conversationName);
-                },
-                error: () => this.finishPromptRun(conversationName),
-              });
+          args: { conversation: convName },
+          callback: (r) => {
+            const p = r?.message || {};
+            const steps = Array.isArray(p.steps) ? p.steps : [];
+            const stage = String(p.stage || "").toLowerCase();
+            if (!stage && this.awaitingQueueAck[convName]) return;
+            this.showProgress(steps, p.partial_text || "", { stage, done: !!p.done });
+            if (p.done) {
+              if (!this.tryBeginCompletionFetch(convName)) return;
+              this.stopProgressPolling({ keepVisible: true });
+              if (p.error) { this.clearCompletionFetchLock(convName); this.finishRun(null, { keepMessages: true }); this.renderSystemMessage(p.error); return; }
+              frappe.call({ method: "erp_ai_assistant.api.ai.get_prompt_result", args: { conversation: convName }, callback: (r2) => {
+                const res = r2?.message || {};
+                if (res.done && String(res.reply || "").trim()) this.renderFinalReply(convName, res.reply, { toolEvents: res.tool_events, attachments: res.attachments });
+                this.finishRun(convName);
+              }, error: () => { this.clearCompletionFetchLock(convName); this.finishRun(convName); } });
             }
           },
-          always: () => {
-            this.progressPollPending = false;
-          },
+          always: () => { this.progressPollPending = false; },
         });
       };
-      pollProgress();
-      this.progressPollTimer = window.setInterval(() => pollProgress(), 800);
+      poll();
+      this.progressPollTimer = setInterval(poll, 800);
     }
 
-    stopProgressPolling() {
-      if (this.progressPollTimer) {
-        clearInterval(this.progressPollTimer);
-        this.progressPollTimer = null;
-      }
+    stopProgressPolling(opts) {
+      const keepVisible = !!opts?.keepVisible;
+      if (this.progressPollTimer) { clearInterval(this.progressPollTimer); this.progressPollTimer = null; }
       this.progressPollPending = false;
-      if (this._realtimeProgressHandler) {
-        try { frappe.realtime.off("erp_ai_progress", this._realtimeProgressHandler); } catch (e) { /* ignore */ }
-        this._realtimeProgressHandler = null;
-        this._realtimeProgressConversation = null;
-      }
-      this.hideProgress();
+      if (this._rtHandler) { try { frappe.realtime.off("erp_ai_progress", this._rtHandler); } catch { /* ignore */ } this._rtHandler = null; }
+      if (!keepVisible) this.hideProgress();
     }
 
-    showProgress(steps, partialText, options) {
-      const settings = options || {};
-      const done = !!settings.done;
+    showProgress(steps, partialText, opts) {
+      const done = !!opts?.done;
       const existing = this.el.messages.querySelector(".erp-web-assistant__msg.is-progress");
       if (existing) {
-        const summary = existing.querySelector(".erp-web-assistant__progress-summary");
-        const stepWrap = existing.querySelector(".erp-web-assistant__progress-steps");
-        const partialWrap = existing.querySelector(".erp-web-assistant__progress-partial");
-        const spinner = existing.querySelector(".erp-web-assistant__progress-spinner");
-        if (summary) summary.textContent = summarizeProgressSteps(steps, done);
+        const label = existing.querySelector(".erp-web-assistant__thinking-label");
+        const stepWrap = existing.querySelector(".erp-web-assistant__thinking-steps");
+        const partial = existing.querySelector(".erp-web-assistant__progress-partial");
+        const spinner = existing.querySelector(".erp-web-assistant__thinking-spinner");
+        if (label) label.textContent = summarizeSteps(steps, done);
         existing.classList.toggle("is-done", done);
         if (spinner) spinner.style.display = done ? "none" : "inline-block";
         if (stepWrap) {
-          const items = Array.isArray(steps) ? steps.filter(Boolean) : [];
-          const finalItems = items.length ? items.slice(-6) : ["Preparing response"];
-          stepWrap.innerHTML = "";
-          finalItems.forEach((item, index) => {
-            const row = document.createElement("div");
-            row.className = "erp-web-assistant__progress-step";
-            row.innerHTML = `<span class="erp-web-assistant__progress-step-icon">${done || index < finalItems.length - 1 ? "✓" : "⟳"}</span><span class="erp-web-assistant__progress-step-label">${safeHtml(mapProgressStepLabel(item))}</span>`;
-            stepWrap.appendChild(row);
-          });
+          const items = (Array.isArray(steps) ? steps.filter(Boolean) : []).slice(-6);
+          const final = items.length ? items : ["Preparing response"];
+          stepWrap.innerHTML = final.map((s, i) => `<div class="erp-web-assistant__thinking-step"><span class="erp-web-assistant__thinking-step-icon">${done || i < final.length - 1 ? "✓" : "⟳"}</span><span>${safeHtml(mapStepLabel(s))}</span></div>`).join("");
         }
-        if (partialWrap) {
-          partialWrap.textContent = String(partialText || "").trim();
-          partialWrap.style.display = partialWrap.textContent ? "block" : "none";
-        }
+        if (partial) { partial.textContent = String(partialText || "").trim(); partial.style.display = partial.textContent ? "block" : "none"; }
         return;
       }
       const progress = document.createElement("div");
       progress.className = "erp-web-assistant__msg is-progress";
       progress.innerHTML = `
-        <div class="erp-web-assistant__message-head"><span class="erp-web-assistant__msg-meta">Assistant</span><span class="erp-web-assistant__message-badges"><span class="erp-web-assistant__message-badge is-neutral">Processing</span></span></div>
+        <div class="erp-web-assistant__message-head"><div class="erp-web-assistant__msg-meta"><span class="erp-web-assistant__msg-role">Assistant</span></div></div>
         <div class="erp-web-assistant__progress-partial" style="display:none;"></div>
-        <details class="erp-web-assistant__progress-log" open>
-          <summary class="erp-web-assistant__progress-head">
-            <span class="erp-web-assistant__progress-spinner" aria-hidden="true"></span>
-            <span class="erp-web-assistant__progress-summary">Running...</span>
+        <details class="erp-web-assistant__thinking" open>
+          <summary class="erp-web-assistant__thinking-head">
+            <span class="erp-web-assistant__thinking-spinner"></span>
+            <span class="erp-web-assistant__thinking-label">Working...</span>
           </summary>
-          <div class="erp-web-assistant__progress-steps"></div>
+          <div class="erp-web-assistant__thinking-steps"></div>
         </details>`;
       this.el.messages.appendChild(progress);
-      this.showProgress(steps, partialText, settings);
+      this.showProgress(steps, partialText, opts);
       this.el.messages.scrollTop = this.el.messages.scrollHeight;
     }
 
-    hideProgress() {
-      this.el.messages.querySelector(".erp-web-assistant__msg.is-progress")?.remove();
+    hideProgress() { this.el.messages.querySelector(".erp-web-assistant__msg.is-progress")?.remove(); }
+
+    tryBeginCompletionFetch(convName) {
+      if (!convName) return false;
+      if (this.completionFetchLocks[convName]) return false;
+      this.completionFetchLocks[convName] = true;
+      return true;
     }
 
-    clearCompletionReloadTimer(conversationName) {
-      const timer = this.completionReloadTimers[conversationName];
-      if (timer) {
-        clearTimeout(timer);
-        delete this.completionReloadTimers[conversationName];
+    clearCompletionFetchLock(convName) {
+      if (!convName) return;
+      delete this.completionFetchLocks[convName];
+    }
+
+    hasPendingOptimisticReply(convName) {
+      const opt = this.optimisticAssistantMessages[convName] || [];
+      return !!opt.length && !!String(opt[opt.length - 1]?.content || "").trim();
+    }
+
+    finalizeRun(convName, opts) {
+      this.stopProgressPolling(opts);
+      if (convName) {
+        this.clearCompletionFetchLock(convName);
+        delete this.awaitingQueueAck[convName];
+        this.loadHistory();
+        return;
       }
+      Object.keys(this.completionFetchLocks).forEach((key) => delete this.completionFetchLocks[key]);
+      if (!opts?.keepMessages) this.loadHistory();
     }
 
-    loadConversationAfterCompletion(conversationName, attempt) {
-      if (!conversationName) return;
+    /* ── Completion ───────────────────────────────────────────────────── */
+    loadConversationAfterCompletion(name, attempt) {
+      if (!name) return;
       const tryCount = Number(attempt || 0);
-      this.clearCompletionReloadTimer(conversationName);
-      this.loadConversation(conversationName, {
-        onLoaded: (_payload, serverMessages) => {
-          const rows = Array.isArray(serverMessages) ? serverMessages : [];
-          const lastMessage = rows.length ? rows[rows.length - 1] : null;
-          const hasAssistantReply = !!(lastMessage && lastMessage.role === "assistant");
-          if (!hasAssistantReply && tryCount < 5) {
-            this.completionReloadTimers[conversationName] = window.setTimeout(() => {
-              this.loadConversationAfterCompletion(conversationName, tryCount + 1);
-            }, 1200);
+      clearTimeout(this.completionReloadTimers[name]);
+      this.loadConversation(name, {
+        silent: true,
+        waitForOptimisticConfirmation: true,
+        onLoaded: (_, serverMsgs) => {
+          const opt = this.optimisticAssistantMessages[name] || [];
+          const expected = opt.length ? String(opt[opt.length - 1]?.content || "").trim() : "";
+          const latestServerReply = serverMsgs.length && serverMsgs[serverMsgs.length - 1]?.role === "assistant";
+          const exactReplyMatch = expected ? serverMsgs.some(r => r?.role === "assistant" && String(r.content || "").trim() === expected) : false;
+          const hasReply = exactReplyMatch || !!latestServerReply;
+          if (hasReply || !expected) {
+            if (hasReply) delete this.optimisticAssistantMessages[name];
+            this.deferProgressRemoval = true;
+            this.renderMessages(this.getMergedMessages(name));
+            this.renderHistory();
+            this.finalizeRun(name);
+            delete this.completionReloadTimers[name];
+          }
+          if (!hasReply && tryCount < 8) {
+            this.completionReloadTimers[name] = setTimeout(() => this.loadConversationAfterCompletion(name, tryCount + 1), 1200);
             return;
           }
-          this.clearCompletionReloadTimer(conversationName);
+          if (!hasReply) this.finalizeRun(name);
         },
       });
     }
 
-    finishPromptRun(conversationName, options) {
-      const settings = options || {};
-      this.stopProgressPolling();
-      if (conversationName) {
-        delete this.awaitingQueueAck[conversationName];
-        this.loadConversationAfterCompletion(conversationName, 0);
-        this.loadHistory();
-        this.updateStatus("Response ready.");
+    finishRun(convName, opts) {
+      if (convName) {
+        if (this.hasPendingOptimisticReply(convName)) {
+          this.finalizeRun(convName);
+        } else {
+          this.stopProgressPolling({ keepVisible: true });
+        }
+        this.loadConversationAfterCompletion(convName, 0);
         return;
       }
-      if (!settings.keepMessages) this.loadHistory();
+      this.finalizeRun(null, opts);
     }
   }
 

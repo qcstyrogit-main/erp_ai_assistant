@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import Any
 
@@ -7,7 +8,7 @@ from frappe import _
 from frappe.utils.data import get_url_to_form
 from frappe.utils import getdate, nowdate
 
-from .catalog import get_safe_doctype_config, resolve_safe_doctype_from_text
+from ..catalog import get_safe_doctype_config, resolve_safe_doctype_from_text
 
 
 SAFE_COUNT_QUERIES = {
@@ -26,6 +27,72 @@ def _error(message: str, *, error_type: str = "validation_error", extra: dict[st
     if extra:
         payload.update(extra)
     return payload
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _normalized_match_text(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _candidate_match_score(hint: str, row: dict[str, Any], search_fields: list[str] | None = None) -> int:
+    normalized_hint = _normalized_match_text(hint)
+    if not normalized_hint:
+        return 0
+    fields = ["name"] + list(search_fields or [])
+    values: list[str] = []
+    seen: set[str] = set()
+    for fieldname in fields:
+        value = str((row or {}).get(fieldname) or "").strip()
+        if not value:
+            continue
+        normalized = _normalized_match_text(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        values.append(normalized)
+
+    best = 0
+    for value in values:
+        if value == normalized_hint:
+            best = max(best, 400 if value == _normalized_match_text((row or {}).get("name")) else 320)
+            continue
+        if value.startswith(normalized_hint):
+            best = max(best, 240 if value == _normalized_match_text((row or {}).get("name")) else 180)
+            continue
+        if normalized_hint in value:
+            best = max(best, 120 if value == _normalized_match_text((row or {}).get("name")) else 90)
+    return best
+
+
+def _pick_best_candidate(hint: str, candidates: list[dict[str, Any]], search_fields: list[str] | None = None) -> dict[str, Any] | None:
+    if not _env_flag("ERP_AI_AUTO_SELECT_LINKS", True):
+        return None
+    if not candidates:
+        return None
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for row in candidates:
+        score = _candidate_match_score(hint, row, search_fields=search_fields)
+        if score > 0:
+            scored.append((score, row))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_score, top_row = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else -1
+    if top_score >= 300:
+        return top_row
+    if top_score >= 180 and second_score < top_score:
+        return top_row
+    if top_score >= 120 and second_score <= 0 and len(scored) == 1:
+        return top_row
+    return None
 
 
 def _as_float(value: Any) -> float | None:
@@ -452,7 +519,7 @@ def _filterable_fields_for_doctype(doctype: str) -> set[str]:
         "Text",
         "Read Only",
     }
-    fields = {"name", "owner", "modified_by", "creation", "modified", "docstatus"}
+    fields = {"name", "owner", "modified_by", "creation", "modified", "docstatus", "status"}
     for field in meta.fields:
         fieldname = str(field.fieldname or "").strip()
         fieldtype = str(field.fieldtype or "").strip()
@@ -597,6 +664,9 @@ def _resolve_record_name_detailed(doctype: str, record_hint: str, config: dict[s
     exact_name = next((row for row in candidates if str(row.get("name") or "").strip() == str(record_hint or "").strip()), None)
     if exact_name:
         return {"status": "resolved", "name": str(exact_name.get("name") or "").strip(), "candidates": candidates}
+    best = _pick_best_candidate(record_hint, candidates, search_fields=(config or {}).get("search_fields") or [])
+    if best:
+        return {"status": "resolved", "name": str(best.get("name") or "").strip(), "candidates": candidates}
     return {"status": "ambiguous", "name": None, "candidates": candidates}
 
 
@@ -865,25 +935,80 @@ def extract_update_instruction_internal(doctype: str, body: str, value: str) -> 
 def _list_rows_to_answer(doctype: str, rows: list[dict[str, Any]], heading: str | None = None) -> str:
     title = heading or f"{doctype} list"
     if not rows:
-        return f"{title}\n\nNo records found."
-    lines = [title, ""]
-    for index, row in enumerate(rows[:20], start=1):
-        primary = row.get("name") or f"Row {index}"
-        extras = [f"{key}: {value}" for key, value in row.items() if key != "name" and value not in (None, "", [], {})][:3]
-        suffix = f" ({', '.join(extras)})" if extras else ""
-        lines.append(f"{index}. {primary}{suffix}")
+        return f"## {title}\n\nNo records found."
+
+    common_columns = [
+        "name", "title", "status", "workflow_state", "posting_date", "transaction_date",
+        "due_date", "customer", "supplier", "party_name", "employee_name", "item_name",
+        "company", "grand_total", "outstanding_amount", "currency",
+    ]
+    columns: list[str] = []
+    for column in common_columns:
+        if any(isinstance(row, dict) and row.get(column) not in (None, "", [], {}) for row in rows):
+            columns.append(column)
+        if len(columns) >= 6:
+            break
+    if not columns:
+        first = rows[0] if isinstance(rows[0], dict) else {}
+        columns = [key for key in list(first.keys())[:6] if key]
+
+    lines = [f"## {title}", "", f"Found **{len(rows)}** record{'s' if len(rows) != 1 else ''}.", ""]
+    if columns:
+        header = "| # | " + " | ".join(key.replace("_", " ").title() for key in columns) + " |"
+        divider = "|---|" + "|".join(["---"] * len(columns)) + "|"
+        lines.extend([header, divider])
+        for index, row in enumerate(rows[:10], start=1):
+            if not isinstance(row, dict):
+                cell = str(row).replace("|", "\\|")
+                lines.append(f"| {index} | {cell} |")
+                continue
+            cells = []
+            for key in columns:
+                value = row.get(key)
+                cells.append("—" if value in (None, "", [], {}) else str(value).replace("|", "\\|"))
+            lines.append(f"| {index} | " + " | ".join(cells) + " |")
+        if len(rows) > 10:
+            lines.extend(["", f"Showing first **10** of **{len(rows)}** records."])
+    else:
+        for index, row in enumerate(rows[:10], start=1):
+            lines.append(f"{index}. {row}")
     return "\n".join(lines)
 
 
 def _document_to_answer(doctype: str, payload: dict[str, Any]) -> str:
-    lines = [f"{doctype} {payload.get('name') or ''}".strip(), ""]
+    name = str(payload.get("name") or "").strip()
+    lines = [f"## {doctype}{f' — {name}' if name else ''}", ""]
+
+    priority_fields = [
+        "status", "workflow_state", "docstatus", "posting_date", "transaction_date", "due_date",
+        "customer", "supplier", "party_name", "company", "currency", "grand_total",
+        "rounded_total", "outstanding_amount",
+    ]
+    summary_rows: list[tuple[str, str]] = []
+    for key in priority_fields:
+        value = payload.get(key)
+        if value in (None, "", [], {}):
+            continue
+        summary_rows.append((key.replace("_", " ").title(), str(value)))
+        if len(summary_rows) >= 8:
+            break
+
+    if summary_rows:
+        lines.extend(["### Summary", ""])
+        for label, value in summary_rows:
+            lines.append(f"- **{label}:** {value}")
+        lines.append("")
+
+    lines.extend(["### Details", ""])
     shown = 0
     for key, value in payload.items():
         if value in (None, "", [], {}):
             continue
-        lines.append(f"{key}: {value}")
+        if isinstance(value, (dict, list)):
+            continue
+        lines.append(f"- **{key.replace('_', ' ').title()}:** {value}")
         shown += 1
-        if shown >= 8:
+        if shown >= 12:
             break
     return "\n".join(lines)
 
@@ -1141,11 +1266,15 @@ def _resolve_link_value_detailed(link_doctype: str, raw_value: Any) -> dict[str,
             exact = frappe.db.get_value(link_doctype, {fieldname: hint}, "name")
             if exact:
                 return {"status": "resolved", "name": str(exact), "candidates": [{"name": str(exact)}]}
+    result_fields = ["name"] + [field for field in candidates if field != "name"][:2]
     or_filters = [[link_doctype, fieldname, "like", f"%{hint}%"] for fieldname in candidates[:4]]
-    rows = frappe.get_all(link_doctype, or_filters=or_filters, fields=["name"] + [field for field in candidates if field != "name"][:2], limit_page_length=5, order_by="modified desc")
+    rows = frappe.get_all(link_doctype, or_filters=or_filters, fields=result_fields, limit_page_length=5, order_by="modified desc")
     if len(rows) == 1:
         return {"status": "resolved", "name": str(rows[0].get("name") or "").strip() or None, "candidates": rows}
     if len(rows) > 1:
+        best = _pick_best_candidate(hint, rows, search_fields=result_fields[1:])
+        if best:
+            return {"status": "resolved", "name": str(best.get("name") or "").strip() or None, "candidates": rows}
         return {"status": "ambiguous", "name": None, "candidates": rows}
     return {"status": "not_found", "name": None, "candidates": []}
 
@@ -1615,19 +1744,31 @@ def list_erp_documents_internal(doctype: str, filters: dict[str, Any] | None = N
     _require_doctype_permission(resolved_doctype, "read")
     safe_filters = _sanitize_filters(filters, set(config.get("filter_fields") or set()))
     fields = list(config.get("fields") or ["name"])
+    page_limit = max(1, min(int(limit or 20), 5000))
     rows = frappe.get_all(
         resolved_doctype,
         filters=safe_filters,
         fields=fields,
         order_by="modified desc",
-        limit_page_length=max(1, min(int(limit or 20), 5000)),
+        limit_page_length=page_limit,
     )
+    # Get total count for pagination awareness
+    try:
+        total_count = frappe.db.count(resolved_doctype, filters=safe_filters)
+    except Exception:
+        total_count = len(rows)
     return {
         "ok": True,
         "type": "answer",
         "answer": _list_rows_to_answer(resolved_doctype, rows),
         "data": rows,
-        "meta": {"doctype": resolved_doctype, "filters": safe_filters},
+        "meta": {
+            "doctype": resolved_doctype,
+            "filters": safe_filters,
+            "returned": len(rows),
+            "total_count": total_count,
+            "has_more": total_count > len(rows),
+        },
     }
 
 

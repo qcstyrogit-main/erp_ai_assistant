@@ -4,7 +4,7 @@ from typing import Any
 import frappe
 import requests
 
-from .resource_registry import read_resource
+from ..resource_registry import read_resource
 
 DEFAULT_FAC_MCP_TIMEOUT = 30.0
 

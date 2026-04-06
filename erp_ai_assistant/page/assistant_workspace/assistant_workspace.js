@@ -1,5 +1,5 @@
 frappe.pages["assistant-workspace"].on_page_load = function (wrapper) {
-  const WEB_ASSISTANT_BUILD = "2026-03-24-response-render-fix-v2";
+  const WEB_ASSISTANT_BUILD = "2026-04-06-grounded-ux-v10";
   const webAssistantAsset = `/assets/erp_ai_assistant/js/web_assistant.js?v=${encodeURIComponent(WEB_ASSISTANT_BUILD)}`;
   const webAssistantCssAsset = `/assets/erp_ai_assistant/css/web_assistant.css?v=${encodeURIComponent(WEB_ASSISTANT_BUILD)}`;
   const page = frappe.ui.make_app_page({

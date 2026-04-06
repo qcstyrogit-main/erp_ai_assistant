@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any
 
 import frappe
@@ -7,6 +8,7 @@ from frappe import _
 from . import ai as ai_api
 from .chat import add_message, clear_pending_action, create_conversation, get_pending_action, set_pending_action
 from .context_resolver import build_request_context
+from .intent_detector import detect_intent_heuristic
 from .erp_tools import ping_assistant as ping_assistant_tool
 from .erp_tools import answer_erp_query as answer_erp_query_tool
 from .erp_tools import create_sales_order as create_sales_order_tool
@@ -30,6 +32,9 @@ from .fac_client import test_fac_connection as test_fac_connection_internal
 from .resource_registry import get_resource_catalog_summary, list_resource_specs, read_resource
 from .tool_registry import get_tool_catalog_summary, list_tool_specs
 from .copilot_response import build_copilot_package
+
+
+DIRECT_RESPONSE_INTENTS = {"update", "workflow", "delete"}
 
 
 def _build_router_attachment_package(result: dict[str, Any]) -> dict[str, Any]:
@@ -111,6 +116,24 @@ def _build_tool_event_payload(result: dict[str, Any]) -> list[dict[str, Any] | s
     if result.get("type") == "document" and result.get("doctype") and result.get("name"):
         events.append({"type": "document_ref", "doctype": result.get("doctype"), "name": result.get("name"), "url": result.get("url")})
     return events
+
+
+def _should_run_direct_prompt(prompt: str, context: dict[str, Any] | None = None) -> bool:
+    text = str(prompt or "").strip()
+    if not text:
+        return False
+    meta = detect_intent_heuristic(text, context or {})
+    if str(meta.get("intent") or "").strip().lower() in DIRECT_RESPONSE_INTENTS:
+        return True
+    lowered = text.lower()
+    direct_patterns = (
+        r"^(?:please\s+)?(?:update|change|modify|set|edit|patch|rename|correct|fix|adjust|revise)\b",
+        r"^(?:can you|could you|would you|help me|kindly)\s+(?:please\s+)?(?:update|change|modify|set|edit|patch|rename|correct|fix|adjust|revise)\b",
+        r"^(?:please\s+)?(?:submit|cancel|approve|reject|reopen|close|confirm|validate|authorise|authorize)\b",
+        r"^(?:can you|could you|would you|help me|kindly)\s+(?:please\s+)?(?:submit|cancel|approve|reject|reopen|close|confirm|validate|authorise|authorize)\b",
+        r"\b(?:delete|remove|wipe|erase|purge)\b",
+    )
+    return any(re.search(pattern, lowered) for pattern in direct_patterns)
 
 
 def _should_override_pending_action(
@@ -459,9 +482,11 @@ def handle_prompt(
     route: str | None = None,
     model: str | None = None,
     images: str | list[dict[str, Any]] | None = None,
+    retry_last_user: int | str = 0,
 ) -> dict[str, Any]:
     prompt_text = str(prompt or "").strip()
     parsed_images = ai_api._parse_prompt_images(images)
+    retry_last_user_flag = frappe.utils.cint(retry_last_user) == 1
 
     if parsed_images:
         return ai_api.enqueue_prompt(
@@ -472,6 +497,7 @@ def handle_prompt(
             route=route,
             model=model,
             images=images,
+            retry_last_user=retry_last_user_flag,
         )
 
     conversation_name = conversation or None
@@ -494,6 +520,16 @@ def handle_prompt(
 
     routed = resumed or {"matched": False}
     if not routed.get("matched"):
+        if prompt_text and _should_run_direct_prompt(prompt_text, context):
+            return ai_api.send_prompt(
+                prompt=prompt,
+                conversation=conversation,
+                doctype=doctype,
+                docname=docname,
+                route=route,
+                model=model,
+                images=images,
+            )
         return ai_api.enqueue_prompt(
             prompt=prompt,
             conversation=conversation,
@@ -502,6 +538,7 @@ def handle_prompt(
             route=route,
             model=model,
             images=images,
+            retry_last_user=retry_last_user_flag,
         )
 
     conversation_name = conversation_name or create_conversation(title=ai_api._summarize_title(prompt_text or _("New chat")))["name"]

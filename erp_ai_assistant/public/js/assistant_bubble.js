@@ -1,5 +1,5 @@
 (function () {
-  window.__ERP_AI_ASSISTANT_BUILD__ = "2026-03-24-desk-chrome-upgrade-v2";
+  window.__ERP_AI_ASSISTANT_BUILD__ = "2026-04-06-blink-fix-v9";
 
   function shouldShowToolActivity() {
     try {
@@ -14,6 +14,10 @@
     const doctypes = Array.isArray(debug?.discovery_doctypes) ? debug.discovery_doctypes : [];
     if (!doctypes.length || !window.console) return;
     console.info("[ERP AI Assistant] _get_discovery_doctypes()", doctypes);
+  }
+
+  function isCompactViewport() {
+    return window.matchMedia && window.matchMedia("(max-width: 900px)").matches;
   }
 
   /**
@@ -68,14 +72,23 @@
         /** @type {Object<string, Array<Object>>} */
         this.optimisticAssistantMessages = {};
 
+        /** @type {Object<string, string>} */
+        this.retryPromptGuards = {};
+
         /** @type {Object<string, boolean>} */
         this.awaitingQueueAck = {};
 
         /** @type {Object<string, number>} */
         this.completionReloadTimers = {};
 
-      /** @type {boolean} */
-      this.globalEventsBound = false;
+        /** @type {Object<string, boolean>} */
+        this.completionFetchLocks = {};
+
+        /** @type {boolean} */
+        this.globalEventsBound = false;
+
+        /** @type {string} */
+        this.lastStableContextText = "General chat";
 
     }
 
@@ -110,46 +123,74 @@
       drawer.setAttribute("aria-label", "AI Assistant Dialog");
       drawer.innerHTML = `
         <div class="erp-ai-assistant-drawer__sidebar">
-          <div class="erp-ai-assistant-drawer__sidebar-head">
-            <div>
-              <div class="erp-ai-assistant-drawer__eyebrow">AI Assistant</div>
-              <h3>Conversations</h3>
-            </div>
-            <div class="erp-ai-assistant-drawer__sidebar-actions">
-              <button class="erp-ai-assistant-btn erp-ai-assistant-btn--primary" data-action="new-chat" title="Start new conversation (Ctrl+Shift+N)">New Chat</button>
-            </div>
+          <div class="erp-ai-assistant-drawer__rail">
+            <button class="erp-ai-assistant-rail__logo" data-action="toggle-sidebar" title="Toggle sidebar" type="button">AI</button>
+            <button class="erp-ai-assistant-rail__btn" data-action="new-chat" title="New chat" type="button">✎</button>
+            <button class="erp-ai-assistant-rail__btn" data-action="focus-search" title="Search chats" type="button">⌕</button>
           </div>
-          <input class="erp-ai-assistant-search" placeholder="Search conversations..." aria-label="Search conversations" />
-          <div class="erp-ai-assistant-history"></div>
+          <div class="erp-ai-assistant-drawer__sidebar-panel">
+            <div class="erp-ai-assistant-drawer__sidebar-head">
+              <div>
+                <div class="erp-ai-assistant-drawer__eyebrow">AI Assistant</div>
+                <h3>Chats</h3>
+              </div>
+            </div>
+            <div class="erp-ai-assistant-sidebar__shortcuts">
+              <button class="erp-ai-assistant-sidebar__shortcut" data-action="new-chat" type="button">
+                <span class="erp-ai-assistant-sidebar__shortcut-icon">✎</span>
+                <span>New chat</span>
+              </button>
+              <button class="erp-ai-assistant-sidebar__shortcut" data-action="focus-search" type="button">
+                <span class="erp-ai-assistant-sidebar__shortcut-icon">⌕</span>
+                <span>Search chats</span>
+              </button>
+            </div>
+            <input class="erp-ai-assistant-search" placeholder="Search conversations..." aria-label="Search conversations" />
+            <div class="erp-ai-assistant-history"></div>
+          </div>
         </div>
         <div class="erp-ai-assistant-drawer__main">
           <div class="erp-ai-assistant-drawer__header">
-            <div>
-              <div class="erp-ai-assistant-drawer__eyebrow">Current Context</div>
-              <div class="erp-ai-assistant-context" title="The current page context being used for responses"></div>
+            <div class="erp-ai-assistant-drawer__header-main">
+              <button class="erp-ai-assistant-btn erp-ai-assistant-btn--ghost" data-action="toggle-sidebar" title="Toggle sidebar" type="button">☰</button>
+              <div>
+                <div class="erp-ai-assistant-drawer__eyebrow">Current Context</div>
+                <div class="erp-ai-assistant-context" title="The current page context being used for responses"></div>
+              </div>
             </div>
-            <button class="erp-ai-assistant-btn" data-action="close" title="Close assistant (Esc)">Close</button>
+            <div class="erp-ai-assistant-drawer__header-actions">
+              <button class="erp-ai-assistant-btn erp-ai-assistant-btn--ghost" data-action="connectors" title="Connector Status" type="button">Connectors</button>
+              <button class="erp-ai-assistant-btn erp-ai-assistant-btn--ghost" data-action="close" title="Close assistant (Esc)" type="button">Close</button>
+            </div>
           </div>
           <div class="erp-ai-assistant-messages"></div>
           <div class="erp-ai-assistant-composer">
-            <textarea rows="3" placeholder="Ask anything. If you are on a document, I can also use that ERP context..." aria-label="Message input"></textarea>
-            <div class="erp-ai-assistant-image-preview"></div>
-            <input type="file" class="erp-ai-assistant-image-input" accept="image/*" multiple hidden />
-            <div class="erp-ai-assistant-composer__actions">
-              <div class="erp-ai-assistant-composer__left">
-                <select class="erp-ai-assistant-model-select" aria-label="Select AI model">
-                  <option value="">Default model</option>
-                </select>
-                <span class="erp-ai-assistant-composer__hint"><kbd>Enter</kbd> to send <kbd>Shift+Enter</kbd> for newline</span>
-              </div>
-              <div class="erp-ai-assistant-composer__buttons">
-                <button class="erp-ai-assistant-btn" data-action="attach-image" title="Attach image or paste screenshot" type="button">Image</button>
-                <button class="erp-ai-assistant-btn erp-ai-assistant-btn--stop" data-action="stop" title="Stop response" aria-label="Stop response" hidden>
-                  <span class="erp-ai-assistant-stop-icon" aria-hidden="true"></span>
-                </button>
-                <button class="erp-ai-assistant-btn erp-ai-assistant-btn--primary" data-action="send" title="Send message">Send</button>
+            <div class="erp-ai-assistant-composer__shell">
+              <textarea class="erp-ai-assistant-composer__textarea" rows="1" placeholder="Ask anything. If you are on a document, I can also use that ERP context..." aria-label="Message input"></textarea>
+              <div class="erp-ai-assistant-image-preview"></div>
+              <input type="file" class="erp-ai-assistant-image-input" accept="image/*" multiple hidden />
+              <div class="erp-ai-assistant-composer__actions">
+                <div class="erp-ai-assistant-composer__left">
+                  <select class="erp-ai-assistant-model-select" aria-label="Select AI model">
+                    <option value="">Default model</option>
+                  </select>
+                </div>
+                <div class="erp-ai-assistant-composer__buttons">
+                  <button class="erp-ai-assistant-btn" data-action="attach-image" title="Attach image or paste screenshot" type="button">📎</button>
+                  <button class="erp-ai-assistant-btn erp-ai-assistant-btn--stop" data-action="stop" title="Stop response" aria-label="Stop response" hidden>⏹</button>
+                  <button class="erp-ai-assistant-btn erp-ai-assistant-btn--primary" data-action="send" title="Send message">Send ↑</button>
+                </div>
               </div>
             </div>
+          </div>
+        </div>
+        <div id="erp-ai-connector-panel" class="erp-ai-connector-panel" hidden>
+          <div class="erp-ai-connector-panel__header">
+            <h3>Connector Status & Health</h3>
+            <button class="erp-ai-assistant-btn" data-action="close-connectors" title="Close Settings">Close</button>
+          </div>
+          <div class="erp-ai-connector-panel__content" aria-live="polite">
+            <div class="erp-ai-connector-panel__loading">Loading connector status...</div>
           </div>
         </div>
       `;
@@ -171,13 +212,53 @@
         modelSelect: drawer.querySelector(".erp-ai-assistant-model-select"),
         sendButton: drawer.querySelector('[data-action="send"]'),
         stopButton: drawer.querySelector('[data-action="stop"]'),
+        connectorPanel: drawer.querySelector('#erp-ai-connector-panel'),
+        connectorContent: drawer.querySelector('.erp-ai-connector-panel__content'),
+        conversationMenu: null,
+      };
+
+      const autoGrow = (el) => {
+        if (!el) return;
+        el.style.height = "auto";
+        el.style.height = Math.min(el.scrollHeight, 240) + "px";
       };
 
       bubble.addEventListener("click", () => this.toggleDrawer());
       drawer.querySelector('[data-action="close"]')?.addEventListener("click", () => this.toggleDrawer(false));
+      drawer.querySelectorAll('[data-action="toggle-sidebar"]').forEach((element) => {
+        element.addEventListener("click", () => this.toggleSidebar());
+      });
+      drawer.querySelector('[data-action="close-sidebar"]')?.addEventListener("click", () => {
+        if (isCompactViewport()) {
+          this.closeMobileSidebar();
+        } else {
+          this.toggleSidebar(true);
+        }
+      });
+      drawer.querySelector('[data-action="connectors"]')?.addEventListener("click", () => this.toggleConnectorPanel(true));
+      drawer.querySelector('[data-action="close-connectors"]')?.addEventListener("click", () => this.toggleConnectorPanel(false));
       drawer.querySelector('[data-action="send"]')?.addEventListener("click", () => this.sendPrompt());
       drawer.querySelector('[data-action="stop"]')?.addEventListener("click", () => this.stopPrompt());
-      drawer.querySelector('[data-action="new-chat"]')?.addEventListener("click", () => this.startDraftConversation());
+      drawer.querySelectorAll('[data-action="new-chat"]').forEach((element) => {
+        element.addEventListener("click", () => this.startDraftConversation());
+      });
+      drawer.querySelector('[data-action="new-chat-visible"]')?.addEventListener("click", () => this.startDraftConversation());
+      drawer.querySelectorAll('[data-action="focus-search"]').forEach((element) => {
+        element.addEventListener("click", () => {
+        if (isCompactViewport()) {
+          this.elements.drawer?.classList.add("mobile-sidebar-open");
+        } else {
+          this.elements.drawer?.classList.remove("sidebar-collapsed");
+        }
+        this.elements.search?.focus();
+        });
+      });
+      drawer.addEventListener("click", (event) => {
+        if (!drawer.classList.contains("mobile-sidebar-open")) return;
+        if (event.target.closest(".erp-ai-assistant-drawer__sidebar")) return;
+        if (event.target.closest('[data-action="toggle-sidebar"]')) return;
+        this.closeMobileSidebar();
+      });
       this.elements.attachImageButton?.addEventListener("click", () => this.elements.imageInput?.click());
       this.elements.imageInput?.addEventListener("change", async (event) => {
         await this._ingestImageFiles(event?.target?.files);
@@ -187,6 +268,7 @@
       });
       this.elements.modelSelect?.addEventListener("change", () => this._persistSelectedModel());
       this.elements.search?.addEventListener("input", () => this.renderHistory());
+      this.elements.textarea?.addEventListener("input", () => autoGrow(this.elements.textarea));
       this.elements.textarea?.addEventListener("keydown", (event) => {
         if (event.key === "Enter" && !event.shiftKey) {
           event.preventDefault();
@@ -238,8 +320,16 @@
         }
         if (event.key === "Escape" && this.drawerOpen) {
           event.preventDefault();
+          this.closeConversationMenu();
           this.toggleDrawer(false);
         }
+      });
+
+      window.addEventListener("resize", () => {
+        if (!isCompactViewport()) {
+          this.elements.drawer?.classList.remove("mobile-sidebar-open");
+        }
+        this.closeConversationMenu();
       });
 
       this._setGeneratingState(false);
@@ -271,13 +361,118 @@
           this.elements.bubble.removeAttribute("aria-hidden");
           this.elements.bubble.style.pointerEvents = "";
           this.elements.bubble.style.opacity = "";
+          this.toggleConnectorPanel(false); // Make sure it closes when drawer closes
         }
       }
       if (this.drawerOpen) {
         this.updateContextHint();
         this.refreshHistory();
         this.elements.textarea?.focus();
+      } else {
+        this.closeConversationMenu();
       }
+    }
+
+    toggleSidebar(forceState) {
+      const drawer = this.elements.drawer;
+      if (!drawer) return;
+      if (isCompactViewport()) {
+        const open = typeof forceState === "boolean" ? forceState : !drawer.classList.contains("mobile-sidebar-open");
+        drawer.classList.toggle("mobile-sidebar-open", open);
+        return;
+      }
+      const collapsed = typeof forceState === "boolean" ? forceState : !drawer.classList.contains("sidebar-collapsed");
+      drawer.classList.toggle("sidebar-collapsed", collapsed);
+      this.closeConversationMenu();
+    }
+
+    closeMobileSidebar() {
+      if (isCompactViewport()) {
+        this.elements.drawer?.classList.remove("mobile-sidebar-open");
+      }
+    }
+
+    toggleConnectorPanel(forceState) {
+      if (!this.elements.connectorPanel) return;
+      const isOpen = typeof forceState === 'boolean' 
+        ? forceState 
+        : this.elements.connectorPanel.hasAttribute('hidden');
+        
+      if (isOpen) {
+        this.elements.connectorPanel.removeAttribute('hidden');
+        this.refreshConnectors();
+      } else {
+        this.elements.connectorPanel.setAttribute('hidden', '');
+      }
+    }
+
+    refreshConnectors() {
+      if (!this.elements.connectorContent) return;
+      
+      this.elements.connectorContent.innerHTML = '<div class="erp-ai-connector-panel__loading">Testing connections...</div>';
+      
+      const calls = [
+        frappe.call({ method: "erp_ai_assistant.api.assistant.test_ai_provider_connection" }),
+        frappe.call({ method: "erp_ai_assistant.api.assistant.test_fac_mcp_connection" }),
+        frappe.call({ method: "erp_ai_assistant.api.assistant.ping_assistant" })
+      ];
+
+      Promise.allSettled(calls).then((results) => {
+        const [llmRes, facRes, pingRes] = results;
+        
+        let html = '<div class="erp-ai-connector-list">';
+        
+        // LLM Gateway Status
+        const llm = llmRes.status === 'fulfilled' ? llmRes.value.message || {} : { ok: false, error: 'Request failed' };
+        html += this._renderConnectorCard(
+          "LLM Gateway",
+          llm.ok ? 'connected' : 'error',
+          llm.provider || 'Unknown',
+          llm.model || 'Unknown',
+          llm.ok ? 'Active Connection' : (llm.message || llm.error)
+        );
+
+        // FAC / Tool Host Status
+        const fac = facRes.status === 'fulfilled' ? facRes.value.message || {} : { ok: false, error: 'Request failed' };
+        html += this._renderConnectorCard(
+          "Tool Host (FAC MCP)",
+          fac.ok ? 'connected' : 'error',
+          fac.provider || 'Local / MCP',
+          fac.ok ? 'Tools active' : 'Offline',
+          fac.ok ? fac.message : (fac.message || fac.error)
+        );
+
+        // Core App Status
+        const ping = pingRes.status === 'fulfilled' ? pingRes.value.message || {} : { ok: false, error: 'Request failed' };
+        html += this._renderConnectorCard(
+          "ERP Core App",
+          ping.ok ? 'connected' : 'error',
+          'Internal',
+          'v1',
+          ping.ok ? 'Ready' : (ping.message || ping.error)
+        );
+
+        html += '</div>';
+        this.elements.connectorContent.innerHTML = html;
+      });
+    }
+
+    _renderConnectorCard(title, status, provider, detail1, detail2) {
+      const color = status === 'connected' ? '#10b981' : '#ef4444';
+      const icon = status === 'connected' ? '✓' : '⚠️';
+      return `
+        <div class="erp-ai-connector-card" style="border-left: 4px solid ${color}">
+          <div class="erp-ai-connector-card__title">
+            <strong>${title}</strong>
+            <span style="color: ${color}">${icon}</span>
+          </div>
+          <div class="erp-ai-connector-card__body">
+            <div><small>Provider:</small> ${provider}</div>
+            <div><small>Info:</small> ${detail1}</div>
+            <div style="margin-top:4px; font-size:11px; opacity:0.8">${detail2}</div>
+          </div>
+        </div>
+      `;
     }
 
     getCurrentContext() {
@@ -415,9 +610,18 @@
       const text = context.doctype && context.docname
         ? `${context.doctype} / ${context.docname}`
         : (context.label || "General chat");
+      const routeText = String(context.route || "").trim();
+      const isFallbackContext = !context.doctype && !context.docname && !routeText && text === "General chat";
+      const displayText = this.isGenerating && isFallbackContext && this.lastStableContextText
+        ? this.lastStableContextText
+        : text;
+
+      if (!isFallbackContext) {
+        this.lastStableContextText = text;
+      }
 
       if (this.elements.context) {
-        this.elements.context.textContent = text;
+        this.elements.context.textContent = displayText;
       }
     }
 
@@ -453,28 +657,71 @@
         return;
       }
 
+      const dateGroup = (dateStr) => {
+        if (!dateStr) return "Older";
+        const d = new Date(dateStr), now = new Date();
+        const diffDays = Math.floor((now - d) / 86400000);
+        if (diffDays === 0) return "Today";
+        if (diffDays === 1) return "Yesterday";
+        if (diffDays <= 7) return "Previous 7 days";
+        return "Older";
+      };
+
+      let lastGroup = "";
       rows.forEach((row) => {
+        const group = dateGroup(row.modified);
+        if (group !== lastGroup) {
+          lastGroup = group;
+          const label = document.createElement("div");
+          label.className = "erp-ai-assistant-history__group-label";
+          label.textContent = group;
+          label.style.cssText = "font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: rgba(255,255,255,0.35); padding: 12px 8px 4px;";
+          this.elements.history.appendChild(label);
+        }
+
         const item = document.createElement("div");
         item.className = "erp-ai-assistant-history__item";
+        item.style.cssText = "display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-radius: 10px; cursor: pointer; transition: background 180ms ease; color: rgba(255,255,255,0.8); margin-bottom: 2px;";
 
         if (this.activeConversation && this.activeConversation.name === row.name) {
           item.classList.add("is-active");
+          item.style.background = "var(--ai-secondary-light)";
+          item.style.color = "#fff";
+          item.style.borderLeft = "3px solid var(--ai-primary)";
         }
 
         item.innerHTML = `
-          <button class="erp-ai-assistant-history__content" type="button">
-            <span class="erp-ai-assistant-history__title">${frappe.utils.escape_html(row.title || "New chat")}</span>
-            <span class="erp-ai-assistant-history__meta">${row.modified || ""}</span>
-          </button>
-          <div class="erp-ai-assistant-history__actions">
-            <button class="erp-ai-assistant-history__icon" type="button" data-action="pin" title="${row.is_pinned ? "Unpin" : "Pin"}">${row.is_pinned ? "P" : "+"}</button>
-            <button class="erp-ai-assistant-history__icon" type="button" data-action="delete" title="Delete">x</button>
+          <div class="erp-ai-assistant-history__content" style="flex: 1; min-width: 0; overflow: hidden;">
+            <div class="erp-ai-assistant-history__title" style="font-weight: 500; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; overflow: hidden;">${frappe.utils.escape_html(row.title || "New chat")}</div>
+          </div>
+          <div class="erp-ai-assistant-history__actions" style="display: flex; gap: 4px; opacity: 0; transition: opacity 180ms ease;">
+            <button class="erp-ai-assistant-history__icon" type="button" data-action="rename" title="Rename" style="width: 24px; height: 24px; border: 0; border-radius: 6px; background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.5); font-size: 12px; cursor: pointer;">✎</button>
+            <button class="erp-ai-assistant-history__icon" type="button" data-action="delete" title="Delete" style="width: 24px; height: 24px; border: 0; border-radius: 6px; background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.5); font-size: 12px; cursor: pointer;">×</button>
           </div>
         `;
 
-        item.querySelector('[data-action="pin"]')?.addEventListener("click", () => this.togglePin(row.name));
-        item.querySelector('[data-action="delete"]')?.addEventListener("click", () => this.deleteConversation(row.name));
-        item.querySelector(".erp-ai-assistant-history__content")?.addEventListener("click", () => this.loadConversation(row.name));
+        item.addEventListener("mouseenter", () => {
+          if (!item.classList.contains("is-active")) item.style.background = "var(--ai-secondary-light)";
+          const actions = item.querySelector(".erp-ai-assistant-history__actions");
+          if (actions) actions.style.opacity = "1";
+        });
+        item.addEventListener("mouseleave", () => {
+          if (!item.classList.contains("is-active")) item.style.background = "transparent";
+          const actions = item.querySelector(".erp-ai-assistant-history__actions");
+          if (actions) actions.style.opacity = "0";
+        });
+
+        item.querySelector('[data-action="rename"]')?.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const newTitle = window.prompt("Rename conversation:", row.title || "");
+          if (!newTitle || newTitle === row.title) return;
+          frappe.call({ method: "erp_ai_assistant.api.chat.rename_conversation", args: { name: row.name, title: newTitle }, callback: () => this.refreshHistory() });
+        });
+        item.querySelector('[data-action="delete"]')?.addEventListener("click", (e) => {
+          e.stopPropagation();
+          this.deleteConversation(row.name);
+        });
+        item.addEventListener("click", () => this.loadConversation(row.name));
         this.elements.history.appendChild(item);
       });
     }
@@ -482,6 +729,7 @@
     startDraftConversation() {
       this.activeConversation = null;
       this.isDraftConversation = true;
+      this.closeMobileSidebar();
       this._clearPendingImages();
       this.renderMessages([]);
       this.renderHistory();
@@ -517,15 +765,19 @@
           const payload = response.message || {};
           this.activeConversation = payload.conversation || null;
           this.isDraftConversation = false;
-          this._clearPendingImages();
-          const serverMessages = Array.isArray(payload.messages) ? payload.messages : [];
+          if (!settings.silent) {
+            this.closeMobileSidebar();
+            this._clearPendingImages();
+          }
+          const serverMessages = this._dedupeRetryUserEcho(name, Array.isArray(payload.messages) ? payload.messages : []);
           this.conversationMessageCache[name] = serverMessages;
           const optimisticMessages = Array.isArray(this.optimisticAssistantMessages[name])
             ? this.optimisticAssistantMessages[name]
             : [];
+          let hasMatchingServerReply = false;
           if (optimisticMessages.length) {
             const lastOptimistic = optimisticMessages[optimisticMessages.length - 1];
-            const hasMatchingServerReply = serverMessages.some((row) =>
+            hasMatchingServerReply = serverMessages.some((row) =>
               row
               && row.role === "assistant"
               && String(row.content || "").trim() === String(lastOptimistic.content || "").trim()
@@ -534,18 +786,51 @@
               delete this.optimisticAssistantMessages[name];
             }
           }
-          this.renderMessages(this._getConversationMessages(name));
-          this.renderHistory();
+          const shouldRender = !settings.silent && (!settings.waitForOptimisticConfirmation || hasMatchingServerReply || !optimisticMessages.length);
+          if (shouldRender) {
+            this.renderMessages(this._getConversationMessages(name));
+            this.renderHistory();
+          }
           if (typeof settings.onLoaded === "function") {
             settings.onLoaded(payload, serverMessages);
           }
         },
         error: (error) => {
           this.activeConversation = null;
-          this.renderMessages([]);
+          if (!settings.silent) {
+            this.renderMessages([]);
+          }
           frappe.show_alert({ message: error.message || "Unable to load conversation", indicator: "red" });
         },
       });
+    }
+
+    _dedupeRetryUserEcho(conversationName, rows) {
+      const items = Array.isArray(rows) ? rows.slice() : [];
+      const guardedPrompt = String(this.retryPromptGuards[conversationName] || "").trim();
+      if (!guardedPrompt || items.length < 2) return items;
+
+      const deduped = [];
+      let removedDuplicate = false;
+      for (const row of items) {
+        const prev = deduped.length ? deduped[deduped.length - 1] : null;
+        const isDuplicateRetryUser =
+          prev
+          && prev.role === "user"
+          && row?.role === "user"
+          && String(prev.content || "").trim() === guardedPrompt
+          && String(row.content || "").trim() === guardedPrompt;
+        if (isDuplicateRetryUser) {
+          removedDuplicate = true;
+          continue;
+        }
+        deduped.push(row);
+      }
+
+      if (removedDuplicate || deduped.some((row) => row?.role === "assistant")) {
+        delete this.retryPromptGuards[conversationName];
+      }
+      return deduped;
     }
 
     renderMessages(messages) {
@@ -554,34 +839,62 @@
       this.elements.messages.innerHTML = "";
 
       if (!messages.length) {
-        const emptyText = this.isDraftConversation
-          ? '<div class="erp-ai-assistant-messages__empty"><div class="erp-ai-assistant-messages__empty-icon">💬</div><p>Start typing to create a new conversation</p></div>'
-          : '<div class="erp-ai-assistant-messages__empty"><div class="erp-ai-assistant-messages__empty-icon">🤖</div><p>Select a conversation or start a new one to begin chatting</p></div>';
+        const emptyState = document.createElement("div");
+        emptyState.className = "erp-ai-assistant-messages__empty";
+        emptyState.innerHTML = `
+          <div class="erp-ai-assistant-messages__empty-icon"></div>
+          <h2>How can I help you today?</h2>
+          <div class="erp-ai-assistant-messages__suggestions">
+            <button class="erp-ai-assistant-suggestion-card" type="button" data-prompt="What are my pending tasks for today?">
+              <span class="erp-ai-assistant-suggestion-icon">📋</span>
+              <span class="erp-ai-assistant-suggestion-text">What are my pending tasks for today?</span>
+            </button>
+            <button class="erp-ai-assistant-suggestion-card" type="button" data-prompt="Show me recent sales orders">
+              <span class="erp-ai-assistant-suggestion-icon">📈</span>
+              <span class="erp-ai-assistant-suggestion-text">Show me recent sales orders</span>
+            </button>
+            <button class="erp-ai-assistant-suggestion-card" type="button" data-prompt="Help me draft an email to a supplier">
+              <span class="erp-ai-assistant-suggestion-icon">✉️</span>
+              <span class="erp-ai-assistant-suggestion-text">Help me draft an email...</span>
+            </button>
+            <button class="erp-ai-assistant-suggestion-card" type="button" data-prompt="Analyze inventory levels">
+              <span class="erp-ai-assistant-suggestion-icon">📦</span>
+              <span class="erp-ai-assistant-suggestion-text">Analyze inventory levels</span>
+            </button>
+          </div>
+        `;
 
-        this.elements.messages.innerHTML = emptyText;
+        const suggestionButtons = emptyState.querySelectorAll(".erp-ai-assistant-suggestion-card");
+        suggestionButtons.forEach(btn => {
+          btn.addEventListener("click", () => {
+            const prompt = btn.getAttribute("data-prompt");
+            if (this.elements.textarea) {
+              this.elements.textarea.value = prompt;
+              this.elements.textarea.style.height = "auto";
+              this.sendPrompt();
+            }
+          });
+        });
+
+        this.elements.messages.appendChild(emptyState);
         return;
       }
 
-      messages.forEach((message) => {
+      messages.forEach((message, index) => {
         const bubble = document.createElement("div");
         bubble.className = `erp-ai-assistant-message ${message.role === "user" ? "is-user" : "is-assistant"}`;
+        bubble.setAttribute("data-msg-idx", index);
 
+        const isLastAssistantMessage = message.role === "assistant" && (index === messages.length - 1 || (index === messages.length - 2 && messages[messages.length - 1].role === "user"));
         const roleLabel = message.role === "user" ? "You" : "Assistant";
-        const timestamp = frappe.datetime.str_to_user ? frappe.datetime.str_to_user(message.creation) : (message.creation || "");
         const content = message.content || "";
         const toolEvents = message.role !== "user" ? this._parseToolEvents(message.tool_events) : [];
         const attachmentPackage = this._parseAttachmentPackage(message.attachments_json);
-        const messageChrome = this._buildMessageChrome(message, { toolEvents, attachmentPackage, content });
 
         bubble.innerHTML = `
-          <div class="erp-ai-assistant-message__head">
-            <div class="erp-ai-assistant-message__meta">
-              <span class="erp-ai-assistant-message__role">${roleLabel}</span>
-              ${timestamp ? `<span class="erp-ai-assistant-message__time">${timestamp}</span>` : ""}
-            </div>
-            ${messageChrome.badges.length ? `<div class="erp-ai-assistant-message__badges">${messageChrome.badges.map((badge) => `<span class="erp-ai-assistant-message__badge ${badge.tone ? `is-${badge.tone}` : ""}">${this._escapeHtml(badge.label)}</span>`).join("")}</div>` : ""}
+          <div class="erp-ai-assistant-message__meta">
+            <span class="erp-ai-assistant-message__role erp-ai-assistant-message__role--${message.role}" ${message.role === "user" ? 'style="color: var(--ai-primary)"' : ''}>${roleLabel}</span>
           </div>
-          ${messageChrome.summary ? `<div class="erp-ai-assistant-message__summary">${this._escapeHtml(messageChrome.summary)}</div>` : ""}
           <div class="erp-ai-assistant-message__body"></div>
         `;
 
@@ -603,42 +916,55 @@
         if (attachmentPackage.attachments.length) {
           bubble.appendChild(this._renderAttachmentRow(attachmentPackage.attachments));
         }
+
         if (message.role !== "user" && content) {
+          const actionsWrap = document.createElement("div");
+          actionsWrap.className = "erp-ai-assistant-message__actions";
+
           const copyBtn = document.createElement("button");
-          copyBtn.className = "erp-ai-assistant-message__copy";
-          copyBtn.innerHTML = "⧉";
-          copyBtn.title = "Copy message";
+          copyBtn.className = "erp-ai-assistant-message__action-btn";
+          copyBtn.innerHTML = "⧉ Copy";
           copyBtn.type = "button";
           copyBtn.addEventListener("click", async (event) => {
             event.preventDefault();
             event.stopPropagation();
             const copied = await this._copyText(content);
             if (copied) {
-              copyBtn.innerHTML = "✓";
-              copyBtn.title = "Copied!";
+              copyBtn.innerHTML = "✓ Copied";
               copyBtn.classList.add("is-copied");
               setTimeout(() => {
-                copyBtn.innerHTML = "⧉";
-                copyBtn.title = "Copy message";
+                copyBtn.innerHTML = "⧉ Copy";
                 copyBtn.classList.remove("is-copied");
-              }, 1200);
-              return;
+              }, 2000);
+            } else {
+              copyBtn.innerHTML = "! Failed";
+              setTimeout(() => {
+                copyBtn.innerHTML = "⧉ Copy";
+              }, 2000);
             }
-            copyBtn.innerHTML = "!";
-            copyBtn.title = "Copy failed";
-            setTimeout(() => {
-              copyBtn.innerHTML = "⧉";
-              copyBtn.title = "Copy message";
-            }, 1200);
           });
-          bubble.appendChild(copyBtn);
+          actionsWrap.appendChild(copyBtn);
+
+          if (isLastAssistantMessage) {
+              const retryBtn = document.createElement("button");
+              retryBtn.className = "erp-ai-assistant-message__action-btn";
+              retryBtn.innerHTML = "⟳ Retry";
+              retryBtn.type = "button";
+              retryBtn.addEventListener("click", async (event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  this.retryLastResponse();
+              });
+              actionsWrap.appendChild(retryBtn);
+          }
+
+          bubble.appendChild(actionsWrap);
         }
 
         this.elements.messages.appendChild(bubble);
       });
 
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
-      this._wireCopyButtons(this.elements.messages);
     }
 
     _formatMessageContent(content) {
@@ -1360,17 +1686,21 @@
       });
     }
 
-    sendPrompt() {
+    sendPrompt(options) {
       if (this.isGenerating) return;
+      const settings = options || {};
 
-      const prompt = (this.elements.textarea?.value || "").trim();
-      const images = this.pendingImages.slice();
+      const prompt = String(settings.prompt ?? this.elements.textarea?.value ?? "").trim();
+      const images = Array.isArray(settings.images) ? settings.images.slice() : this.pendingImages.slice();
+      const shouldQueueUserMessage = settings.queueUserMessage !== false;
       if (!prompt && !images.length) return;
 
       // Add user message to UI immediately
       this.ensureConversation((conversationName) => {
-        this._queuePendingUserMessage(conversationName, prompt, images);
-        this._renderPendingConversation(conversationName);
+        if (shouldQueueUserMessage) {
+          this._queuePendingUserMessage(conversationName, prompt, images);
+          this._renderPendingConversation(conversationName);
+        }
         this.awaitingQueueAck[conversationName] = true;
 
         // ── Mandatory context injection ──────────────────────────────────────
@@ -1386,13 +1716,16 @@
           data_url: item.dataUrl,
         }));
 
-        if (this.elements.textarea) {
+        if (this.elements.textarea && settings.clearComposer !== false) {
           this.elements.textarea.value = "";
         }
-        this._clearPendingImages();
+        if (settings.clearImages !== false) {
+          this._clearPendingImages();
+        }
 
         this.abortRequested = false;
         this._setGeneratingState(true);
+        this._showTypingIndicator(["Starting..."]);
 
         const request = frappe.call({
           method: "erp_ai_assistant.api.assistant.handle_prompt",
@@ -1404,6 +1737,7 @@
             route: routeStr,
             model: this.elements.modelSelect?.value || undefined,
             images: imagePayload.length ? JSON.stringify(imagePayload) : undefined,
+            retry_last_user: settings.retryLastUser ? 1 : 0,
           },
           callback: (response) => {
             const payload = response?.message || {};
@@ -1452,6 +1786,61 @@
       this._finishPromptRun(null, { keepMessages: true });
     }
 
+    retryLastResponse() {
+      if (!this.activeConversation || !this.activeConversation.name) return;
+      if (this.isGenerating) return;
+
+      const conversationName = this.activeConversation.name;
+      const cachedMessages = Array.isArray(this.conversationMessageCache[conversationName]) ? this.conversationMessageCache[conversationName] : [];
+
+      if (!cachedMessages.length) return;
+
+      // Ensure the last message is from the assistant
+      const lastMessage = cachedMessages[cachedMessages.length - 1];
+      if (lastMessage.role !== "assistant") return;
+
+      // Ensure there's a user message right before it to retry
+      const previousUserMessage = cachedMessages.length > 1 ? cachedMessages[cachedMessages.length - 2] : null;
+      if (!previousUserMessage || previousUserMessage.role !== "user") return;
+      this.retryPromptGuards[conversationName] = String(previousUserMessage.content || "").trim();
+
+      // Keep the UI in a busy state while the previous answer is removed.
+      this._setGeneratingState(true);
+
+      // Call the backend to delete the last assistant message and then resend the prompt
+      frappe.call({
+        method: "erp_ai_assistant.api.chat.delete_last_assistant_message",
+        args: { conversation: conversationName },
+        callback: (response) => {
+          if (response.message && response.message.ok) {
+            // Remove the last message from the local cache immediately to update UI
+            this.conversationMessageCache[conversationName].pop();
+            this.renderMessages(this._getConversationMessages(conversationName));
+
+            // Resend the prompt using the previous user message's content
+            if (this.elements.textarea) {
+                this._setGeneratingState(false);
+                this.sendPrompt({
+                  prompt: previousUserMessage.content || "",
+                  queueUserMessage: false,
+                  clearComposer: true,
+                  clearImages: false,
+                  images: [],
+                  retryLastUser: true,
+                });
+            }
+          } else {
+             this._setGeneratingState(false);
+             frappe.show_alert({ message: "Unable to retry message.", indicator: "orange" });
+          }
+        },
+        error: (error) => {
+            this._setGeneratingState(false);
+            frappe.show_alert({ message: error.message || "Unable to retry message.", indicator: "red" });
+        }
+      });
+    }
+
     _addUserMessageToUI(prompt, images) {
       if (!this.elements.messages) return;
 
@@ -1472,8 +1861,7 @@
 
       userBubble.innerHTML = `
         <div class="erp-ai-assistant-message__meta">
-          <span class="erp-ai-assistant-message__role">You</span>
-          <span class="erp-ai-assistant-message__time">${timeStr}</span>
+          <span class="erp-ai-assistant-message__role erp-ai-assistant-message__role--user" style="color: var(--ai-primary)">You</span>
         </div>
         <div class="erp-ai-assistant-message__body">${this._formatMessageContent(body)}</div>
       `;
@@ -1588,17 +1976,16 @@
       indicator.id = "erp-ai-assistant-typing";
       indicator.innerHTML = `
         <div class="erp-ai-assistant-message__meta">
-          <span class="erp-ai-assistant-message__role">Assistant</span>
-          <span class="erp-ai-assistant-message__time erp-ai-thinking-label">Thinking…</span>
+          <span class="erp-ai-assistant-message__role erp-ai-assistant-message__role--assistant">Assistant</span>
         </div>
         <div class="erp-ai-assistant-progress">
-          <div class="erp-ai-assistant-progress__partial" style="display:none;"></div>
-          <details class="erp-ai-assistant-progress__log">
-            <summary class="erp-ai-assistant-progress__head">
-              <span class="erp-ai-assistant-progress__spinner" aria-hidden="true"></span>
-              <span class="erp-ai-assistant-progress__summary">Running...</span>
+          <div class="erp-ai-assistant-progress__partial" style="display:none; font-size:15px; padding-bottom:12px; white-space:pre-wrap; opacity:0.8;"></div>
+          <details class="erp-ai-assistant-progress__log" open>
+            <summary class="erp-ai-assistant-message__activity-head">
+               <span class="erp-ai-assistant-progress__spinner" aria-hidden="true">⟳</span>
+               <span class="erp-ai-assistant-progress__summary erp-ai-thinking-label" style="animation: cd-pulse 1.8s ease-in-out infinite;">Working...</span>
             </summary>
-            <div class="erp-ai-assistant-progress__steps"></div>
+            <div class="erp-ai-assistant-progress__steps" style="padding: 0 14px 12px;"></div>
           </details>
         </div>
       `;
@@ -1606,6 +1993,18 @@
       this.elements.messages.appendChild(indicator);
       this._updateTypingSteps(Array.isArray(steps) ? steps : ["Preparing response"], "", { done: false });
       this.elements.messages.scrollTop = this.elements.messages.scrollHeight;
+    }
+
+    _tryBeginCompletionFetch(conversationName) {
+      if (!conversationName) return false;
+      if (this.completionFetchLocks[conversationName]) return false;
+      this.completionFetchLocks[conversationName] = true;
+      return true;
+    }
+
+    _clearCompletionFetchLock(conversationName) {
+      if (!conversationName) return;
+      delete this.completionFetchLocks[conversationName];
     }
 
     _mapProgressStepLabel(step) {
@@ -1653,9 +2052,15 @@
         : [];
       const finalSteps = normalized.length ? normalized : ["Preparing response"];
       indicator.classList.toggle("is-done", done);
+
       if (summary) {
         summary.textContent = this._summarizeProgressSteps(finalSteps, done);
+        if (done) {
+          summary.style.animation = "none";
+          summary.style.opacity = "1";
+        }
       }
+
       if (spinner) {
         spinner.style.display = done ? "none" : "inline-block";
       }
@@ -1700,8 +2105,12 @@
         if ((stage === "idle" || !stage) && this.awaitingQueueAck[conversationName]) return;
         this._updateTypingSteps(steps, data.partial_text || "", { done: !!data.done });
         if (data.done) {
-          this._stopProgressPolling();
+          if (!this._tryBeginCompletionFetch(conversationName)) {
+            return;
+          }
+          this._stopProgressPolling({ preserveIndicator: true });
           if (data.error) {
+            this._clearCompletionFetchLock(conversationName);
             this._finishPromptRun(null, { keepMessages: true });
             frappe.show_alert({ message: data.error || "Assistant request failed", indicator: "red" });
             return;
@@ -1721,6 +2130,7 @@
               this._finishPromptRun(conversationName);
             },
             error: () => {
+              this._clearCompletionFetchLock(conversationName);
               this._finishPromptRun(conversationName);
             },
           });
@@ -1753,8 +2163,12 @@
             }
             this._updateTypingSteps(steps, progress.partial_text || "", { done: !!progress.done });
             if (progress.done) {
-              this._stopProgressPolling();
+              if (!this._tryBeginCompletionFetch(conversationName)) {
+                return;
+              }
+              this._stopProgressPolling({ preserveIndicator: true });
               if (progress.error) {
+                this._clearCompletionFetchLock(conversationName);
                 this._finishPromptRun(null, { keepMessages: true });
                 frappe.show_alert({ message: progress.error || "Assistant request failed", indicator: "red" });
                 return;
@@ -1766,12 +2180,16 @@
                   const result = resultResponse?.message || {};
                   logAssistantDebug(result);
                   if (result.done && String(result.reply || "").trim()) {
-                    this._queueOptimisticAssistantMessage(conversationName, result.reply);
+                    this._queueOptimisticAssistantMessage(conversationName, result.reply, {
+                      toolEvents: result.tool_events,
+                      attachments: result.attachments,
+                    });
                     this._renderPendingConversation(conversationName);
                   }
                   this._finishPromptRun(conversationName);
                 },
                 error: () => {
+                  this._clearCompletionFetchLock(conversationName);
                   this._finishPromptRun(conversationName);
                 },
               });
@@ -1790,7 +2208,8 @@
     }
 
 
-    _stopProgressPolling() {
+    _stopProgressPolling(options) {
+      const settings = options || {};
       if (this.progressPollTimer) {
         clearInterval(this.progressPollTimer);
         this.progressPollTimer = null;
@@ -1805,6 +2224,9 @@
         }
         this._realtimeProgressHandler = null;
         this._realtimeProgressConversation = null;
+      }
+      if (!settings.preserveIndicator) {
+        this._hideTypingIndicator();
       }
     }
 
@@ -1829,11 +2251,24 @@
       const tryCount = Number(attempt || 0);
       this._clearCompletionReloadTimer(conversationName);
       this.loadConversation(conversationName, {
+        silent: true,
+        waitForOptimisticConfirmation: true,
         onLoaded: (_payload, serverMessages) => {
           const rows = Array.isArray(serverMessages) ? serverMessages : [];
-          const lastMessage = rows.length ? rows[rows.length - 1] : null;
-          const hasAssistantReply = !!(lastMessage && lastMessage.role === "assistant");
-          if (!hasAssistantReply && tryCount < 5) {
+          const optimisticMessages = Array.isArray(this.optimisticAssistantMessages[conversationName])
+            ? this.optimisticAssistantMessages[conversationName]
+            : [];
+          const expectedReply = optimisticMessages.length
+            ? String(optimisticMessages[optimisticMessages.length - 1]?.content || "").trim()
+            : "";
+          const hasExpectedAssistantReply = expectedReply
+            ? rows.some((row) => row && row.role === "assistant" && String(row.content || "").trim() === expectedReply)
+            : !!(rows.length && rows[rows.length - 1]?.role === "assistant");
+          if (hasExpectedAssistantReply || !expectedReply) {
+            this.renderMessages(this._getConversationMessages(conversationName));
+            this.renderHistory();
+          }
+          if (!hasExpectedAssistantReply && tryCount < 8) {
             this.completionReloadTimers[conversationName] = window.setTimeout(() => {
               this._loadConversationAfterCompletion(conversationName, tryCount + 1);
             }, 1200);
@@ -1848,15 +2283,19 @@
       const settings = options || {};
       this._stopProgressPolling();
       this._setGeneratingState(false);
-      this._hideTypingIndicator();
+      this.updateContextHint();
       this.abortRequested = false;
       if (conversationName) {
+        this._clearCompletionFetchLock(conversationName);
         delete this.awaitingQueueAck[conversationName];
         delete this.pendingConversationMessages[conversationName];
         this.refreshHistory();
         this._loadConversationAfterCompletion(conversationName, 0);
         return;
       }
+      Object.keys(this.completionFetchLocks).forEach((key) => {
+        delete this.completionFetchLocks[key];
+      });
       if (!settings.keepMessages) {
         this.refreshHistory();
       }
@@ -2028,6 +2467,135 @@
         error: (error) => {
           frappe.show_alert({ message: error.message || "Unable to update pin", indicator: "red" });
         },
+      });
+    }
+
+    closeConversationMenu() {
+      const menu = this.elements.conversationMenu;
+      if (!menu) return;
+      if (typeof menu._dismiss === "function") {
+        document.removeEventListener("mousedown", menu._dismiss, true);
+      }
+      menu.remove();
+      this.elements.conversationMenu = null;
+    }
+
+    toggleConversationMenu(row, anchor) {
+      if (!row || !anchor || !this.elements.drawer) return;
+      const existing = this.elements.conversationMenu;
+      if (existing?.dataset?.conversation === row.name) {
+        this.closeConversationMenu();
+        return;
+      }
+
+      this.closeConversationMenu();
+      const menu = document.createElement("div");
+      menu.className = "erp-ai-assistant-history-menu";
+      menu.dataset.conversation = row.name;
+      menu.innerHTML = `
+        <button type="button" data-menu-action="rename">Rename</button>
+        <button type="button" data-menu-action="pin">${row.is_pinned ? "Unpin chat" : "Pin chat"}</button>
+        <button type="button" data-menu-action="archive" disabled>Archive</button>
+        <button type="button" data-menu-action="delete" class="is-danger">Delete</button>
+      `;
+      this.elements.drawer.appendChild(menu);
+
+      const drawerRect = this.elements.drawer.getBoundingClientRect();
+      const anchorRect = anchor.getBoundingClientRect();
+      const menuWidth = 220;
+      const left = Math.max(12, Math.min(anchorRect.right - drawerRect.left - menuWidth + 12, drawerRect.width - menuWidth - 12));
+      const top = Math.max(12, Math.min(anchorRect.bottom - drawerRect.top + 8, drawerRect.height - 180));
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+
+      menu.querySelector('[data-menu-action="rename"]')?.addEventListener("click", () => {
+        this.closeConversationMenu();
+        const newTitle = window.prompt("Rename conversation:", row.title || "");
+        if (!newTitle || newTitle === row.title) return;
+        frappe.call({
+          method: "erp_ai_assistant.api.chat.rename_conversation",
+          args: { name: row.name, title: newTitle },
+          callback: () => this.refreshHistory(),
+        });
+      });
+
+      menu.querySelector('[data-menu-action="pin"]')?.addEventListener("click", () => {
+        this.closeConversationMenu();
+        this.togglePin(row.name);
+      });
+
+      menu.querySelector('[data-menu-action="delete"]')?.addEventListener("click", () => {
+        this.closeConversationMenu();
+        this.deleteConversation(row.name);
+      });
+
+      const dismiss = (event) => {
+        if (menu.contains(event.target) || anchor.contains(event.target)) return;
+        this.closeConversationMenu();
+      };
+      menu._dismiss = dismiss;
+      window.setTimeout(() => document.addEventListener("mousedown", dismiss, true), 0);
+      this.elements.conversationMenu = menu;
+    }
+
+    renderHistory() {
+      if (!this.elements.history) return;
+      this.closeConversationMenu();
+
+      const query = (this.elements.search?.value || "").toLowerCase();
+      this.elements.history.innerHTML = "";
+
+      const rows = this.conversations.filter(
+        (row) => !query || (row.title || "").toLowerCase().includes(query)
+      );
+
+      if (!rows.length) {
+        this.elements.history.innerHTML = `<div class="erp-ai-assistant-history__empty">No conversations</div>`;
+        return;
+      }
+
+      const dateGroup = (dateStr) => {
+        if (!dateStr) return "Older";
+        const d = new Date(dateStr), now = new Date();
+        const diffDays = Math.floor((now - d) / 86400000);
+        if (diffDays === 0) return "Today";
+        if (diffDays === 1) return "Yesterday";
+        if (diffDays <= 7) return "Previous 7 days";
+        return "Older";
+      };
+
+      let lastGroup = "";
+      rows.forEach((row) => {
+        const group = dateGroup(row.modified);
+        if (group !== lastGroup) {
+          lastGroup = group;
+          const label = document.createElement("div");
+          label.className = "erp-ai-assistant-history__group-label";
+          label.textContent = group;
+          this.elements.history.appendChild(label);
+        }
+
+        const item = document.createElement("div");
+        item.className = "erp-ai-assistant-history__item";
+        if (this.activeConversation && this.activeConversation.name === row.name) {
+          item.classList.add("is-active");
+        }
+
+        item.innerHTML = `
+          <button class="erp-ai-assistant-history__content" type="button">
+            <div class="erp-ai-assistant-history__title">${frappe.utils.escape_html(row.title || "New chat")}</div>
+          </button>
+          <div class="erp-ai-assistant-history__actions">
+            <button class="erp-ai-assistant-history__icon" type="button" data-action="menu" title="Conversation options">⋯</button>
+          </div>
+        `;
+
+        item.querySelector(".erp-ai-assistant-history__content")?.addEventListener("click", () => this.loadConversation(row.name));
+        item.querySelector('[data-action="menu"]')?.addEventListener("click", (event) => {
+          event.stopPropagation();
+          this.toggleConversationMenu(row, event.currentTarget);
+        });
+        this.elements.history.appendChild(item);
       });
     }
 

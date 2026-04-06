@@ -2,7 +2,7 @@ from typing import Any, Callable
 
 import frappe
 
-from .erp_tools import (
+from ..erp_tools import (
     answer_erp_query_internal,
     cancel_erp_document_internal,
     create_erp_document_internal,
@@ -20,8 +20,8 @@ from .erp_tools import (
     submit_erp_document_internal,
     update_erp_document_internal,
 )
-from .file_tools import export_doctype_list_excel_internal, export_employee_list_excel_internal, generate_document_pdf_internal
-from .security import clamp_limit, ensure_doctype_access, ensure_document_access, permission_summary, require_destruction_confirmation
+from ..file_tools import export_doctype_list_excel_internal, export_employee_list_excel_internal, generate_document_pdf_internal
+from ..security import clamp_limit, ensure_doctype_access, ensure_document_access, permission_summary, require_destruction_confirmation
 
 
 def _tool_ping_assistant(arguments: dict[str, Any]) -> dict[str, Any]:

@@ -142,6 +142,22 @@ def delete_conversation(name: str):
     return {"ok": True}
 
 
+@frappe.whitelist()
+def delete_last_assistant_message(conversation: str):
+    """Delete the last assistant message in a conversation (for retry)."""
+    doc = _get_conversation(conversation)
+    messages = frappe.get_all(
+        "AI Message",
+        filters={"conversation": doc.name, "role": "assistant"},
+        fields=["name"],
+        order_by="creation desc",
+        limit_page_length=1,
+    )
+    if messages:
+        frappe.delete_doc("AI Message", messages[0].name, ignore_permissions=True)
+    return {"ok": True}
+
+
 def add_message(
     conversation: str,
     role: str,

@@ -46,6 +46,180 @@ MODULE_SUGGESTIONS = {
 }
 
 
+TRANSACTION_LIST_CONFIG = {
+    "Sales Invoice": {
+        "title": "Sales Invoice List",
+        "party_field": "customer",
+        "party_label": "Customer",
+        "date_field": "posting_date",
+        "amount_field": "grand_total",
+        "outstanding_field": "outstanding_amount",
+        "notable_statuses": ("overdue", "cancelled"),
+        "primary_action": "Show the details of the most recent Sales Invoice.",
+        "secondary_action": "Show overdue Sales Invoices.",
+        "export_action": "Export the current Sales Invoice list to Excel.",
+        "suggestions": [
+            "Summarize these invoices by status.",
+            "Show the details of a specific invoice.",
+            "Group Sales Invoices by customer.",
+        ],
+    },
+    "Purchase Invoice": {
+        "title": "Purchase Invoice List",
+        "party_field": "supplier",
+        "party_label": "Supplier",
+        "date_field": "posting_date",
+        "amount_field": "grand_total",
+        "outstanding_field": "outstanding_amount",
+        "notable_statuses": ("overdue", "unpaid", "cancelled"),
+        "primary_action": "Show the details of the most recent Purchase Invoice.",
+        "secondary_action": "Show unpaid Purchase Invoices.",
+        "export_action": "Export the current Purchase Invoice list to Excel.",
+        "suggestions": [
+            "Summarize these purchase invoices by status.",
+            "Show the details of a specific invoice.",
+            "Group Purchase Invoices by supplier.",
+        ],
+    },
+    "Sales Order": {
+        "title": "Sales Order List",
+        "party_field": "customer",
+        "party_label": "Customer",
+        "date_field": "transaction_date",
+        "amount_field": "grand_total",
+        "notable_statuses": ("to deliver and bill", "to bill", "closed", "cancelled"),
+        "primary_action": "Show the details of the most recent Sales Order.",
+        "secondary_action": "Show Sales Orders that still need delivery or billing.",
+        "export_action": "Export the current Sales Order list to Excel.",
+        "suggestions": [
+            "Summarize these sales orders by status.",
+            "Show orders that still need delivery.",
+            "Group Sales Orders by customer.",
+        ],
+    },
+    "Purchase Order": {
+        "title": "Purchase Order List",
+        "party_field": "supplier",
+        "party_label": "Supplier",
+        "date_field": "transaction_date",
+        "amount_field": "grand_total",
+        "notable_statuses": ("to receive and bill", "to bill", "closed", "cancelled"),
+        "primary_action": "Show the details of the most recent Purchase Order.",
+        "secondary_action": "Show Purchase Orders that still need receipt or billing.",
+        "export_action": "Export the current Purchase Order list to Excel.",
+        "suggestions": [
+            "Summarize these purchase orders by status.",
+            "Show orders that still need receipt.",
+            "Group Purchase Orders by supplier.",
+        ],
+    },
+    "Quotation": {
+        "title": "Quotation List",
+        "party_field": "party_name",
+        "party_label": "Party",
+        "date_field": "transaction_date",
+        "amount_field": "grand_total",
+        "notable_statuses": ("open", "expired", "ordered", "cancelled"),
+        "primary_action": "Show the details of the most recent Quotation.",
+        "secondary_action": "Show open Quotations.",
+        "export_action": "Export the current Quotation list to Excel.",
+        "suggestions": [
+            "Summarize these quotations by status.",
+            "Show expired Quotations.",
+            "Group Quotations by customer.",
+        ],
+    },
+    "Delivery Note": {
+        "title": "Delivery Note List",
+        "party_field": "customer",
+        "party_label": "Customer",
+        "date_field": "posting_date",
+        "amount_field": "grand_total",
+        "notable_statuses": ("to bill", "completed", "closed", "cancelled"),
+        "primary_action": "Show the details of the most recent Delivery Note.",
+        "secondary_action": "Show Delivery Notes that still need billing.",
+        "export_action": "Export the current Delivery Note list to Excel.",
+        "suggestions": [
+            "Summarize these delivery notes by status.",
+            "Show Delivery Notes that still need billing.",
+            "Group Delivery Notes by customer.",
+        ],
+    },
+    "Purchase Receipt": {
+        "title": "Purchase Receipt List",
+        "party_field": "supplier",
+        "party_label": "Supplier",
+        "date_field": "posting_date",
+        "amount_field": "grand_total",
+        "notable_statuses": ("to bill", "completed", "closed", "cancelled"),
+        "primary_action": "Show the details of the most recent Purchase Receipt.",
+        "secondary_action": "Show Purchase Receipts that still need billing.",
+        "export_action": "Export the current Purchase Receipt list to Excel.",
+        "suggestions": [
+            "Summarize these purchase receipts by status.",
+            "Show Purchase Receipts that still need billing.",
+            "Group Purchase Receipts by supplier.",
+        ],
+    },
+}
+
+
+MASTER_LIST_CONFIG = {
+    "Customer": {
+        "title": "Customer List",
+        "primary_field": "customer_name",
+        "primary_label": "Customer",
+        "status_field": "status",
+        "primary_action": "Show the details of the most recent Customer.",
+        "secondary_action": "Show active Customers.",
+        "export_action": "Export the current Customer list to Excel.",
+        "suggestions": [
+            "Summarize these customers by status.",
+            "Group Customers by territory or group.",
+        ],
+    },
+    "Supplier": {
+        "title": "Supplier List",
+        "primary_field": "supplier_name",
+        "primary_label": "Supplier",
+        "status_field": "status",
+        "primary_action": "Show the details of the most recent Supplier.",
+        "secondary_action": "Show active Suppliers.",
+        "export_action": "Export the current Supplier list to Excel.",
+        "suggestions": [
+            "Summarize these suppliers by status.",
+            "Group Suppliers by supplier group.",
+        ],
+    },
+    "Item": {
+        "title": "Item List",
+        "primary_field": "item_name",
+        "primary_label": "Item",
+        "status_field": "disabled",
+        "primary_action": "Show the details of the most recent Item.",
+        "secondary_action": "Show active Items.",
+        "export_action": "Export the current Item list to Excel.",
+        "suggestions": [
+            "Summarize these items by group.",
+            "Show disabled Items.",
+        ],
+    },
+    "Employee": {
+        "title": "Employee List",
+        "primary_field": "employee_name",
+        "primary_label": "Employee",
+        "status_field": "status",
+        "primary_action": "Show the details of the most recent Employee.",
+        "secondary_action": "Show active Employees.",
+        "export_action": "Export the current Employee list to Excel.",
+        "suggestions": [
+            "Summarize these employees by department.",
+            "Show inactive Employees.",
+        ],
+    },
+}
+
+
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -212,9 +386,155 @@ def _invoice_analysis(doc: Any) -> dict[str, Any]:
     }
 
 
+def _count_by_status(rows: list[dict[str, Any]], fieldname: str = "status") -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_value = row.get(fieldname)
+        if fieldname == "disabled":
+            value = "Disabled" if raw_value in (1, "1", True, "true", "True") else "Active"
+        else:
+            value = _clean_text(raw_value)
+        if not value:
+            continue
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _transaction_dataset_summary(payload: dict[str, Any]) -> dict[str, Any] | None:
+    rows = payload.get("data")
+    if not isinstance(rows, list) or not rows:
+        return None
+    doctype = _clean_text(payload.get("doctype"))
+    config = TRANSACTION_LIST_CONFIG.get(doctype)
+    if not config:
+        return None
+
+    count = int(payload.get("count") or len(rows) or 0)
+    total_count = payload.get("total_count")
+    most_recent = rows[0] if isinstance(rows[0], dict) else {}
+    notable_rows = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        status = _clean_text(row.get("status")).lower()
+        if status in config.get("notable_statuses", ()):
+            notable_rows.append(row)
+    status_counts = _count_by_status([row for row in rows if isinstance(row, dict)], "status")
+
+    issues: list[str] = []
+    insights: list[str] = []
+
+    if total_count not in (None, ""):
+        insights.append(f"You have a total of {total_count} {doctype} records in the system.")
+    else:
+        insights.append(f"Showing {count} {doctype} records from the current result.")
+
+    if status_counts:
+        top_statuses = sorted(status_counts.items(), key=lambda item: (-item[1], item[0].lower()))[:3]
+        insights.append(", ".join(f"{value} {label}" for label, value in top_statuses) + " in this result.")
+
+    if notable_rows:
+        row = notable_rows[0]
+        status = _clean_text(row.get("status"))
+        party = _clean_text(row.get(config["party_field"])) or f"Unknown {config['party_label'].lower()}"
+        issue = f"{_clean_text(row.get('name'))} for {party}"
+        amount = row.get(config.get("amount_field"))
+        if amount not in (None, ""):
+            issue += f" ({_as_money(amount, _clean_text(row.get('currency')) or None)})"
+        issue += f" is currently {status}."
+        issues.append(issue)
+        outstanding_field = config.get("outstanding_field")
+        if outstanding_field and row.get(outstanding_field) not in (None, "", 0, 0.0):
+            insights.append(
+                f"Outstanding amount on {_clean_text(row.get('name'))}: "
+                f"{_as_money(row.get(outstanding_field), _clean_text(row.get('currency')) or None)}."
+            )
+
+    return {
+        "summary": {
+            "title": config["title"],
+            "badge": f"{count} rows",
+            "rows": [
+                {"label": "Returned", "value": str(count)},
+                {"label": "Total In System", "value": str(total_count) if total_count not in (None, "") else "-"},
+                {"label": "Most Recent", "value": _clean_text(most_recent.get("name")) or "-"},
+                {"label": "Latest Date", "value": _fmt_date(most_recent.get(config["date_field"]))},
+            ],
+        },
+        "issues": issues[:3],
+        "actions": [
+            {"label": "View Details", "prompt": config["primary_action"], "style": "primary"},
+            {"label": "Show Exceptions", "prompt": config["secondary_action"]},
+            {"label": "Export Excel", "prompt": config["export_action"]},
+        ],
+        "insights": insights[:3],
+        "suggestions": config["suggestions"],
+    }
+
+
+def _master_dataset_summary(payload: dict[str, Any]) -> dict[str, Any] | None:
+    rows = payload.get("data")
+    if not isinstance(rows, list) or not rows:
+        return None
+    doctype = _clean_text(payload.get("doctype"))
+    config = MASTER_LIST_CONFIG.get(doctype)
+    if not config:
+        return None
+
+    count = int(payload.get("count") or len(rows) or 0)
+    total_count = payload.get("total_count")
+    most_recent = rows[0] if isinstance(rows[0], dict) else {}
+    status_counts = _count_by_status([row for row in rows if isinstance(row, dict)], config["status_field"])
+
+    insights: list[str] = []
+    issues: list[str] = []
+
+    if total_count not in (None, ""):
+        insights.append(f"You have a total of {total_count} {doctype} records in the system.")
+    else:
+        insights.append(f"Showing {count} {doctype} records from the current result.")
+
+    if status_counts:
+        top_statuses = sorted(status_counts.items(), key=lambda item: (-item[1], item[0].lower()))[:3]
+        insights.append(", ".join(f"{value} {label}" for label, value in top_statuses) + " in this result.")
+        if "Disabled" in status_counts and status_counts["Disabled"] > 0:
+            issues.append(f"{status_counts['Disabled']} disabled {doctype} records appear in this result.")
+        if "Inactive" in status_counts and status_counts["Inactive"] > 0:
+            issues.append(f"{status_counts['Inactive']} inactive {doctype} records appear in this result.")
+
+    return {
+        "summary": {
+            "title": config["title"],
+            "badge": f"{count} rows",
+            "rows": [
+                {"label": "Returned", "value": str(count)},
+                {"label": "Total In System", "value": str(total_count) if total_count not in (None, "") else "-"},
+                {"label": config["primary_label"], "value": _clean_text(most_recent.get(config["primary_field"])) or _clean_text(most_recent.get("name")) or "-"},
+                {"label": "Most Recent", "value": _clean_text(most_recent.get("name")) or "-"},
+            ],
+        },
+        "issues": issues[:3],
+        "actions": [
+            {"label": "View Details", "prompt": config["primary_action"], "style": "primary"},
+            {"label": "Show Active", "prompt": config["secondary_action"]},
+            {"label": "Export Excel", "prompt": config["export_action"]},
+        ],
+        "insights": insights[:3],
+        "suggestions": config["suggestions"],
+    }
+
+
 def _dataset_summary(payload: Any) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
+    transaction_summary = _transaction_dataset_summary(payload)
+    if transaction_summary:
+        return transaction_summary
+    master_summary = _master_dataset_summary(payload)
+    if master_summary:
+        return master_summary
     rows = payload.get("data")
     if not isinstance(rows, list):
         return None

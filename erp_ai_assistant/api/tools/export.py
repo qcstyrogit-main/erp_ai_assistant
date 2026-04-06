@@ -379,7 +379,11 @@ def download_message_attachment(message: str, attachment_id: str):
     if not builder:
         frappe.throw("Unsupported attachment type")
 
-    bytes_content = builder(title, rows)
+    try:
+        bytes_content = builder(title, rows)
+    except ImportError as e:
+        frappe.throw(f"Export failed. Missing required library: {e}")
+
     frappe.local.response.filename = str(target.get("filename") or "download")
     frappe.local.response.filecontent = bytes_content
     frappe.local.response.type = "download"

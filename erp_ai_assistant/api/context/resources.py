@@ -2,9 +2,9 @@ from typing import Any
 
 import frappe
 
-from .chat import get_pending_action
-from .context_resolver import normalize_context_payload
-from .erp_tools import describe_erp_schema_internal, get_doctype_fields_internal, list_erp_doctypes_internal
+from ..chat import get_pending_action
+from ..context_resolver import normalize_context_payload
+from ..erp_tools import describe_erp_schema_internal, get_doctype_fields_internal, list_erp_doctypes_internal
 
 
 def _resource_current_document(context: dict[str, Any], _arguments: dict[str, Any]) -> dict[str, Any]:
